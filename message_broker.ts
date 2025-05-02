@@ -1,5 +1,5 @@
-import { LinkedListQueue } from "./queues";
-import { Logger, wait } from "./utils";
+import { LinkedListQueue } from "../queue";
+import { Logger, wait } from "../utils";
 
 type IQueue<Data = any> = {
   enqueue(data: Data, priority?: number): void;
@@ -44,7 +44,8 @@ class CorrelationRegistry extends Map<string, number> {}
 class Broker {
   private queues: Record<string, IQueue<Uint8Array<ArrayBufferLike>>> = {};
   private deadLetterTopic = "dead-letter";
-  private consumerIterator = 0;
+  private subscriptions: Record<string, Set<number>> = {};
+  private subscriptionIterator = 0;
 
   constructor(
     private Queue: new () => IQueue<Uint8Array<ArrayBufferLike>>,
@@ -72,11 +73,14 @@ class Broker {
 
     const message = new Message(data, metadata || {});
     message.metadata.timestamp = Date.now();
+    const {priority, attempts} = message.metadata;
+    if (attempts) 
+    message.metadata.attempts = message.metadata.attempts ?? 10;
     const record = Message.encode(message);
 
     try {
       const { priority, attempts } = message.metadata;
-      if (attempts && attempts > 10) {
+      if (!) {
         this.queues[this.deadLetterTopic].enqueue(record, priority);
       } else {
         this.queues[topic].enqueue(record, priority);
@@ -90,12 +94,15 @@ class Broker {
     for (const message of messages) {
       const { attempts = 0 } = message.metadata;
       message.metadata.priority = -1;
-      message.metadata.attempts = attempts + 1;
-      this.sendTo<any>(topic, message);
+      message.metadata.attempts = attempts - 1;
+      this.sendTo<any>(topic, message.data, message.metadata);
     }
   }
 
   readFrom<Data>(topic: string, consumerId: number, prefetch: number) {
+    if (!this.subscriptions[topic].has(consumerId)) {
+      throw new Error('Topic subscribtion not found')
+    }
     const messages: Message<Data>[] = [];
     const now = Date.now();
     // Batching
@@ -132,8 +139,13 @@ class Broker {
 
   subscribe(subcription: Subscription) {
     if (!this.queues[subcription.topic]) throw new Error("Topic not found");
-    const id = this.consumerIterator++;
-    // add subscription
+    const id = this.subscriptionIterator++;
+
+    if (!this.subscriptions[subcription.topic]) {
+      this.subscriptions[subcription.topic] = new Set();
+    }
+    this.subscriptions[subcription.topic].add(id);
+
     return id;
   }
 
