@@ -8,6 +8,25 @@ type IQueue<Data = any> = {
   isEmpty(): boolean;
   size(): number;
 };
+class InMemoryQueue extends LinkedListQueue implements IQueue {}
+
+type ICorrelationRegistry = {
+  has(correlationId: string): boolean;
+  get(correlationId: string): string | undefined;
+  set(correlationId: string, consumerId: string): void;
+  delete(consumerId: string): boolean;
+};
+class InMemoryCorrelationRegistry
+  extends Map<string, string>
+  implements ICorrelationRegistry
+{
+  delete(key: string): boolean {
+    this.forEach((consumerIdx, correlationId) => {
+      if (consumerIdx === key) super.delete(correlationId);
+    });
+    return true;
+  }
+}
 
 type IMessageMetadata = Partial<{
   correlationId: string;
@@ -38,19 +57,13 @@ class Message<Data = any> {
   }
 }
 
-// can have millions of keys (orderId as correlationId e.g.), use redis in prod
-class CorrelationRegistry extends Map<string, number> {}
-
 class Broker {
-  private queues: Record<string, IQueue<Uint8Array<ArrayBufferLike>>> = {};
-  private deadLetterTopic = "dead-letter";
-  private subscriptions: Record<string, Set<number>> = {};
-  private subscriptionIterator = 0;
+  public queues: Record<string, IQueue<Uint8Array<ArrayBufferLike>>> = {};
+  private producers: Record<string, Set<string>> = {};
+  private consumers: Record<string, Set<string>> = {};
+  public deadLetterTopic = "dead-letter";
 
-  constructor(
-    private Queue: new () => IQueue<Uint8Array<ArrayBufferLike>>,
-    private correlations?: CorrelationRegistry
-  ) {
+  constructor(private Queue: new () => IQueue<Uint8Array<ArrayBufferLike>>) {
     this.assertTopic(this.deadLetterTopic);
   }
 
@@ -59,76 +72,131 @@ class Broker {
     this.queues[name] = new this.Queue();
   }
 
-  purgeTopic(name: string) {
-    delete this.queues[name];
-  }
-
   listTopics() {
     return Object.keys(this.queues);
   }
 
-  sendTo<Data>(topic: string, data: Data, metadata?: IMessageMetadata) {
-    if (!this.queues[topic]) throw new Error("Topic not found");
-    if (topic == this.deadLetterTopic) throw new Error("Cannot send to topic");
+  purgeTopic(name: string) {
+    if (!this.queues[name]) throw new Error("Topic not found");
+    delete this.queues[name];
+    delete this.producers[name];
+    delete this.consumers[name];
+  }
 
+  addProducer(producer: Producer) {
+    const { topic, id } = producer;
+    this.assertTopic(topic);
+    this.producers[topic].add(id);
+  }
+
+  removeProducer(producer: Producer) {
+    const { topic, id } = producer;
+    this.producers[topic].delete(id);
+    if (!this.producers[topic].size && !this.consumers[topic].size) {
+      this.purgeTopic(topic);
+    }
+  }
+
+  addConsumer(consumer: Consumer) {
+    const { topic, id } = consumer;
+    this.assertTopic(topic);
+    this.consumers[topic].add(id);
+  }
+
+  removeConsumer(consumer: Consumer) {
+    const { topic, id } = consumer;
+    this.consumers[topic].delete(id);
+    if (!this.producers[topic].size && !this.consumers[topic].size) {
+      this.purgeTopic(topic);
+    }
+  }
+
+  // unsubscribe(subscription: Subscription) {
+  //   const { topic, id } = subscription;
+  //   if (!this.queues[topic]) throw new Error("Topic not found");
+
+  
+  //   if (this.subscriptions[topic]) {
+  //     this.subscriptions[topic].delete(id);
+  //   }
+  // }
+}
+
+class Producer<Data = any> {
+  static iterator = 0;
+  id: string;
+  constructor(
+    private broker: Broker,
+    public topic: string,
+    private maxDeliveryAttempts = 10,
+    private timeout = 5000
+  ) {
+    if (topic == this.broker.deadLetterTopic) {
+      throw new Error("Cannot send to topic");
+    }
+    this.id = `${Producer.iterator++}`;
+    this.broker.addProducer(this);
+  }
+  send(data: Data, metadata?: IMessageMetadata) {
+    let actualTopic = this.topic;
     const message = new Message(data, metadata || {});
-    message.metadata.timestamp = Date.now();
-    const {priority, attempts} = message.metadata;
-    if (attempts) 
-    message.metadata.attempts = message.metadata.attempts ?? 10;
-    const record = Message.encode(message);
+
+    const { priority, attempts, timestamp } = message.metadata;
+    if (!timestamp) message.metadata.timestamp = Date.now();
+    if (attempts === 0) actualTopic = this.broker.deadLetterTopic;
+    else if (attempts) message.metadata.attempts = attempts - 1;
+    else message.metadata.attempts = this.maxDeliveryAttempts;
 
     try {
-      const { priority, attempts } = message.metadata;
-      if (!) {
-        this.queues[this.deadLetterTopic].enqueue(record, priority);
-      } else {
-        this.queues[topic].enqueue(record, priority);
-      }
+      const record = Message.encode(message);
+      this.broker.queues[actualTopic].enqueue(record, priority);
     } catch (e) {
       throw new Error("Failed to enqueue message");
     }
   }
+}
 
-  nack(topic: string, messages: Message[]) {
-    for (const message of messages) {
-      const { attempts = 0 } = message.metadata;
-      message.metadata.priority = -1;
-      message.metadata.attempts = attempts - 1;
-      this.sendTo<any>(topic, message.data, message.metadata);
-    }
+class Consumer<Data = any> {
+  static iterator = 0;
+  id: string;
+  constructor(
+    private broker: Broker,
+    public topic: string,
+    public prefetch = 1,
+    private correlations?: ICorrelationRegistry
+  ) {
+    this.id = `${Consumer.iterator++}`;
+    this.broker.addConsumer(this);
   }
-
-  readFrom<Data>(topic: string, consumerId: number, prefetch: number) {
-    if (!this.subscriptions[topic].has(consumerId)) {
-      throw new Error('Topic subscribtion not found')
-    }
+  consume() {
     const messages: Message<Data>[] = [];
     const now = Date.now();
     // Batching
     try {
-      while (messages.length < prefetch) {
-        if (this.queues[topic].isEmpty()) break;
-        const record = this.queues[topic].peak()!;
+      while (
+        messages.length < this.prefetch &&
+        !this.broker.queues[this.topic].isEmpty()
+      ) {
+        const record = this.broker.queues[this.topic].peak()!;
         const message = Message.decode<Data>(record);
         const { correlationId, ttl, ttd } = message.metadata;
         // Time-to-deliver
         if (ttd && ttd > now) continue;
         // Time-to-live
         if (ttl && ttl > now) {
-          this.queues[topic].dequeue();
+          this.broker.queues[this.topic].dequeue();
           continue;
         }
         // Consistent hashing
         if (this.correlations && correlationId) {
           const correlatedConsumerId = this.correlations.get(correlationId);
-          if (correlatedConsumerId && correlatedConsumerId !== consumerId) {
+          if (correlatedConsumerId && correlatedConsumerId !== this.id) {
             continue;
           }
-          this.correlations.set(correlationId, consumerId);
+          this.correlations.set(correlationId, this.id);
         }
 
-        this.queues[topic].dequeue()!;
+        this.broker.queues[this.topic].dequeue()!;
         messages.push(message);
       }
     } catch (e) {
@@ -137,61 +205,28 @@ class Broker {
     }
   }
 
-  subscribe(subcription: Subscription) {
-    if (!this.queues[subcription.topic]) throw new Error("Topic not found");
-    const id = this.subscriptionIterator++;
-
-    if (!this.subscriptions[subcription.topic]) {
-      this.subscriptions[subcription.topic] = new Set();
-    }
-    this.subscriptions[subcription.topic].add(id);
-
-    return id;
-  }
-
-  unsubscribe(subcription: Subscription) {
-    if (!this.queues[subcription.topic]) throw new Error("Topic not found");
-    // remove subscription
-    this.correlations?.forEach((corellatedConsumerIdx, correlationId) => {
-      if (corellatedConsumerIdx === subcription.id) {
-        this.correlations?.delete(correlationId);
-      }
-    });
-  }
-}
-
-class Subscription<Data = any> {
-  id: number;
-  constructor(
-    private broker: Broker,
-    public topic: string,
-    public prefetch = 1
-  ) {
-    this.id = this.broker.subscribe(this);
-  }
-  read() {
-    return this.broker.readFrom<Data>(this.topic, this.id, this.prefetch);
-  }
-  poll() {}
   nack(messages: Message[]) {
-    this.broker.nack(this.topic, messages);
+    for (const message of messages) {
+      const { attempts = 0 } = message.metadata;
+      message.metadata.priority = -1;
+      message.metadata.attempts = attempts - 1;
+      this.sendTo<any>(topic, message.data, message.metadata);
+    }
   }
 }
 
 /** Example */
 
-const b = new Broker(LinkedListQueue, new CorrelationRegistry());
-b.assertTopic("test");
-b.sendTo("test", { data: "test" });
+const correlations = new InMemoryCorrelationRegistry();
+const b = new Broker(InMemoryQueue);
 
-const sub = new Subscription(b, "test");
-const messages = sub.read();
+const pub = new Producer(b, "test");
+pub.send({ test: 1 });
+
+const sub = new Consumer(b, "test", 1, correlations);
+const messages = sub.consume();
 sub.nack(messages);
-b.unsubscribe(sub);
-
-const sub2 = new Subscription(b, "test");
-const messages2 = sub2.read();
-b.unsubscribe(sub2);
+// b.unsubscribe(sub);
 
 // type ILogger = {
 //   log(message: string, level: "INFO" | "WARN" | "DANGER"): void;
@@ -239,20 +274,6 @@ b.unsubscribe(sub2);
 //   }
 // }
 
-// class Producer<Data> {
-//   constructor(private broker: MessageBroker, private logger?: ILogger) {}
-//   send(topic: string, data: Data, metadata: IMessageMetadata = {}) {
-//     this.broker.assertTopic(topic);
-//     const message = new Message<Data>(data, metadata);
-//     this.logger?.log(
-//       `[producer-${1}] ==> (${topic}): ${JSON.stringify(data)}`,
-//       "INFO"
-//     );
-//     return this.broker.send(topic, message);
-//     // 2021-08-27 13:09:50.349  INFO [producer-1] ===> (Purchases): key = htanaka value = t-shirts
-//   }
-// }
-
 // /** Examples */
 
 // const listener = (delay: number) => async (m: any[]) => {
@@ -288,3 +309,10 @@ b.unsubscribe(sub2);
 
 // // Consumer.consume.subscribe.unsubscribe.pause
 // // Producer.send
+
+// this.logger?.log(
+//   `[producer-${1}] ==> (${topic}): ${JSON.stringify(data)}`,
+//   "INFO"
+// );
+// return this.broker.send(topic, message);
+// // 2021-08-27 13:09:50.349  INFO [producer-1] ===> (Purchases): key = htanaka value = t-shirts
