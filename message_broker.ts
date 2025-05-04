@@ -1,91 +1,8 @@
 import crypto from "node:crypto";
-import { LinkedListPriorityQueue } from "../queues/linked_list_proirity_queue";
+import { LinkedListPriorityQueue } from "../queues";
 import { Logger, wait } from "./utils";
 
-/** Consistent hashing class.
- * The system works regardless of how different the key hashes are because the lookup is always
- * relative to the fixed node positions on the ring. Sorted nodes in a ring:
- * [**100(A)**, _180(user-123 key hash always belong to the B)_, **200(B)**, **300(A)**, **400(B)**, **500(A)**, **600(B)**]
- */
-class Hasher {
-  private ring = new Map<number, string>(); // hash:consumerId
 
-  /**
-   * Create a new instance of Hasher with the given number of virtual nodes.
-   * @param {number} [virtualNodes=3] The number of virtual nodes to create for each consumer.
-   * The more virtual nodes you create, the more evenly distributed the messages will be
-   * among your consumers. Which means fewer hotspots, more balanced traffic. However, setting
-   * this number too high can lead to a large memory footprint and slower lookups.
-   */
-  constructor(private virtualNodes = 3) {}
-
-  addConsumer(consumerId: string) {
-    for (let i = 0; i < this.virtualNodes; i++) {
-      const hash = this.hash(`${consumerId}-${i}`);
-      this.ring.set(hash, consumerId);
-    }
-  }
-  removeConsumer(consumerId: string) {
-    const consumerExists = [...this.ring.values()].includes(consumerId);
-    if (!consumerExists) return;
-    for (let i = 0; i < this.virtualNodes; i++) {
-      const hash = this.hash(`${consumerId}-${i}`);
-      this.ring.delete(hash);
-    }
-  }
-  getConsumer(key: string): string | undefined {
-    const hash = this.hash(key);
-    const sortedHashes = [...this.ring.keys()].sort((a, b) => a - b);
-    const node = sortedHashes.find((h) => h >= hash) || sortedHashes[0];
-    return this.ring.get(node);
-  }
-  private hash(key: string): number {
-    return parseInt(
-      crypto.createHash("sha256").update(key).digest("hex").slice(0, 8),
-      16
-    );
-  }
-}
-
-type IQueue<Data = any> = {
-  enqueue(data: Data, priority?: number): void;
-  dequeue(): Data | undefined;
-  peek(): Data | undefined;
-  isEmpty(): boolean;
-  size(): number;
-};
-
-// class DelayedQueue {
-//   private heap: Array<{ timestamp: number; message: Uint8Array }> = [];
-
-//   enqueue(message: Uint8Array, delayMs: number) {
-//     const deliveryTime = Date.now() + delayMs;
-//     this.heap.push({ timestamp: deliveryTime, message });
-//     this.heap.sort((a, b) => a.timestamp - b.timestamp); // Min-heap
-//   }
-
-//   peekNextDeliveryTime(): number | null {
-//     return this.heap.length > 0 ? this.heap[0].timestamp : null;
-//   }
-
-//   dequeueDueMessages(): Uint8Array[] {
-//     const now = Date.now();
-//     const dueMessages: Uint8Array[] = [];
-
-//     while (this.heap.length > 0 && this.heap[0].timestamp <= now) {
-//       dueMessages.push(this.heap.shift()!.message);
-//     }
-
-//     return dueMessages;
-//   }
-// }
-
-// type ICorrelationRegistry = {
-//   has(correlationId: string): boolean;
-//   get(correlationId: string): string | undefined;
-//   set(correlationId: string, consumerId: string): ICorrelationRegistry;
-//   delete(consumerId: string): boolean;
-// };
 // class InMemoryCorrelationRegistry
 //   extends Map<string, string>
 //   implements ICorrelationRegistry
@@ -117,166 +34,79 @@ type IQueue<Data = any> = {
 //   }
 // }
 
+/** Consistent hashing class.
+ * The system works regardless of how different the key hashes are because the lookup is always
+ * relative to the fixed node positions on the ring. Sorted nodes in a ring:
+ * [**100(A)**, _180(user-123 key hash always belong to the B)_, **200(B)**, **300(A)**, **400(B)**, **500(A)**, **600(B)**]
+ */
+class ConsistencyHasher {
+  private ring = new Map<number, string>();
+
+  /**
+   * Create a new instance of ConsistencyHasher with the given number of virtual nodes.
+   * @param {number} [replicas=3] The number of virtual nodes to create for each consumer.
+   * The more virtual nodes you create, the more evenly distributed the messages will be
+   * among your consumers. Which means fewer hotspots, more balanced traffic. However, setting
+   * this number too high can lead to a large memory footprint and slower lookups.
+   */
+  constructor(private replicas = 3) {}
+
+  addNode(id: string) {
+    for (let i = 0; i < this.replicas; i++) {
+      const hash = this.hash(`${id}-${i}`);
+      this.ring.set(hash, id);
+    }
+  }
+  removeNode(id: string) {
+    const nodeExists = [...this.ring.values()].includes(id);
+    if (!nodeExists) return;
+    for (let i = 0; i < this.replicas; i++) {
+      const hash = this.hash(`${id}-${i}`);
+      this.ring.delete(hash);
+    }
+  }
+  getNode(key: string): string | undefined {
+    const hash = this.hash(key);
+    const sortedHashes = [...this.ring.keys()].sort((a, b) => a - b);
+    const node = sortedHashes.find((h) => h >= hash) || sortedHashes[0];
+    return this.ring.get(node);
+  }
+  private hash(key: string): number {
+    return parseInt(
+      crypto.createHash("sha256").update(key).digest("hex").slice(0, 8),
+      16
+    );
+  }
+}
 type ILogger = {
   log(message: string, level: "INFO" | "WARN" | "DANGER"): void;
 };
-type IBrokerOptions = {
-  Queue: new () => IQueue<Uint8Array<ArrayBufferLike>>;
-  Hasher: new () => Hasher;
-  logger?: ILogger;
-  maxDeliveryAttempts?: number;
-  maxMessageSize?: number;
+type IQueue<Data = any> = {
+  enqueue(data: Data, priority?: number): void;
+  dequeue(): Data | undefined;
+  peek(): Data | undefined;
+  isEmpty(): boolean;
+  size(): number;
 };
-class Broker {
-  private Queue: new () => IQueue<Uint8Array<ArrayBufferLike>>;
-  public Hasher: new () => Hasher;
-  // public queues: Record<string, IQueue<Uint8Array<ArrayBufferLike>>> = {};
-  private topics: Map<
-    string,
-    {
-      physicalQueues: Map<string, IQueue<Uint8Array<ArrayBufferLike>>>; // per consumer
-      virtualQueue: IQueue<Uint8Array<ArrayBufferLike>>; // broadcasting
-      hasher: Hasher;
-    }
-  > = new Map();
-
-  public delayedQueue: IQueue<Uint8Array<ArrayBufferLike>>;
-  public dlqTopic = "dlq";
-  private nextDeliveryTimeout: number;
-
-  public logger?: ILogger;
-  public maxDeliveryAttempts: number;
-  public maxMessageSize: number;
-
-  // private producers: Record<string, Set<string>> = {};
-  // private consumers: Record<string, Set<string>> = {};
-
-  constructor(options: IBrokerOptions) {
-    this.Queue = options.Queue;
-    this.Hasher = options.Hasher;
-    this.logger = options.logger;
-
-    const { maxDeliveryAttempts = 10, maxMessageSize = 1024 * 1024 } = options;
-    if (maxDeliveryAttempts > 0) this.maxDeliveryAttempts = maxDeliveryAttempts;
-    else throw new Error("MaxDeliveryAttempts cannot be negative");
-    if (maxMessageSize > 0) this.maxMessageSize = maxMessageSize;
-    else throw new Error("MaxMessageSize cannot be negative");
-
-    this.assertTopic(this.dlqTopic);
-    this.delayedQueue = new this.Queue();
-  }
-
-  assertTopic(name: string) {
-    if (this.topics.has(name)) return;
-    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
-      throw new Error("Invalid topic name");
-    }
-    this.topics.set(name, {
-      physicalQueues: new Map(),
-      virtualQueue: new this.Queue(),
-      hasher: new this.Hasher(),
-    });
-  }
-
-  listTopics() {
-    return this.topics.keys();
-  }
-
-  purgeTopic(name: string) {
-    if (!this.topics.has[name]) throw new Error("Topic not found");
-    this.topics.delete(name);
-    // delete this.producers[name];
-    // delete this.consumers[name];
-  }
-
-  register(agent: Producer | Consumer) {
-    const { topic, id } = agent;
-    this.assertTopic(topic);
-    if (agent instanceof Producer) {
-      if (topic == this.dlqTopic) {
-        throw new Error("Invalid topic");
-      }
-      // this.producers[topic].add(id);
-    } else {
-      // this.consumers[topic].add(id);
-      this.topics.set(topic)
-    }
-  }
-
-  unregister(agent: Producer | Consumer) {
-    const { topic, id } = agent;
-    if (agent instanceof Producer) {
-      this.producers[topic]?.delete(id);
-    } else {
-      this.consumers[topic]?.delete(id);
-      this.correlations?.delete(id);
-    }
-    if (!this.producers[topic].size && !this.consumers[topic].size) {
-      this.purgeTopic(topic);
-    }
-  }
-
-  // misc
-
-  // private processDelayedQueue() {
-  //   const now = Date.now();
-  //   while (!this.delayedQueue.isEmpty()) {
-  //     const record = this.delayedQueue.peek()!;
-  //     const { metadata } = Message.decode(record);
-  //     if (metadata.timestamp! > now) break;
-  //     this.queues[metadata.topic!].enqueue(record, metadata.priority);
-  //   }
-
-  //   this.scheduleNextDeliveryCheck();
-  // }
-
-  // scheduleNextDeliveryCheck() {
-  //   if (this.nextDeliveryTimeout) {
-  //     clearTimeout(this.nextDeliveryTimeout);
-  //   }
-
-  //   if (this.delayedQueue.isEmpty()) return;
-  //   const record = this.delayedQueue.peek()!;
-  //   const { metadata } = Message.decode(record);
-
-  //   const delay = Math.max(0, metadata.timestamp! - Date.now());
-  //   this.nextDeliveryTimeout = setTimeout(
-  //     this.processDelayedQueue.bind(this),
-  //     delay
-  //   );
-  // }
-
-  calculateBackoff(attempt: number) {
-    return Math.min(2 ** attempt * 1000, 30000);
-  }
-
-  // isNotCorrelate(correlationId: string, agentId: string) {
-  //   // Consistent hashing
-  //   if (!this.correlations) return false;
-  //   const correlatedAgentId = this.correlations.get(correlationId);
-  //   if (correlatedAgentId && correlatedAgentId !== agentId) return true;
-  //   this.correlations.set(correlationId, agentId);
-  //   return false;
-  // }
-}
-
-type IMessageMetadata = Partial<{
+type IMessageMetadata = {
+  id: string;
   topic: string;
-  correlationId: string;
-  priority: number;
-  ttl: number;
-  ttd: number;
   attempts: number;
   timestamp: number;
+  correlationId?: string;
+  priority?: number;
+  ttl?: number;
+  ttd?: number;
   //
-  batchId: string;
-  batchIndex: number;
-  batchSize: number;
-}>;
+  batchId?: string;
+  batchIndex?: number;
+  batchSize?: number;
+};
 class Message<Data = any> {
-  constructor(public data: Data, public metadata: IMessageMetadata = {}) {
+  static iterator = 1;
+  constructor(public data: Data, public metadata: IMessageMetadata) {
     this.metadata.timestamp ||= Date.now();
-    this.metadata.attempts ??= 0;
+    this.metadata.attempts ??= 1;
     this.metadata.priority ??= 0;
   }
   static encode<Data>(message: Message<Data>) {
@@ -317,150 +147,331 @@ class Message<Data = any> {
     return true;
   }
 }
+class Topic {
+  unicastQueues: Map<string, IQueue<Uint8Array<ArrayBufferLike>>> = new Map();
+  constructor(
+    public name: string,
+    public broadcastQueue: IQueue<Uint8Array<ArrayBufferLike>>,
+    public hasher: ConsistencyHasher
+  ) {}
+}
+type ITopicBrokerOptions = {
+  Queue: new () => IQueue<Uint8Array<ArrayBufferLike>>;
+  Hasher: new () => ConsistencyHasher;
+  maxDeliveryAttempts?: number;
+  maxMessageSize?: number;
+  logger?: ILogger;
+};
+class TopicBroker {
+  private Queue: new () => IQueue<Uint8Array<ArrayBufferLike>>;
+  public Hasher: new () => ConsistencyHasher;
+  public topics: Map<string, Topic> = new Map();
 
-class Producer<Data = any> {
-  static iterator = 0;
-  id: string;
-  constructor(private broker: Broker, public topic: string) {
-    if (!topic) throw new Error("Invalid topic");
-    this.id = `${Producer.iterator++}`;
-    this.broker.register(this);
+  public dlqQueue: IQueue<Uint8Array<ArrayBufferLike>>;
+  public delayedQueue: IQueue<Uint8Array<ArrayBufferLike>>;
+  private nextDelayedDeliveryTimeout: number;
+
+  public logger?: ILogger;
+  public maxDeliveryAttempts: number;
+  public maxMessageSize: number;
+
+  constructor(options: ITopicBrokerOptions) {
+    this.Queue = options.Queue;
+    this.Hasher = options.Hasher;
+    this.logger = options.logger;
+
+    const { maxDeliveryAttempts = 10, maxMessageSize = 1024 * 1024 } = options;
+    if (maxDeliveryAttempts > 0) this.maxDeliveryAttempts = maxDeliveryAttempts;
+    else throw new Error("MaxDeliveryAttempts cannot be negative");
+    if (maxMessageSize > 0) this.maxMessageSize = maxMessageSize;
+    else throw new Error("MaxMessageSize cannot be negative");
+
+    this.dlqQueue = new this.Queue();
+    this.delayedQueue = new this.Queue();
   }
 
-  send(data: Data, metadata?: IMessageMetadata) {
-    if (data == null) throw new Error("Invalid data");
+  assertTopic(name: string) {
+    if (this.topics.has(name)) return;
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+      throw new Error("Invalid topic name");
+    }
+    this.topics.set(name, new Topic(name, new this.Queue(), new this.Hasher()));
+  }
 
-    const message = new Message(data, metadata);
-    message.metadata.topic ||= this.topic;
+  listTopics() {
+    return this.topics.keys();
+  }
 
-    try {
-      const record = Message.encode(message);
-      const { maxMessageSize } = this.broker;
+  deleteTopic(name: string) {
+    if (!this.topics.has(name)) throw new Error("Topic not found");
+    this.topics.delete(name);
+  }
 
-      if (record.length > maxMessageSize) {
-        throw new Error(`Message size exceeds limit ${maxMessageSize}B`);
-      }
+  registerConsumer(topicName: string, id: string) {
+    const topic = this.topics.get(topicName)!;
+    if (!topic) throw new Error("Topic is not exist");
 
-      if (message.isDelayed()) {
-        this.broker.delayedQueue.enqueue(record, message.getDeliveryDate());
-        this.broker.scheduleNextDeliveryCheck();
-      } else {
-        this.broker.queues[this.topic].enqueue(
-          record,
-          message.metadata.priority
+    topic.unicastQueues.set(id, new this.Queue());
+    topic.hasher.addNode(id);
+    return topic;
+  }
+
+  unregisterConsumer(topicName: string, id: string) {
+    const topic = this.topics.get(topicName)!;
+    if (!topic) throw new Error("Topic is not exist");
+
+    topic.hasher.removeNode(id);
+    topic.unicastQueues.delete(id);
+    if (!topic.unicastQueues.size) {
+      this.deleteTopic(topicName);
+    }
+  }
+
+  registerProducer(topicName: string, id: string) {
+    const topic = this.topics.get(topicName)!;
+    if (!topic) throw new Error("Topic is not exist");
+
+    if (topicName == this.dlqTopic) throw new Error("Invalid topic");
+    return topic;
+  }
+
+  // misc
+
+  private processDelayedQueue() {
+    const now = Date.now();
+    while (!this.delayedQueue.isEmpty()) {
+      const record = this.delayedQueue.peek()!;
+      const { data, metadata } = Message.decode(record);
+      if (metadata.timestamp! > now) break;
+
+      this.delayedQueue.dequeue();
+      const { topic: topicName, correlationId, priority } = metadata;
+      const topic = this.topics.get(topicName!);
+      if (!topic) {
+        this.logger?.log(
+          `[Delayed] ==> (NULL): ${JSON.stringify(data)}`,
+          "WARN"
         );
+        continue;
       }
 
-      this.broker.logger?.log(
-        `[producer-${this.id}] ==> (${this.topic}): ${JSON.stringify(data)}`,
+      if (correlationId) {
+        const consumerId = topic.hasher.getNode(correlationId)!;
+        topic.unicastQueues.get(consumerId)?.enqueue(record, priority);
+      } else {
+        topic.broadcastQueue.enqueue(record, priority);
+      }
+
+      this.logger?.log(
+        `[Delayed] ==> (${metadata.topic}): ${JSON.stringify(data)}`,
         "INFO"
       );
-    } catch (e) {
-      throw new Error(`Message rejected: ${e.message}`);
     }
+
+    this.scheduleNextDeliveryCheck();
+  }
+
+  scheduleNextDeliveryCheck() {
+    if (this.nextDelayedDeliveryTimeout) {
+      clearTimeout(this.nextDelayedDeliveryTimeout);
+    }
+
+    if (this.delayedQueue.isEmpty()) return;
+    const record = this.delayedQueue.peek()!;
+    const { metadata } = Message.decode(record);
+
+    const delay = Math.max(0, metadata.timestamp! - Date.now());
+    this.nextDelayedDeliveryTimeout = setTimeout(
+      this.processDelayedQueue.bind(this),
+      delay
+    );
+  }
+}
+class Producer<Data = any> {
+  static iterator = 1;
+  id: string;
+  topic: Topic;
+  constructor(private broker: TopicBroker, public topicName: string) {
+    this.id = `${Producer.iterator++}`;
+    this.topic = this.broker.registerProducer(topicName, this.id);
+  }
+
+  send(
+    data: Data,
+    metadata: Pick<
+      Partial<IMessageMetadata>,
+      "topic" | "priority" | "correlationId" | "ttd" | "ttl"
+    > = {}
+  ) {
+    if (data == null) throw new Error("Invalid data");
+
+    metadata.id = `${Message.iterator++}`;
+    const message = new Message(data, metadata);
+    message.metadata.topic = this.topic.name;
+    const record = Message.encode(message);
+    const { correlationId, priority } = message.metadata;
+
+    if (record.length > this.broker.maxMessageSize) {
+      throw new Error(
+        `Message size exceeds limit ${this.broker.maxMessageSize}B`
+      );
+    }
+
+    if (message.isDelayed()) {
+      this.broker.delayedQueue.enqueue(record, message.getDeliveryDate());
+      this.broker.logger?.log(
+        `[producer-${this.id}] ==> (Delayed): ${JSON.stringify(data)}`,
+        "INFO"
+      );
+      return this.broker.scheduleNextDeliveryCheck();
+    }
+
+    if (correlationId) {
+      const consumerId = this.topic.hasher.getNode(correlationId)!;
+      this.topic.unicastQueues.get(consumerId)?.enqueue(record, priority);
+    } else {
+      this.topic.broadcastQueue.enqueue(record, priority);
+    }
+
+    this.broker.logger?.log(
+      `[producer-${this.id}] ==> (${this.topic}): ${JSON.stringify(data)}`,
+      "INFO"
+    );
   }
 
   sendBatch(items: Array<{ data: Data; metadata?: IMessageMetadata }>) {
     const batchId = `batch-${Date.now()}`;
-    items.forEach((item, i) => {
+    items.forEach((item, batchIndex) => {
       this.send(item.data, {
         ...item.metadata,
         batchId,
-        batchIndex: i,
+        batchIndex,
         batchSize: items.length,
       });
     });
   }
 }
 
+type IConsumerOptions = {
+  topic: string;
+  limit?: number;
+  autoAck?: boolean;
+};
 class Consumer<Data = any> {
   static iterator = 0;
   id: string;
-  constructor(
-    private broker: Broker,
-    public topic: string,
-    public prefetch = 1
-  ) {
-    if (!topic) throw new Error("Invalid topic");
+  topic: Topic;
+  limit: number;
+  autoAck: boolean;
+  polling = false;
+  private pendingAcks = new Map<string, Message>();
+  constructor(private broker: TopicBroker, options: IConsumerOptions) {
+    const { topic: topicName, limit = 1, autoAck = false } = options;
+    if (limit > 0) this.limit = limit;
+    else throw new Error("Limit must be positive");
+    this.autoAck = autoAck;
     this.id = `${Consumer.iterator++}`;
-    this.broker.register(this);
+
+    this.topic = this.broker.registerConsumer(topicName, this.id);
   }
 
   consume() {
     const messages: Message<Data>[] = [];
-    let batchSize = 0;
 
-    while (
-      batchSize < this.prefetch &&
-      !this.broker.queues[this.topic].isEmpty()
-    ) {
-      const record = this.broker.queues[this.topic].peek()!;
-      const message = Message.decode<Data>(record);
-      const { correlationId } = message.metadata;
-      if (message.isExpired()) {
-        this.broker.queues[this.topic].dequeue();
-        message.metadata.attempts = this.broker.maxDeliveryAttempts; /////
-        this.nack([message]);
-        continue;
-      }
-      if (correlationId && this.broker.isNotCorrelate(correlationId, this.id)) {
-        continue;
-      }
+    const queues = [
+      this.topic.unicastQueues.get(this.id),
+      this.topic.broadcastQueue,
+    ];
 
-      this.broker.queues[this.topic].dequeue()!;
-      messages.push(message);
-      batchSize++;
+    for (const queue of queues) {
+      while (queue && !queue.isEmpty() && messages.length < this.limit) {
+        const record = queue.dequeue()!;
+        const message = Message.decode<Data>(record);
+        if (!this.autoAck) this.pendingAcks.set(message.metadata.id, message);
+        if (message.isExpired()) this.nack(message.metadata.id, false);
+        else messages.push(message);
+      }
     }
 
-    const data = JSON.stringify(messages.map((r) => r.data));
     this.broker.logger?.log(
-      `[consumer-${this.id}] <== (${this.topic}): ${data}`,
+      `[consumer-${this.id}] <== (${this.topic}): ${JSON.stringify(
+        messages.map((r) => r.data)
+      )}`,
       "INFO"
     );
 
     return messages;
   }
 
-  async nack(messages: Message[]) {
-    for (const message of messages) {
-      let topic = this.topic;
+  subscribe(handler: (msgs: Message[]) => Promise<void>) {
+    this.polling = true;
+    this.poll(handler);
+  }
 
-      if (message.isExceedAttempts(this.broker.maxDeliveryAttempts)) {
-        topic = this.broker.dlqTopic;
-      }
+  unsubscribe() {
+    this.polling = false;
+  }
 
-      // Add delay before re-queuing (exponential backoff)
-      const delay = this.broker.calculateBackoff(message.metadata.attempts!);
-      await wait(delay);
-      const record = Message.encode(message);
-      this.broker.queues[topic].enqueue(record, message.metadata.priority);
+  private async poll(handler: (msgs: Message[]) => Promise<void>) {
+    const messages = this.consume();
+    if (!messages.length) await wait(100);
+    else await handler(messages);
+    if (this.polling) this.poll(handler);
+  }
 
-      const data = JSON.stringify(messages.map((r) => r.data));
-      this.broker.logger?.log(
-        `[consumer-${this.id}] ==> (${this.topic}): ${data}`,
-        "INFO"
-      );
+  ack(messageId?: string) {
+    if (messageId) this.pendingAcks.delete(messageId);
+    else this.pendingAcks.clear();
+  }
+
+  nack(messageId?: string, requeue = true) {
+    const message = this.pendingAcks.get(messageId);
+    if (!message) return;
+    const { correlationId, priority } = message.metadata;
+    const record = Message.encode(message);
+    let topicName = this.topic.name;
+
+    if (!requeue || message.isExceedAttempts(this.broker.maxDeliveryAttempts)) {
+      topicName = this.broker.dlqTopic;
+      const topic = this.broker.topics.get(topicName);
+      topic?.broadcastQueue.enqueue(record);
+    } else if (correlationId) {
+      const consumerId = this.topic.hasher.getNode(correlationId)!;
+      this.topic.unicastQueues.get(consumerId)?.enqueue(record, priority);
+    } else {
+      this.topic.broadcastQueue.enqueue(record, priority);
     }
+
+    this.broker.logger?.log(
+      `[producer-${this.id}] ==> (${topicName}): ${JSON.stringify(
+        message.data
+      )}`,
+      "INFO"
+    );
+
+    // // Add delay before re-queuing (exponential backoff)
+    // const delay = this.broker.calculateBackoff(message.metadata.attempts!);
+    // await wait(delay);
+    //   calculateBackoff(attempt: number) {
+    // return Math.min(2 ** attempt * 1000, 30000);
   }
 }
 
 /** Example */
-// HeapQueue is 3-4x faster at scale due to O(log n) vs. O(n) inserts
-// LinkedListQueue struggles with priorities (sorts on every insert).
-// Memory usage is similar (~10MB for 1M messages).
 
-const b = new Broker({
+const b = new TopicBroker({
   Queue: LinkedListPriorityQueue,
-  correlations: new InMemoryCorrelationRegistry(),
+  Hasher: ConsistencyHasher,
   logger: new Logger(),
 });
 
 const pub = new Producer(b, "test");
 pub.send({ test: 1 });
 
-const sub = new Consumer(b, "test", 1);
+const sub = new Consumer(b, { topic: "test", limit: 1 });
 const messages = sub.consume();
-sub.nack(messages);
+sub.ack();
+
 // b.unsubscribe(sub);
 // const brokerWithHeap = new Broker(HeapQueue);
 // const pub = new Producer(brokerWithHeap, "test");
@@ -485,7 +496,7 @@ sub.nack(messages);
 //   constructor(
 //     private broker: MessageBroker,
 //     private topic: string,
-//     private prefetch = 1,
+//     private limit = 1,
 //     private logger?: ILogger
 //   ) {
 //     // this.broker.register(this)
@@ -511,7 +522,7 @@ sub.nack(messages);
 //   }
 
 //   consume() {
-//     return this.broker.read<Data>(this.topic, this.prefetch);
+//     return this.broker.read<Data>(this.topic, this.limit);
 //   }
 //   subscribe(resolver: IMessageResolver<Data>) {
 //     this.resolver = resolver;
@@ -583,3 +594,19 @@ sub.nack(messages);
 
 // Different speeds/needs → Queue-per-consumer
 // Uniform workers → Queue-per-topic
+
+// await Promise.all(
+//       messages.map(async msg => {
+//         try {
+//           await Promise.race([
+//             handler(msg),
+//             new Promise((_, reject) =>
+//               setTimeout(reject, this.processingTimeout, 'Processing timeout')
+//             )
+//           ]);
+//           // Implicit ACK on success
+//         } catch (error) {
+//           super.nack(topic, msg.metadata.correlationId!, false); // Send to DLQ
+//         }
+//       })
+//     );

@@ -1,0 +1,26 @@
+{
+  "name": "mbroker",
+  "version": "0.0.1",
+  "description": "message broker in nodejs",
+  "homepage": "https://github.com/blacknred/mbroker#readme",
+  "bugs": {
+    "url": "https://github.com/blacknred/mbroker/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blacknred/mbroker.git"
+  },
+  "license": "ISC",
+  "author": "blcknrd",
+  "type": "esm",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "proto": "npx protoc --ts_proto_out=./src/generated --ts_proto_opt=outputEncodeMethods=true --proto_path=./src/proto ./src/proto/message.proto"
+  },
+  "dependencies": {
+    "pino": "^9.6.0",
+    "ts-proto": "^2.7.0",
+    "zod": "^3.24.3"
+  }
+}

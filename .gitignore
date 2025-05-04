@@ -1,0 +1,51 @@
+# compiled output
+/dist
+.next/
+node_modules
+
+# Logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# OS
+.DS_Store
+*.pem
+
+# Testing
+/coverage
+.nyc_output
+
+# IDEs and editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+/.idea
+.project
+.classpath
+.code-workspace
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# Env
+.env.*
+!.env.example
+*.pem
+*_orig
+
+# Storage data
+docker/*/data/
+packages/*/*/lib
+
+# Extras
+.terraform/
+*.tfvars
+docker-compose.override.yml

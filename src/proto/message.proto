@@ -1,0 +1,21 @@
+// src/proto/message.proto
+syntax = "proto3";
+
+message ProtoMessage {
+  bytes data = 1;  // Store serialized payload
+  MessageMetadata metadata = 2;
+
+  message MessageMetadata {
+    string id = 1;
+    string topic = 2;
+    int64 timestamp = 3;
+    int32 attempts = 4;
+    optional string correlation_id = 5;
+    optional int32 priority = 6;
+    optional int64 ttl = 7;
+    optional int64 ttd = 8;
+    optional string batch_id = 9;
+    optional int32 batch_index = 10;
+    optional int32 batch_size = 11;
+  }
+}
