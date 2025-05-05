@@ -6,14 +6,16 @@ import { Logger, wait } from "./utils";
 type ILogger = {
   log(message: string, level: "INFO" | "WARN" | "DANGER"): void;
 };
-type IQueue<Data = any> = {
+type IPriorityQueue<Data = any> = {
   enqueue(data: Data, priority?: number): void;
   dequeue(): Data | undefined;
   peek(): Data | undefined;
   isEmpty(): boolean;
   size(): number;
 };
-
+//
+//
+//
 // ConsistencyHasher.ts
 interface IHashService {
   hash(key: string): number;
@@ -24,12 +26,17 @@ class SHA256HashService implements IHashService {
     return parseInt(hex.slice(0, 8), 16);
   }
 }
+type IConsistencyHasher = {
+  addNode(id: string): void;
+  removeNode(id: string): void;
+  getNode(key: string): string | undefined;
+};
 /** Consistent hashing class.
  * The system works regardless of how different the key hashes are because the lookup is always
  * relative to the fixed node positions on the ring. Sorted nodes in a ring:
  * [**100(A)**, _180(user-123 key hash always belong to the B)_, **200(B)**, **300(A)**, **400(B)**, **500(A)**, **600(B)**]
  */
-class ConsistencyHasher {
+class InMemoryConsistencyHasher implements IConsistencyHasher {
   private ring = new Map<number, string>();
 
   /**
@@ -62,9 +69,10 @@ class ConsistencyHasher {
     return this.ring.get(node);
   }
 }
-
+//
+//
 // MessageSerializer.ts
-export class MessageSerializer {
+class MessageSerializer {
   static encode<Data>(message: Message<Data>) {
     try {
       return new TextEncoder().encode(JSON.stringify(message));
@@ -82,7 +90,8 @@ export class MessageSerializer {
     }
   }
 }
-
+//
+//
 // Message.ts
 type IMessageMetadata = {
   id: string;
@@ -135,142 +144,129 @@ class Message<Data = any> {
     this.metadata.attempts = attempts + 1;
   }
 }
-
+//
+//
+// Topic.ts
 class Topic {
-  unicastQueues: Map<string, IQueue<Uint8Array>> = new Map();
+  unicastQueues: Map<string, IPriorityQueue<Uint8Array>> = new Map();
   constructor(
     public name: string,
-    public broadcastQueue: IQueue<Uint8Array>,
-    public hasher: ConsistencyHasher
+    public broadcastQueue: IPriorityQueue<Uint8Array>,
+    public hasher: IConsistencyHasher
   ) {}
 }
+//
+//
+// TopicRegistry.ts (need sharding)
+class TopicRegistry {
+  private topics = new Map<string, Topic>();
 
+  constructor(
+    private queueFactory: () => IPriorityQueue<Uint8Array>,
+    private hasherFactory: () => IConsistencyHasher
+  ) {}
 
-
-
-// Config.ts
-export interface BrokerConfig {
-  maxDeliveryAttempts: number;
-  maxMessageSize: number;
-  replicas: number;
-}
-
-// TopicBroker.ts (updated)
-class TopicBroker {
-  constructor(private config: BrokerConfig) {}
-}
-
-type TopicBrokerConfig = {
-
-}
-// TopicBroker.ts
-class TopicBroker {
-  private queueFactory: new () => IQueue<Uint8Array>;
-  public hasherFactory: new (hashService: IHashService) => ConsistencyHasher;
-  public topics: Map<string, Topic> = new Map();
-
-  public dlQueue: IQueue<Uint8Array>;
-  public delayedQueue: IQueue<Uint8Array>;
-  private nextDelayedDeliveryTimeout: number;
-
-  public logger?: ILogger;
-  public maxDeliveryAttempts: number;
-  public maxMessageSize: number;
-
-  constructor(options: {
-    queueFactory: new () => IQueue<Uint8Array>;
-    hasherFactory: new () => ConsistencyHasher;
-    logger?: ILogger;
-    maxDeliveryAttempts?: number;
-    maxMessageSize?: number;
-    
-  }) {
-    this.queueFactory = options.queueFactory;
-    this.hasherFactory = options.hasherFactory;
-    this.logger = options.logger;
-
-    const { maxDeliveryAttempts = 10, maxMessageSize = 1024 * 1024 } = options;
-    if (maxDeliveryAttempts > 0) this.maxDeliveryAttempts = maxDeliveryAttempts;
-    else throw new Error("MaxDeliveryAttempts cannot be negative");
-    if (maxMessageSize > 0) this.maxMessageSize = maxMessageSize;
-    else throw new Error("MaxMessageSize cannot be negative");
-
-    this.dlQueue = new this.queueFactory();
-    this.delayedQueue = new this.queueFactory();
-  }
-
-  assertTopic(name: string) {
-    if (this.topics.has(name)) return;
-    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+  create(name: string): Topic {
+    if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
       throw new Error("Invalid topic name");
     }
+
+    if (this.topics.has(name)) {
+      throw new Error("Topic already exists");
+    }
+
     this.topics.set(
       name,
-      new Topic(
-        name,
-        new this.queueFactory(),
-        new this.hasherFactory(new SHA256HashService())
-      )
+      new Topic(name, this.queueFactory(), this.hasherFactory())
     );
+
+    return this.topics.get(name)!;
   }
 
-  listTopics() {
+  list() {
     return this.topics.keys();
   }
 
-  deleteTopic(name: string) {
-    this.getTopicOrThrow(name);
-    this.topics.delete(name);
-  }
-
-  private getTopicOrThrow(name: string) {
-    if (!this.topics.has(name)) throw new Error("Topic not found");
+  get(name: string): Topic | undefined {
     return this.topics.get(name);
   }
 
-  registerConsumer(topicName: string, consumerId: string) {
-    const topic = this.getTopicOrThrow(topicName)!;
-    topic.unicastQueues.set(consumerId, new this.Queue());
+  delete(name: string): void {
+    if (!this.topics.has(name)) {
+      throw new Error("Topic not found");
+    }
+    this.topics.delete(name);
+  }
+}
+//
+//
+// ClientManager.ts
+class ClientManager {
+  constructor(
+    private topicRegistry: TopicRegistry,
+    private queueFactory: () => IPriorityQueue<Uint8Array>
+  ) {}
+
+  registerConsumer(topicName: string, consumerId: string): Topic {
+    const topic = this.topicRegistry.get(topicName);
+    if (!topic) throw new Error("Topic not Found");
+    topic.unicastQueues.set(consumerId, this.queueFactory());
     topic.hasher.addNode(consumerId);
     return topic;
   }
 
-  unregisterConsumer(topicName: string, consumerId: string) {
-    const topic = this.getTopicOrThrow(topicName)!;
-    topic.unicastQueues.delete(consumerId);
-    topic.hasher.removeNode(consumerId);
+  unregisterConsumer(topicName: string, consumerId: string): void {
+    const topic = this.topicRegistry.get(topicName);
+    if (!topic) throw new Error("Topic not Found");
+    topic?.unicastQueues.delete(consumerId);
+    topic?.hasher.removeNode(consumerId);
   }
 
-  registerProducer(topicName: string, producerId: string) {
-    return this.getTopicOrThrow(topicName)!;
+  registerProducer(topicName: string): Topic {
+    const topic = this.topicRegistry.get(topicName);
+    if (!topic) throw new Error("Topic not Found");
+    return topic;
   }
+}
+//
+//
+// DeliveryService.ts
+class DeliveryService {
+  private nextDeliveryTimeout?: number;
 
-  scheduleNextDelayedDelivery() {
-    if (this.nextDelayedDeliveryTimeout) {
-      clearTimeout(this.nextDelayedDeliveryTimeout);
+  constructor(
+    private delayedQueue: IPriorityQueue<Uint8Array>,
+    private dlQueue: IPriorityQueue<Uint8Array>,
+    private topicRegistry: TopicRegistry,
+    private logger?: Logger
+  ) {}
+
+  scheduleDelayedDelivery(): void {
+    if (this.nextDeliveryTimeout) {
+      clearTimeout(this.nextDeliveryTimeout);
     }
     if (this.delayedQueue.isEmpty()) return;
 
     const record = this.delayedQueue.peek()!;
     const message = MessageSerializer.decode(record);
     const delay = Math.max(0, message.getCurrentDelay());
-    this.nextDelayedDeliveryTimeout = setTimeout(
-      this.processDelayedQueue,
-      delay
-    );
+
+    this.nextDeliveryTimeout = setTimeout(() => {
+      this.processDelayedQueue();
+    }, delay);
   }
 
-  private processDelayedQueue = () => {
+  private processDelayedQueue(): void {
     while (!this.delayedQueue.isEmpty()) {
       const record = this.delayedQueue.dequeue()!;
-      const { data, metadata } = MessageSerializer.decode(record);
-      const { topic: topicName, correlationId, priority } = metadata;
-      const topic = this.topics.get(topicName);
+      const message = MessageSerializer.decode(record);
+      const { topic: topicName, correlationId, priority } = message.metadata;
+      const topic = this.topicRegistry.getTopic(topicName);
 
-      if (!topic) {
+      if (!topic || message.isExpired()) {
         this.dlQueue.enqueue(record);
         this.logger?.log(
-          `[Delayed] ==> (dlq): ${JSON.stringify(data)}`,
+          `[Delayed] ==> (dlq): ${JSON.stringify(message.data)}`,
           "WARN"
         );
         continue;
@@ -284,14 +280,204 @@ class TopicBroker {
       }
 
       this.logger?.log(
-        `[Delayed] ==> (${metadata.topic}): ${JSON.stringify(data)}`,
+        `[Delayed] ==> (${topicName}): ${JSON.stringify(message.data)}`,
         "INFO"
       );
     }
 
-    this.scheduleNextDelayedDelivery();
-  };
+    this.scheduleDelayedDelivery();
+  }
 }
+//
+//
+// TopicBroker.ts (Facade)
+type TopicBrokerConfig = {
+  maxDeliveryAttempts: number;
+  maxMessageSize: number;
+  replicas: number;
+  defaultPollingInterval?: number;
+};
+class TopicBroker {
+  public readonly dlQueue: IPriorityQueue<Uint8Array>;
+  public readonly delayedQueue: IPriorityQueue<Uint8Array>;
+
+  private topicRegistry: TopicRegistry;
+  private clientManager: ClientManager;
+  private deliveryService: DeliveryService;
+
+  constructor(
+    private config: TopicBrokerConfig,
+    private queueFactory: () => IPriorityQueue<Uint8Array>,
+    private hasherFactory: () => IConsistencyHasher,
+    private logger?: Logger
+  ) {
+    this.topicRegistry = new TopicRegistry(queueFactory, hasherFactory);
+    this.clientManager = new ClientManager(this.topicRegistry, queueFactory);
+    this.deliveryService = new DeliveryService(
+      this.queueFactory(),
+      this.queueFactory(),
+      this.topicRegistry,
+      logger
+    );
+  }
+
+  createTopic(name: string): void {
+    this.topicRegistry.create(name);
+  }
+
+  listTopics() {
+    return this.topicRegistry.list();
+  }
+
+  deleteTopic(name: string) {
+    return this.topicRegistry.delete(name);
+  }
+
+  registerConsumer(topicName: string, consumerId: string): Topic {
+    return this.clientManager.registerConsumer(topicName, consumerId);
+  }
+
+  unregisterConsumer(topicName: string, consumerId: string) {
+    return this.clientManager.unregisterConsumer(topicName, consumerId);
+  }
+
+  registerProducer(topicName: string, producerId: string) {
+    return this.clientManager.registerProducer(topicName);
+  }
+
+  scheduleNextDelayedDelivery() {
+    return this.deliveryService.scheduleDelayedDelivery();
+  }
+}
+
+// class TopicBroker {
+//   private queueFactory: new () => IPriorityQueue<Uint8Array>;
+//   public hasherFactory: new (hashService: IHashService) => ConsistencyHasher;
+//   public topics: Map<string, Topic> = new Map();
+
+//   public dlQueue: IPriorityQueue<Uint8Array>;
+//   public delayedQueue: IPriorityQueue<Uint8Array>;
+//   private nextDelayedDeliveryTimeout: number;
+
+//   public logger?: ILogger;
+//   public maxDeliveryAttempts: number;
+//   public maxMessageSize: number;
+
+//   constructor(options: {
+//     queueFactory: new () => IPriorityQueue<Uint8Array>;
+//     hasherFactory: new () => ConsistencyHasher;
+//     logger?: ILogger;
+//     maxDeliveryAttempts?: number;
+//     maxMessageSize?: number;
+
+//   }) {
+//     this.queueFactory = options.queueFactory;
+//     this.hasherFactory = options.hasherFactory;
+//     this.logger = options.logger;
+
+//     const { maxDeliveryAttempts = 10, maxMessageSize = 1024 * 1024 } = options;
+//     if (maxDeliveryAttempts > 0) this.maxDeliveryAttempts = maxDeliveryAttempts;
+//     else throw new Error("MaxDeliveryAttempts cannot be negative");
+//     if (maxMessageSize > 0) this.maxMessageSize = maxMessageSize;
+//     else throw new Error("MaxMessageSize cannot be negative");
+
+//     this.dlQueue = new this.queueFactory();
+//     this.delayedQueue = new this.queueFactory();
+//   }
+
+// assertTopic(name: string) {
+//   if (this.topics.has(name)) return;
+//   if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+//     throw new Error("Invalid topic name");
+//   }
+//   this.topics.set(
+//     name,
+//     new Topic(
+//       name,
+//       new this.queueFactory(),
+//       new this.hasherFactory(new SHA256HashService())
+//     )
+//   );
+// }
+
+// listTopics() {
+//   return this.topics.keys();
+// }
+
+// deleteTopic(name: string) {
+//   this.getTopicOrThrow(name);
+//   this.topics.delete(name);
+// }
+
+// private getTopicOrThrow(name: string) {
+//   if (!this.topics.has(name)) throw new Error("Topic not found");
+//   return this.topics.get(name);
+// }
+
+// registerConsumer(topicName: string, consumerId: string) {
+//   const topic = this.getTopicOrThrow(topicName)!;
+//   topic.unicastQueues.set(consumerId, new this.Queue());
+//   topic.hasher.addNode(consumerId);
+//   return topic;
+// }
+
+// unregisterConsumer(topicName: string, consumerId: string) {
+//   const topic = this.getTopicOrThrow(topicName)!;
+//   topic.unicastQueues.delete(consumerId);
+//   topic.hasher.removeNode(consumerId);
+// }
+
+// registerProducer(topicName: string, producerId: string) {
+//   return this.getTopicOrThrow(topicName)!;
+// }
+
+// scheduleNextDelayedDelivery() {
+//   if (this.nextDelayedDeliveryTimeout) {
+//     clearTimeout(this.nextDelayedDeliveryTimeout);
+//   }
+//   if (this.delayedQueue.isEmpty()) return;
+
+//   const record = this.delayedQueue.peek()!;
+//   const message = MessageSerializer.decode(record);
+//   const delay = Math.max(0, message.getCurrentDelay());
+//   this.nextDelayedDeliveryTimeout = setTimeout(
+//     this.processDelayedQueue,
+//     delay
+//   );
+// }
+
+// private processDelayedQueue = () => {
+//   while (!this.delayedQueue.isEmpty()) {
+//     const record = this.delayedQueue.dequeue()!;
+//     const { data, metadata } = MessageSerializer.decode(record);
+//     const { topic: topicName, correlationId, priority } = metadata;
+//     const topic = this.topics.get(topicName);
+
+//     if (!topic) {
+//       this.dlQueue.enqueue(record);
+//       this.logger?.log(
+//         `[Delayed] ==> (dlq): ${JSON.stringify(data)}`,
+//         "WARN"
+//       );
+//       continue;
+//     }
+
+//     if (correlationId) {
+//       const consumerId = topic.hasher.getNode(correlationId)!;
+//       topic.unicastQueues.get(consumerId)?.enqueue(record, priority);
+//     } else {
+//       topic.broadcastQueue.enqueue(record, priority);
+//     }
+
+//     this.logger?.log(
+//       `[Delayed] ==> (${metadata.topic}): ${JSON.stringify(data)}`,
+//       "INFO"
+//     );
+//   }
+
+//   this.scheduleNextDelayedDelivery();
+// };
+// }
 
 class Producer<Data = any> {
   static iterator = 1;
@@ -518,7 +704,7 @@ con.ack();
 // consumer1.consume();
 // consumer1.polling();
 
-// class PersistentQueue<Data> implements IQueue<Data> {
+// class PersistentQueue<Data> implements IPriorityQueue<Data> {
 //   private wal = new fs.createWriteStream("./queue.wal", { flags: "a" });
 
 //   enqueue(data: Data, priority?: number) {
