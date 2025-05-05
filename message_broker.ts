@@ -2,10 +2,28 @@ import crypto from "node:crypto";
 import { LinkedListPriorityQueue } from "../queues";
 import { Logger, wait } from "./utils";
 
+// interfaces.ts
 type ILogger = {
   log(message: string, level: "INFO" | "WARN" | "DANGER"): void;
 };
+type IQueue<Data = any> = {
+  enqueue(data: Data, priority?: number): void;
+  dequeue(): Data | undefined;
+  peek(): Data | undefined;
+  isEmpty(): boolean;
+  size(): number;
+};
 
+// ConsistencyHasher.ts
+interface IHashService {
+  hash(key: string): number;
+}
+class SHA256HashService implements IHashService {
+  hash(key: string): number {
+    const hex = crypto.createHash("sha256").update(key).digest("hex");
+    return parseInt(hex.slice(0, 8), 16);
+  }
+}
 /** Consistent hashing class.
  * The system works regardless of how different the key hashes are because the lookup is always
  * relative to the fixed node positions on the ring. Sorted nodes in a ring:
@@ -20,11 +38,11 @@ class ConsistencyHasher {
    * The more virtual nodes gives you fewer hotspots, more balanced traffic. However, setting
    * this number too high can lead to a large memory footprint and slower lookups.
    */
-  constructor(private replicas = 3) {}
+  constructor(private hashService: IHashService, private replicas = 3) {}
 
   addNode(id: string) {
     for (let i = 0; i < this.replicas; i++) {
-      const hash = this.hash(`${id}-${i}`);
+      const hash = this.hashService.hash(`${id}-${i}`);
       this.ring.set(hash, id);
     }
   }
@@ -32,32 +50,40 @@ class ConsistencyHasher {
   removeNode(id: string) {
     if (![...this.ring.values()].includes(id)) return;
     for (let i = 0; i < this.replicas; i++) {
-      const hash = this.hash(`${id}-${i}`);
+      const hash = this.hashService.hash(`${id}-${i}`);
       this.ring.delete(hash);
     }
   }
 
   getNode(key: string): string | undefined {
-    const keyHash = this.hash(key);
+    const keyHash = this.hashService.hash(key);
     const sortedHashes = Array.from(this.ring.keys()).sort((a, b) => a - b);
     const node = sortedHashes.find((h) => h >= keyHash) || sortedHashes[0];
     return this.ring.get(node);
   }
+}
 
-  private hash(key: string): number {
-    const hex = crypto.createHash("sha256").update(key).digest("hex");
-    return parseInt(hex.slice(0, 8), 16);
+// MessageSerializer.ts
+export class MessageSerializer {
+  static encode<Data>(message: Message<Data>) {
+    try {
+      return new TextEncoder().encode(JSON.stringify(message));
+    } catch (e) {
+      throw new Error("Failed to encode message");
+    }
+  }
+
+  static decode<Data>(bytes: Uint8Array) {
+    try {
+      const { data, metadata } = JSON.parse(new TextDecoder().decode(bytes));
+      return new Message<Data>(data, metadata);
+    } catch (e) {
+      throw new Error("Failed to decode message");
+    }
   }
 }
 
-type IQueue<Data = any> = {
-  enqueue(data: Data, priority?: number): void;
-  dequeue(): Data | undefined;
-  peek(): Data | undefined;
-  isEmpty(): boolean;
-  size(): number;
-};
-
+// Message.ts
 type IMessageMetadata = {
   id: string;
   topic: string;
@@ -71,27 +97,8 @@ type IMessageMetadata = {
   batchIndex?: number;
   batchSize?: number;
 };
-
 class Message<Data = any> {
   static iterator = 1;
-
-  static encode<Data>(message: Message<Data>) {
-    try {
-      return new TextEncoder().encode(JSON.stringify(message));
-    } catch (e) {
-      throw new Error("Failed to encode message");
-    }
-  }
-
-  static decode<Data>(record: Uint8Array) {
-    try {
-      const { data, metadata } = JSON.parse(new TextDecoder().decode(record));
-      return new Message<Data>(data, metadata);
-    } catch (e) {
-      throw new Error("Failed to decode message");
-    }
-  }
-
   metadata: IMessageMetadata;
 
   constructor(
@@ -138,9 +145,28 @@ class Topic {
   ) {}
 }
 
+
+
+
+// Config.ts
+export interface BrokerConfig {
+  maxDeliveryAttempts: number;
+  maxMessageSize: number;
+  replicas: number;
+}
+
+// TopicBroker.ts (updated)
 class TopicBroker {
-  private Queue: new () => IQueue<Uint8Array>;
-  public Hasher: new () => ConsistencyHasher;
+  constructor(private config: BrokerConfig) {}
+}
+
+type TopicBrokerConfig = {
+
+}
+// TopicBroker.ts
+class TopicBroker {
+  private queueFactory: new () => IQueue<Uint8Array>;
+  public hasherFactory: new (hashService: IHashService) => ConsistencyHasher;
   public topics: Map<string, Topic> = new Map();
 
   public dlQueue: IQueue<Uint8Array>;
@@ -152,14 +178,15 @@ class TopicBroker {
   public maxMessageSize: number;
 
   constructor(options: {
-    Queue: new () => IQueue<Uint8Array>;
-    Hasher: new () => ConsistencyHasher;
+    queueFactory: new () => IQueue<Uint8Array>;
+    hasherFactory: new () => ConsistencyHasher;
+    logger?: ILogger;
     maxDeliveryAttempts?: number;
     maxMessageSize?: number;
-    logger?: ILogger;
+    
   }) {
-    this.Queue = options.Queue;
-    this.Hasher = options.Hasher;
+    this.queueFactory = options.queueFactory;
+    this.hasherFactory = options.hasherFactory;
     this.logger = options.logger;
 
     const { maxDeliveryAttempts = 10, maxMessageSize = 1024 * 1024 } = options;
@@ -168,8 +195,8 @@ class TopicBroker {
     if (maxMessageSize > 0) this.maxMessageSize = maxMessageSize;
     else throw new Error("MaxMessageSize cannot be negative");
 
-    this.dlQueue = new this.Queue();
-    this.delayedQueue = new this.Queue();
+    this.dlQueue = new this.queueFactory();
+    this.delayedQueue = new this.queueFactory();
   }
 
   assertTopic(name: string) {
@@ -177,7 +204,14 @@ class TopicBroker {
     if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
       throw new Error("Invalid topic name");
     }
-    this.topics.set(name, new Topic(name, new this.Queue(), new this.Hasher()));
+    this.topics.set(
+      name,
+      new Topic(
+        name,
+        new this.queueFactory(),
+        new this.hasherFactory(new SHA256HashService())
+      )
+    );
   }
 
   listTopics() {
@@ -218,7 +252,7 @@ class TopicBroker {
     if (this.delayedQueue.isEmpty()) return;
 
     const record = this.delayedQueue.peek()!;
-    const message = Message.decode(record);
+    const message = MessageSerializer.decode(record);
     const delay = Math.max(0, message.getCurrentDelay());
     this.nextDelayedDeliveryTimeout = setTimeout(
       this.processDelayedQueue,
@@ -229,7 +263,7 @@ class TopicBroker {
   private processDelayedQueue = () => {
     while (!this.delayedQueue.isEmpty()) {
       const record = this.delayedQueue.dequeue()!;
-      const { data, metadata } = Message.decode(record);
+      const { data, metadata } = MessageSerializer.decode(record);
       const { topic: topicName, correlationId, priority } = metadata;
       const topic = this.topics.get(topicName);
 
@@ -290,7 +324,7 @@ class Producer<Data = any> {
         }),
       });
 
-      const record = Message.encode(message);
+      const record = MessageSerializer.encode(message);
       records.push({ message, record });
       if (record.length > this.broker.maxMessageSize) {
         throw new Error(
@@ -362,7 +396,7 @@ class Consumer<Data = any> {
     for (const queue of queues) {
       while (queue && !queue.isEmpty() && messages.length < this.limit) {
         const record = queue.dequeue()!;
-        const message = Message.decode<Data>(record);
+        const message = MessageSerializer.decode<Data>(record);
         if (!this.autoAck) {
           this.pendingAcks.set(message.metadata.id, message);
         }
@@ -422,12 +456,12 @@ class Consumer<Data = any> {
       let target = this.topic.name;
 
       if (!requeue || attempts > this.broker.maxDeliveryAttempts) {
-        const record = Message.encode(message);
+        const record = MessageSerializer.encode(message);
         this.broker.dlQueue.enqueue(record);
         target = "dlq";
       } else {
         message.iterateAttempts();
-        const record = Message.encode(message);
+        const record = MessageSerializer.encode(message);
         if (correlationId) {
           const consumerId = this.topic.hasher.getNode(correlationId)!;
           this.topic.unicastQueues.get(consumerId)?.enqueue(record, priority);
@@ -449,8 +483,8 @@ class Consumer<Data = any> {
 /** Example */
 
 const b = new TopicBroker({
-  Queue: LinkedListPriorityQueue,
-  Hasher: ConsistencyHasher,
+  queueFactory: LinkedListPriorityQueue,
+  hasherFactory: ConsistencyHasher,
   logger: new Logger(),
 });
 b.assertTopic("test");
