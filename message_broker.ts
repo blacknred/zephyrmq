@@ -1,11 +1,129 @@
 import crypto from "node:crypto";
-import { LinkedListPriorityQueue } from "../queues";
-import { Logger, wait } from "./utils";
+import { EventEmitter } from "node:events";
+import pino from "pino";
+import Zod, { z } from "zod";
+import {
+  LinkedListPriorityQueue,
+  HighCapacityBinaryHeapPriorityQueue,
+} from "../queues";
+import { wait } from "./utils";
+import { ProtoMessage } from "../generated/message";
+import { Gauge, Counter } from "prom-client";
 
+// logs & metrics
+const bus = new EventEmitter();
+const logger = pino({
+  level: process.env.LOG_LEVEL || "info",
+  transport:
+    process.env.NODE_ENV === "development"
+      ? { target: "pino-pretty" }
+      : undefined,
+  base: { service: "message-broker" },
+});
+const topicDepth = new Counter({
+  name: "queue_depth",
+  help: "Current messages in queue",
+  labelNames: ["topic"],
+});
+const producerMessageCount = new Counter({
+  name: "producer_messages_total",
+  help: "Total messages sent by producer",
+  labelNames: ["topic", "producer_id"],
+});
+const consumerLag = new Gauge({
+  name: "consumer_pending_messages",
+  help: "Pending messages per consumer",
+  labelNames: ["topic", "consumer_id"],
+});
+bus.on("messageRouted", (event) => {
+  logger.info(event, "Message routed");
+});
+bus.on("messagesConsumed", (event) => {
+  logger.info(event, "Messages consumed");
+});
+bus.on("producerMessageCount", ({ topic, producerId: producer_id }) => {
+  producerMessageCount.inc({ topic, producer_id });
+  topicDepth.inc({ topic });
+});
+bus.on("consumerLag", ({ topic, onsumerId: consumer_id, lag }) => {
+  consumerLag.set({ topic, consumer_id }, lag);
+});
+// class MetricsExporter {
+//   private metricsProviders = new Map<string, () => Record<string, number>>();
+
+//   register(topicName: string, getMetrics: () => Record<string, number>) {
+//     this.metricsProviders.set(topicName, getMetrics);
+//   }
+
+//   start() {
+//     setInterval(() => {
+//       this.metricsProviders.forEach((getMetrics, topicName) => {
+//         const lags = getMetrics(); // E.g., { "consumer-1": 5, "consumer-2": 10 }
+//         Object.entries(lags).forEach(([consumerId, lag]) => {
+//           consumerLagGauge.set({ topic: topicName, consumerId }, lag);
+//         });
+//       });
+//     }, 15_000);
+//   }
+// }
+
+// type QueueMetrics = {
+//   depth: number;
+//   enqueueRate: number; // Messages/sec
+//   dequeueRate: number;
+//   avgLatencyMs: number; // Time in queue
+// };
+
+// class BrokerMetrics {
+//   private metrics: Record<string, QueueMetrics> = {};
+
+//   update(topic: string, operation: 'enqueue' | 'dequeue', latencyMs: number) {
+//     if (!this.metrics[topic]) {
+//       this.metrics[topic] = { depth: 0, enqueueRate: 0, dequeueRate: 0, avgLatencyMs: 0 };
+//     }
+//     const m = this.metrics[topic];
+//     m.depth += operation === 'enqueue' ? 1 : -1;
+//     m[`${operation}Rate`] += 1;
+//     m.avgLatencyMs = (m.avgLatencyMs * 0.9) + (latencyMs * 0.1); // Exponential moving average
+//   }
+
+//   getMetrics(): Readonly<Record<string, QueueMetrics>> {
+//     return this.metrics;
+//   }
+// }
+//   enqueue(topic: string, message: Message) {
+//     const start = Date.now();
+//     this.queues[topic].enqueue(Message.encode(message));
+//     this.metrics.update(topic, 'enqueue', Date.now() - start);
+//   }
+
+//   dequeue(topic: string): Message | undefined {
+//     const start = Date.now();
+//     const data = this.queues[topic].dequeue();
+//     if (data) {
+//       this.metrics.update(topic, 'dequeue', Date.now() - start);
+//       return Message.decode(data);
+//     }
+//   }
+// {
+//   "orders": {
+//     "depth": 42,
+//     "enqueueRate": 10,
+//     "dequeueRate": 8,
+//     "avgLatencyMs": 50
+//   }
+// }
+///
+//
+//
+//
+//
+//
+
+//
+//
+//
 // interfaces.ts
-interface ILogger {
-  log(message: string, level: "INFO" | "WARN" | "DANGER"): void;
-}
 interface IPriorityQueue<Data = any> {
   enqueue(data: Data, priority?: number): void;
   dequeue(): Data | undefined;
@@ -72,6 +190,88 @@ class InMemoryConsistencyHasher implements IConsistencyHasher {
 //
 //
 //
+// src/codecs/JSONCodec.ts
+interface ICodec {
+  encode<T>(message: Message<T>): Uint8Array;
+  decode<T>(bytes: Uint8Array): Message<T>;
+}
+const messageSchema = z.object({
+  data: z.unknown(),
+  metadata: z.object({
+    id: z.string(),
+    topic: z.string(),
+    attempts: z.number().int().min(1),
+    timestamp: z.number(),
+  }),
+});
+class JSONCodec implements ICodec {
+  encode<Data>(message: Message<Data>) {
+    try {
+      return new TextEncoder().encode(JSON.stringify(message));
+    } catch (e) {
+      throw new Error("Failed to encode message");
+    }
+  }
+  decode<Data>(bytes: Uint8Array) {
+    try {
+      const raw = JSON.parse(new TextDecoder().decode(bytes));
+      const { data, metadata } = messageSchema.parse(raw);
+      return new Message<Data>(data, metadata);
+    } catch (e) {
+      throw new Error("Failed to decode message");
+    }
+  }
+}
+class ProtobufCodec implements ICodec {
+  encode<Data>({ data, metadata }: Message<Data>): Uint8Array {
+    const { timestamp, attempts, priority, ttd, ttl, batchIndex, batchSize } =
+      metadata;
+    const protoMsg = ProtoMessage.create({
+      data: this.serializeData(data), // 👈 Custom data serializer
+      metadata: {
+        ...metadata,
+        // Convert all numbers to bigint
+        timestamp: BigInt(timestamp),
+        attempts: BigInt(attempts),
+        priority: priority ? BigInt(priority) : priority,
+        ttl: ttl ? BigInt(ttl) : ttl,
+        ttd: ttd ? BigInt(ttd) : ttd,
+        batchIndex: batchIndex ? BigInt(batchIndex) : batchIndex,
+        batchSize: batchSize ? BigInt(batchSize) : batchSize,
+      },
+    });
+    return ProtoMessage.encode(protoMsg).finish();
+  }
+
+  decode<Data>(bytes: Uint8Array): Message<Data> {
+    const protoMsg = ProtoMessage.decode(bytes);
+    const { timestamp, attempts, priority, ttd, ttl, batchIndex, batchSize } =
+      protoMsg.metadata;
+    return new Message(this.deserializeData<Data>(protoMsg.data), {
+      ...protoMsg.metadata,
+      // Convert back to JS numbers
+      timestamp: Number(timestamp),
+      attempts: Number(attempts),
+      priority: priority ? Number(priority) : priority,
+      ttl: ttl ? Number(ttl) : ttl,
+      ttd: ttd ? Number(ttd) : ttd,
+      batchIndex: batchIndex ? Number(batchIndex) : batchIndex,
+      batchSize: batchSize ? Number(batchSize) : batchSize,
+    });
+  }
+
+  private serializeData<T>(data: T): Uint8Array {
+    // Use JSON as default, but can be overridden
+    return new TextEncoder().encode(JSON.stringify(data));
+  }
+
+  private deserializeData<T>(bytes: Uint8Array): T {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  }
+}
+//
+//
+//
 // Message.ts
 interface IMessageMetadata {
   id: string;
@@ -87,52 +287,40 @@ interface IMessageMetadata {
   batchSize?: number;
 }
 class Message<Data = any> {
-  private static iterator = 1;
   public metadata: IMessageMetadata;
   constructor(
     public data: Data,
-    metadata: Omit<IMessageMetadata, "timestamp" | "attempts" | "id">
+    metadata: Omit<IMessageMetadata, "timestamp" | "attempts">
   ) {
     this.metadata = {
       ...metadata,
       timestamp: Date.now(),
       attempts: 1,
-      id: `${Message.iterator++}`,
     };
   }
 }
-// MessageSerializer.ts
-class MessageSerializer {
-  static encode<Data>(message: Message<Data>) {
-    try {
-      return new TextEncoder().encode(JSON.stringify(message));
-    } catch (e) {
-      throw new Error("Failed to encode message");
-    }
-  }
+// src/validators.ts
+interface IValidator<Data> {
+  validate(data: { message: Message<Data>; record: Uint8Array }): void;
+}
+class SizeValidator implements IValidator<Uint8Array> {
+  constructor(private maxSize: number) {}
 
-  static decode<Data>(bytes: Uint8Array) {
-    try {
-      const { data, metadata } = JSON.parse(new TextDecoder().decode(bytes));
-      return new Message<Data>(data, metadata);
-    } catch (e) {
-      throw new Error("Failed to decode message");
-    }
+  validate({ record }: { record: Uint8Array }) {
+    if (record.length > this.maxSize) throw new Error("Message too large");
   }
 }
-// MessageValidator.ts
-class MessageValidator<Data> {
-  constructor(private maxMessageSize: number) {}
+class MessageValidator<Data> implements IValidator<Data> {
+  constructor(private schema: Zod.Schema<Data>) {}
 
-  validate(message: { record: Uint8Array; data: Data }): void {
-    if (message.record.length > this.maxMessageSize) {
-      throw new Error(`Message exceeds ${this.maxMessageSize} bytes`);
-    }
-    // Add schema validation (e.g., using Zod)
+  validate({ message }: { message: Message<Data> }) {
+    this.schema.parse(message);
   }
 }
-// MessageFactory.ts
+// src/factories/MessageFactory.ts
 class MessageFactory<Data> {
+  constructor(private validators: IValidator<Data>[], private codec: ICodec) {}
+
   create(
     data: Data[],
     metadata: Partial<IMessageMetadata> & { topic: string }
@@ -140,41 +328,186 @@ class MessageFactory<Data> {
     return data.map((item, index) => {
       const message = new Message(item, {
         ...metadata,
+        id: crypto.randomUUID(),
         ...(data.length > 1 && {
           batchId: `batch-${Date.now()}`,
           batchIndex: index,
           batchSize: data.length,
         }),
       });
-      return {
+      const record = {
         message,
-        record: MessageSerializer.encode(message),
+        record: this.codec.encode(message),
       };
+
+      this.validators.forEach((v) => v.validate(record));
+      return record;
     });
   }
 }
 //
 //
 //
+// routing-engine.ts
+interface IRoutingStrategy {
+  getConsumerId(topic: string, key: string): string;
+  addConsumer(topic: string, id: string): void;
+  removeConsumer(topic: string, id: string): void;
+}
+class ConsistentHashingStrategy implements IRoutingStrategy {
+  constructor(private hasher: IConsistencyHasher) {}
+
+  getConsumerId(_topic: string, key: string) {
+    return this.hasher.getNode(key)!;
+  }
+  addConsumer(_topic: string, id: string) {
+    return this.hasher.addNode(id);
+  }
+  removeConsumer(_topic: string, id: string) {
+    return this.hasher.removeNode(id);
+  }
+}
 // Topic.ts
-class Topic {
+interface ITopicMetadata {
+  name: string;
+  createdAt: string;
+  pendingMessages: number;
+  producersCount: number;
+  producersIds: string[];
+  totalMessagesPublished: number;
+  consumerCount: number;
+  consumerIds: string[];
+  lagPerConsumer?: Record<
+    // Message lag per consumer (queue depth)
+    string, // Consumer ID
+    number // Pending messages
+  >;
+  // config: {
+  //   retentionMs?: number;           // How long messages are retained
+  //   maxSizeBytes?: number;          // Max topic size
+  //   partitions?: number;            // Number of partitions (if partitioned)
+  // };
+  // subscriptionTypes: ("unicast" | "broadcast")[];
+  // broadcastConsumerCount: number;    // Consumers listening to broadcasts
+  // unicastConsumerCount: number;     // Consumers with dedicated queues
+}
+interface IClientMetadata {
+  lastActiveAt: number;
+  messageCount?: number;
+  pendingMessages?: number;
+}
+class Topic<Data> {
+  timestamp = Date.now();
+  private totalMessagesPublished: number = 0;
+  private producers = new Map<string, IClientMetadata>();
+  private consumers = new Map<string, IClientMetadata>();
   unicastQueues: Map<string, IPriorityQueue<Uint8Array>> = new Map();
+
   constructor(
     public name: string,
-    public broadcastQueue: IPriorityQueue<Uint8Array>,
-    public hasher: IConsistencyHasher
+    private router: MessageRouter,
+    private routingStrategy: IRoutingStrategy,
+    private sharedUnicastQueue: IPriorityQueue<Uint8Array>,
+    private codec: ICodec
   ) {}
+
+  getConsumerId(key: string) {
+    return this.routingStrategy.getConsumerId(this.name, key);
+  }
+  addConsumer(id: string) {
+    this.routingStrategy.addConsumer(this.name, id);
+    this.consumers.set(id, { lastActiveAt: Date.now() });
+  }
+  removeConsumer(id: string) {
+    this.unicastQueues.delete(id);
+    this.routingStrategy.removeConsumer(this.name, id);
+    this.consumers.delete(id);
+  }
+  addProducer(id: string) {
+    this.producers.set(id, { lastActiveAt: Date.now() });
+  }
+  removeProducer(id: string) {
+    this.producers.delete(id);
+  }
+
+  // message handling
+  send(producerId: string, record: Uint8Array, metadata: IMessageMetadata) {
+    this.router.route(record, metadata);
+    if (producerId) this._recordProducerActivity(producerId);
+  }
+  consume(consumerId: string, limit = 1, signal?: AbortSignal) {
+    if (signal?.aborted) return [];
+
+    const messages: Message<Data>[] = [];
+    const queues = [
+      this.unicastQueues.get(consumerId),
+      this.sharedUnicastQueue,
+    ];
+
+    for (const queue of queues) {
+      while (queue && !queue.isEmpty() && messages.length < limit) {
+        const record = queue.dequeue()!;
+        const message = this.codec.decode<Data>(record);
+        const { timestamp, ttl } = message.metadata;
+
+        if (ttl && timestamp + ttl <= Date.now()) {
+          this.router.route(record, {
+            ...message.metadata,
+            attempts: Infinity,
+          });
+
+          continue;
+        }
+
+        messages.push(message);
+      }
+    }
+
+    this.recordConsumerLag(consumerId, messages.length);
+    return messages;
+  }
+
+  // misc
+  private _recordProducerActivity(producerId: string) {
+    const messageCount = this.producers.get(producerId)?.messageCount || 0;
+    this.totalMessagesPublished++;
+    this.producers.set(producerId, {
+      lastActiveAt: Date.now(),
+      messageCount: messageCount + 1,
+    });
+  }
+  recordConsumerLag(consumerId: string, count: number) {
+    const pending = this.consumers.get(consumerId)?.pendingMessages || 0;
+    this.consumers.set(consumerId, {
+      lastActiveAt: Date.now(),
+      pendingMessages: Math.max(0, pending - count),
+    });
+  }
+  getMetadata(): ITopicMetadata {
+    return {
+      name: this.name,
+      createdAt: new Date(this.timestamp).toISOString(),
+      pendingMessages: this.sharedUnicastQueue.size(),
+      producersCount: this.producers.size,
+      producersIds: [...this.producers.keys()],
+      totalMessagesPublished: this.totalMessagesPublished,
+      consumerCount: this.consumers.size,
+      consumerIds: [...this.consumers.keys()],
+    };
+  }
 }
 // TopicRegistry.ts (need sharding)
 class TopicRegistry {
-  private topics = new Map<string, Topic>();
+  private topics = new Map<string, Topic<any>>();
 
   constructor(
     private queueFactory: () => IPriorityQueue<Uint8Array>,
-    private hasherFactory: () => IConsistencyHasher
+    private routingStrategy: () => IRoutingStrategy,
+    private router: MessageRouter,
+    private codec: ICodec
   ) {}
 
-  create(name: string): Topic {
+  create<Data>(name: string): Topic<Data> {
     if (this.topics.has(name)) {
       throw new Error("Topic already exists");
     }
@@ -185,7 +518,13 @@ class TopicRegistry {
 
     this.topics.set(
       name,
-      new Topic(name, this.queueFactory(), this.hasherFactory())
+      new Topic<Data>(
+        name,
+        this.router,
+        this.routingStrategy(),
+        this.queueFactory(),
+        this.codec
+      )
     );
 
     return this.topics.get(name)!;
@@ -195,7 +534,7 @@ class TopicRegistry {
     return this.topics.keys();
   }
 
-  get(name: string): Topic | undefined {
+  get(name: string): Topic<any> | undefined {
     return this.topics.get(name);
   }
 
@@ -205,9 +544,7 @@ class TopicRegistry {
   }
 
   delete(name: string): void {
-    if (!this.topics.has(name)) {
-      throw new Error("Topic not found");
-    }
+    this.getOrThrow(name);
     this.topics.delete(name);
   }
 }
@@ -218,49 +555,53 @@ class ClientManager {
     private queueFactory: () => IPriorityQueue<Uint8Array>
   ) {}
 
-  registerConsumer(topicName: string, consumerId: string): Topic {
+  registerConsumer(topicName: string, consumerId: string) {
     const topic = this.topicRegistry.getOrThrow(topicName);
     topic?.unicastQueues.set(consumerId, this.queueFactory());
-    topic?.hasher.addNode(consumerId);
-    return topic!;
+    topic?.addConsumer(consumerId);
+    // TODO: logs
   }
 
   unregisterConsumer(topicName: string, consumerId: string): void {
     const topic = this.topicRegistry.getOrThrow(topicName);
     topic?.unicastQueues.delete(consumerId);
-    topic?.hasher.removeNode(consumerId);
+    topic?.removeConsumer(consumerId);
+    // TODO: logs
   }
 
-  registerProducer(topicName: string): Topic {
-    return this.topicRegistry.getOrThrow(topicName)!;
+  registerProducer(topicName: string, producerId: string) {
+    const topic = this.topicRegistry.getOrThrow(topicName)!;
+    topic?.addProducer(producerId);
+    // TODO: logs
+  }
+
+  unregisterProducer(topicName: string, producerId: string): void {
+    const topic = this.topicRegistry.getOrThrow(topicName)!;
+    topic?.removeProducer(producerId);
+    // TODO: logs and
   }
 }
 // DelayedQueueManager.ts
-interface IDelayedQueueManager {
-  setRouter(router: IMessageRouter): void;
-  addMessage(record: Uint8Array, ttd: number): void;
-}
-class DelayedQueueManager implements IDelayedQueueManager {
+class DelayedQueueManager {
   private nextTimeout?: number;
-  private router?: IMessageRouter;
 
-  constructor(private delayedQueue: IPriorityQueue<Uint8Array>) {}
-
-  setRouter(router: IMessageRouter): void {
-    this.router = router;
-  }
+  constructor(
+    private queue: IPriorityQueue<Uint8Array>,
+    private codec: ICodec,
+    private onRoute: (record: Uint8Array, metadata: IMessageMetadata) => void
+  ) {}
 
   addMessage(record: Uint8Array, ttd: number): void {
-    this.delayedQueue.enqueue(record, ttd);
+    this.queue.enqueue(record, ttd);
     this.scheduleDelivery();
   }
 
   private scheduleDelivery(): void {
     if (this.nextTimeout) clearTimeout(this.nextTimeout);
-    if (this.delayedQueue.isEmpty()) return;
+    if (this.queue.isEmpty()) return;
 
-    const record = this.delayedQueue.peek()!;
-    const message = MessageSerializer.decode(record);
+    const record = this.queue.peek()!;
+    const message = this.codec.decode(record);
     const { ttd, timestamp } = message.metadata;
     const delay = Math.max(0, timestamp + ttd! - Date.now());
 
@@ -270,136 +611,165 @@ class DelayedQueueManager implements IDelayedQueueManager {
   }
 
   private processQueue(): void {
-    if (!this.router) throw new Error("Router not set");
-
-    while (!this.delayedQueue.isEmpty()) {
-      const record = this.delayedQueue.dequeue()!;
-      const message = MessageSerializer.decode(record);
-      this.router.route(record, message.metadata);
-      // this.logger?.log(`[Delivered] ${message.metadata.id}`, "INFO");
+    while (!this.queue.isEmpty()) {
+      const record = this.queue.dequeue()!;
+      const message = this.codec.decode(record);
+      this.onRoute(record, message.metadata);
     }
 
     this.scheduleDelivery();
   }
 }
-// MessageRouter.ts
-interface IMessageRouter {
-  route(record: Uint8Array, metadata: IMessageMetadata): void;
+class DLQManager {
+  constructor(private queue: IPriorityQueue<Uint8Array>) {}
+
+  addMessage(record: Uint8Array) {
+    this.queue.enqueue(record);
+  }
 }
-class MessageRouter implements IMessageRouter {
+// MessageRouter.ts
+class MessageRouter {
   constructor(
     private topicRegistry: TopicRegistry,
-    private delayedQueueManager: IDelayedQueueManager,
-    private dlQueue: IPriorityQueue<Uint8Array>,
-    private maxDeliveryAttempts: number
+    private delayedQueueManager: DelayedQueueManager,
+    private dlqManager: DLQManager,
+    private maxDeliveryAttempts: number,
+    private eventBus?: EventEmitter
   ) {}
 
-  route(record: Uint8Array, metadata: IMessageMetadata): string {
-    if (this._shouldRouteToDLQ(metadata)) {
-      this.dlQueue.enqueue(record);
-      return "DLQ";
+  route(record: Uint8Array, metadata: IMessageMetadata): void {
+    if (this._isExpired(metadata)) {
+      this.dlqManager.addMessage(record);
+      this._log(metadata, {
+        ttl: metadata.ttl,
+        target: "DLQ",
+        reason: "TTL_EXPIRED",
+      });
+      return;
     }
 
-    if (this._shouldDelay(metadata)) {
+    if (this._isOutOfAttempts(metadata)) {
+      this.dlqManager.addMessage(record);
+      this._log(metadata, {
+        attempts: metadata.attempts,
+        target: "DLQ",
+        reason: "MAX_ATTEMPTS",
+      });
+      return;
+    }
+
+    if (this._isDelayed(metadata)) {
       this.delayedQueueManager.addMessage(record, metadata.ttd!);
-      return "DELAYED";
+      this._log(metadata, {
+        ttd: metadata.ttd,
+        target: "DELAYED",
+        reason: "TTD",
+      });
+      return;
     }
 
-    return this._routeToTopic(record, metadata);
+    this._routeToTopic(record, metadata);
   }
 
-  private _shouldRouteToDLQ(metadata: IMessageMetadata): boolean {
-    const { attempts, ttl, timestamp } = metadata;
-    if (attempts > this.maxDeliveryAttempts) return true;
-    if (ttl && timestamp + ttl <= Date.now()) return true;
-    return false;
+  private _isExpired({ ttl, timestamp }: IMessageMetadata): boolean {
+    return !!ttl && timestamp + ttl <= Date.now();
   }
 
-  private _shouldDelay({ ttd }: IMessageMetadata): boolean {
+  private _isOutOfAttempts({ attempts }: IMessageMetadata): boolean {
+    return attempts > this.maxDeliveryAttempts;
+  }
+
+  private _isDelayed({ ttd }: IMessageMetadata): boolean {
     return !!ttd && ttd > Date.now();
   }
 
-  private _routeToTopic(
-    record: Uint8Array,
-    metadata: IMessageMetadata
-  ): string {
+  private _routeToTopic(record: Uint8Array, metadata: IMessageMetadata) {
     const { topic: topicName, correlationId, priority } = metadata;
     const topic = this.topicRegistry.get(topicName);
     if (!topic) {
-      this.dlQueue.enqueue(record);
-      return "DLQ";
+      this.dlqManager.addMessage(record);
+      this._log(metadata, {
+        target: "DLQ",
+        reason: "TOPIC_NOT_EXIST",
+      });
+      return;
     }
 
     if (correlationId) {
-      const consumerId = topic.hasher.getNode(correlationId)!;
+      const consumerId = topic.getConsumerId(correlationId)!;
       topic.unicastQueues.get(consumerId)?.enqueue(record, priority);
     } else {
-      topic.broadcastQueue.enqueue(record, priority);
+      topic.sharedUnicastQueue.enqueue(record, priority);
     }
 
-    return topicName;
+    this._log(metadata, { target: topic?.name });
+  }
+
+  private _log(
+    metadata: IMessageMetadata,
+    extraFields: Record<string, unknown>
+  ) {
+    this.eventBus?.emit("routed", {
+      messageId: metadata.id,
+      topic: metadata.topic,
+      ...extraFields,
+    });
   }
 }
 // TopicBroker.ts (Facade)
-interface ITopicBrokerConfig {
-  maxDeliveryAttempts: number;
-  maxMessageSize: number;
-  defaultPollingInterval?: number;
-  // replicas: number;
-}
 class TopicBroker {
-  public readonly dlQueue: IPriorityQueue<Uint8Array>;
-  public router: MessageRouter;
-
   constructor(
-    public config: ITopicBrokerConfig,
-    private queueFactory: () => IPriorityQueue<Uint8Array>,
-    private hasherFactory: () => IConsistencyHasher,
-    private topicRegistry = new TopicRegistry(
-      this.queueFactory,
-      this.hasherFactory
-    ),
-    private clientManager = new ClientManager(
-      this.topicRegistry,
-      this.queueFactory
-    ),
-    private delayedQueueManager = new DelayedQueueManager(this.queueFactory()),
-    public logger?: Logger
-  ) {
-    this.dlQueue = this.queueFactory();
+    private readonly topicRegistry: TopicRegistry,
+    private readonly clientManager: ClientManager,
+    private readonly dlqManager: DLQManager,
+    private readonly router: MessageRouter,
+    private readonly eventBus: EventEmitter = new EventEmitter(),
+    private readonly codec: ICodec = new JSONCodec()
+  ) {}
 
-    this.router = new MessageRouter(
-      this.topicRegistry,
-      this.delayedQueueManager,
-      this.dlQueue,
-      this.config.maxDeliveryAttempts
-    );
+  getEventBus() {
+    return this.eventBus;
+  }
 
-    this.delayedQueueManager.setRouter(this.router);
+  getCodec() {
+    return this.codec;
+  }
+
+  route(record: Uint8Array, metadata: IMessageMetadata) {
+    // TODO: pre-routing logic (e.g., rate limiting)
+    this.router.route(record, metadata);
   }
 
   createTopic(name: string): void {
     this.topicRegistry.create(name);
   }
 
-  isTopicExist(name: string) {
-    this.topicRegistry.getOrThrow(name);
+  getTopic(name: string) {
+    return this.topicRegistry.get(name);
+  }
+
+  getTopicMetadata(name: string): ITopicMetadata | undefined {
+    return this.topicRegistry.getOrThrow(name)?.getMetadata();
   }
 
   deleteTopic(name: string) {
-    return this.topicRegistry.delete(name);
+    this.topicRegistry.delete(name);
   }
 
-  registerConsumer(topicName: string, consumerId: string): Topic {
-    return this.clientManager.registerConsumer(topicName, consumerId);
+  registerConsumer(topicName: string, consumerId: string) {
+    this.clientManager.registerConsumer(topicName, consumerId);
   }
 
   unregisterConsumer(topicName: string, consumerId: string) {
-    return this.clientManager.unregisterConsumer(topicName, consumerId);
+    this.clientManager.unregisterConsumer(topicName, consumerId);
   }
 
   registerProducer(topicName: string, producerId: string) {
-    return this.clientManager.registerProducer(topicName);
+    this.clientManager.registerProducer(topicName, producerId);
+  }
+
+  unregisterProducer(topicName: string, producerId: string) {
+    this.clientManager.unregisterProducer(topicName, producerId);
   }
 }
 //
@@ -407,18 +777,11 @@ class TopicBroker {
 //
 // Producer.ts (Facade)
 class Producer<Data> {
-  private static iterator = 1;
-  public readonly id: string;
-
   constructor(
-    private broker: TopicBroker,
-    private topicName: string,
-    private messageFactory = new MessageFactory<Data>(),
-    private validator = new MessageValidator(broker.config.maxMessageSize)
-  ) {
-    this.id = `producer-${Producer.iterator++}`;
-    this.broker.registerProducer(topicName, this.id);
-  }
+    private readonly topic: Topic<Data>,
+    private readonly messageFactory: MessageFactory<Data>,
+    private readonly options: { producerId: string; topic: string }
+  ) {}
 
   send(
     data: Data[],
@@ -427,67 +790,39 @@ class Producer<Data> {
       "priority" | "correlationId" | "ttd" | "ttl"
     >
   ): number {
+    const { topic, producerId } = this.options;
     const messages = this.messageFactory.create(data, {
       ...metadata,
-      topic: this.topicName,
+      topic,
     });
 
-    messages.forEach(({ message: { data, metadata }, record }) => {
-      this.validator.validate({ record, data });
-      const target = this.broker.router.route(record, metadata);
-
-      this.broker.logger?.log(
-        `[${this.id}] → ${target}: ${JSON.stringify(data)}`,
-        target === "DLQ" ? "DANGER" : "INFO"
-      );
+    messages.forEach(({ message: { metadata }, record }) => {
+      this.topic.send(producerId, record, metadata);
     });
 
     return messages.length;
   }
 }
-//
-//
-//
-// MessageFetcher.ts
-class MessageFetcher<Data> {
+class ProducerFactory {
+  private static iterator = 1;
   constructor(
-    private consumerId: string,
-    private topic: Topic,
-    private limit: number,
-    private ackManager: AckManager<Data>,
-    private onMessageExpired: (
-      record: Uint8Array,
-      metadata: IMessageMetadata
-    ) => void
+    private readonly broker: TopicBroker,
+    private readonly messageFactory: MessageFactory<any>
   ) {}
 
-  fetchMessages(options?: { signal?: AbortSignal }): Message<Data>[] {
-    if (options?.signal?.aborted) return [];
-
-    const messages: Message<Data>[] = [];
-    const queues = [
-      this.topic.unicastQueues.get(this.consumerId),
-      this.topic.broadcastQueue,
-    ];
-
-    for (const queue of queues) {
-      while (queue && !queue.isEmpty() && messages.length < this.limit) {
-        const record = queue.dequeue()!;
-        const message = MessageSerializer.decode<Data>(record);
-        const { timestamp, ttl } = message.metadata;
-
-        if (ttl && timestamp + ttl <= Date.now()) {
-          this.onMessageExpired(record, message.metadata);
-        } else {
-          messages.push(message);
-          this.ackManager.addToPending(message);
-        }
-      }
-    }
-
-    return messages;
+  create<Data>(topicName: string) {
+    const producerId = `producer-${ProducerFactory.iterator++}`;
+    this.broker.registerProducer(topicName, producerId);
+    const topic = this.broker.getTopic(topicName)!;
+    return new Producer<Data>(topic, this.messageFactory, {
+      topic: topicName,
+      producerId,
+    });
   }
 }
+//
+//
+//
 // AckManager.ts
 class AckManager<Data> {
   private pending = new Map<string, Message<Data>>();
@@ -502,29 +837,32 @@ class AckManager<Data> {
       : Array.from(this.pending.values());
   }
 
-  ack(messageId?: string): void {
-    if (messageId) this.pending.delete(messageId);
-    else this.pending.clear();
+  ack(messageId?: string): number {
+    if (messageId) {
+      this.pending.delete(messageId);
+      return 1;
+    }
+    const size = this.pending.size;
+    this.pending.clear();
+    return size;
   }
 }
 // SubscriptionManager.ts
-class SubscriptionManager {
+class SubscriptionManager<Data> {
   private isActive = false;
   private abortController = new AbortController();
 
-  constructor(
-    private messageFetcher: MessageFetcher<any>,
-    private interval = 100
-  ) {}
+  constructor(private interval = 1000) {}
 
   async subscribe(
-    handler: (messages: Message[]) => Promise<void>
+    fetcher: () => Message<Data>[],
+    handler: (messages: Message<Data>[]) => Promise<void>
   ): Promise<void> {
     this.isActive = true;
 
     while (this.isActive) {
       try {
-        const messages = this.messageFetcher.fetchMessages();
+        const messages = fetcher();
         if (messages.length > 0) await handler(messages);
         await wait(this.interval, this.abortController.signal);
       } catch (err) {
@@ -538,87 +876,99 @@ class SubscriptionManager {
     this.abortController.abort();
   }
 }
-// Consumer.ts (Facade)
+// src/consumers/Consumer.ts (Facade)
 class Consumer<Data> {
-  private static iterator = 1;
-  public readonly id: string;
-  private messageFetcher: MessageFetcher<Data>;
-  private subscriptionManager: SubscriptionManager;
-
   constructor(
-    private broker: TopicBroker,
-    private ackManager = new AckManager<Data>(),
-    private options: { topic: string; limit?: number; autoAck?: boolean }
-  ) {
-    this.id = `consumer-${Consumer.iterator++}`;
-    const topic = this.broker.registerConsumer(options.topic, this.id);
-
-    this.messageFetcher = new MessageFetcher(
-      this.id,
-      topic,
-      options.limit ?? 1,
-      this.ackManager,
-      this.onMessageExpired
-    );
-
-    this.subscriptionManager = new SubscriptionManager(
-      this.messageFetcher,
-      this.broker.config.defaultPollingInterval
-    );
-  }
-
-  private onMessageExpired(record: Uint8Array, metadata: IMessageMetadata) {
-    const target = this.broker.router.route(record, {
-      ...metadata,
-      attempts: Infinity,
-    });
-
-    this.broker.logger?.log(
-      `[${this.id}] → ${target}: ${JSON.stringify(
-        MessageSerializer.decode(record)?.data
-      )}`,
-      target === "DLQ" ? "DANGER" : "INFO"
-    );
-  }
+    private topic: Topic<Data>,
+    private ackManager: AckManager<Data>,
+    private subscriptionManager: SubscriptionManager<Data>,
+    private codec: ICodec,
+    private eventBus: EventEmitter,
+    private readonly options: {
+      consumerId: string;
+      topic: string;
+      limit?: number;
+      autoAck?: boolean;
+    }
+  ) {}
 
   consume(): Message<Data>[] {
-    const messages = this.messageFetcher.fetchMessages();
-    this.broker.logger?.log(
-      `[${this.id}] <= ${this.options.topic}: ${JSON.stringify(messages)}`,
-      "INFO"
-    );
+    const { consumerId, limit } = this.options;
+    const messages = this.topic.consume(consumerId, limit);
+    messages.forEach(this.ackManager.addToPending);
+
+    this.eventBus.emit("messagesConsumed", {
+      messageCount: messages.length,
+      ...this.options,
+    });
+
     return messages;
   }
 
   subscribe(handler: (messages: Message<Data>[]) => Promise<void>): void {
-    this.subscriptionManager.subscribe(handler);
+    this.subscriptionManager.subscribe(this.consume, handler);
   }
 
   unsubscribe(): void {
     this.subscriptionManager.unsubscribe();
-    // this.ackManager.nackAll(true);
   }
 
   ack(messageId?: string): void {
-    this.ackManager.ack(messageId);
+    const ackedCount = this.ackManager.ack(messageId);
+    this.topic.recordConsumerLag(this.options.consumerId, ackedCount);
   }
 
   nack(messageId?: string, requeue = true): void {
     const messages = this.ackManager.getMessages(messageId);
 
     messages.forEach((message) => {
-      const record = MessageSerializer.encode(message);
-      const target = this.broker.router.route(record, {
+      const record = this.codec.encode(message);
+      this.topic.send("", record, {
         ...message.metadata,
         attempts: requeue ? message.metadata.attempts + 1 : Infinity,
       });
-
-      this.broker.logger?.log(
-        `[${this.id}] → ${target}: ${JSON.stringify(message)}`,
-        target === "DLQ" ? "DANGER" : "INFO"
-      );
     });
 
     this.ackManager.ack(messageId);
+  }
+}
+// src/factories/ConsumerFactory.ts
+class ConsumerFactory {
+  private static consumerIterator = 1;
+
+  constructor(
+    private readonly broker: TopicBroker,
+    private readonly defaultOptions?: {
+      limit?: number;
+      autoAck?: boolean;
+      pollingInterval?: number;
+    }
+  ) {}
+
+  create<Data>(
+    topicName: string,
+    options?: typeof this.defaultOptions
+  ): Consumer<Data> {
+    const consumerId = `consumer-${ConsumerFactory.consumerIterator++}`;
+    this.broker.registerConsumer(topicName, consumerId);
+    const topic = this.broker.getTopic(topicName)!;
+    const limit = this.defaultOptions?.limit || options?.limit;
+    const autoAck = this.defaultOptions?.autoAck || options?.autoAck;
+    const pollingInterval =
+      this.defaultOptions?.pollingInterval || options?.pollingInterval;
+
+    return new Consumer<Data>(
+      topic,
+      new AckManager<Data>(),
+      new SubscriptionManager<Data>(pollingInterval),
+      this.broker.getCodec(),
+      this.broker.getEventBus(),
+      {
+        consumerId,
+        topic: topicName,
+        limit,
+        autoAck,
+      }
+    );
   }
 }

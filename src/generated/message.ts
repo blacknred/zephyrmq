@@ -36,18 +36,25 @@ function createBaseProtoMessage(): ProtoMessage {
 }
 
 export const ProtoMessage: MessageFns<ProtoMessage> = {
-  encode(message: ProtoMessage, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+  encode(
+    message: ProtoMessage,
+    writer: BinaryWriter = new BinaryWriter()
+  ): BinaryWriter {
     if (message.data.length !== 0) {
       writer.uint32(10).bytes(message.data);
     }
     if (message.metadata !== undefined) {
-      ProtoMessage_MessageMetadata.encode(message.metadata, writer.uint32(18).fork()).join();
+      ProtoMessage_MessageMetadata.encode(
+        message.metadata,
+        writer.uint32(18).fork()
+      ).join();
     }
     return writer;
   },
 
   decode(input: BinaryReader | Uint8Array, length?: number): ProtoMessage {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const reader =
+      input instanceof BinaryReader ? input : new BinaryReader(input);
     let end = length === undefined ? reader.len : reader.pos + length;
     const message = createBaseProtoMessage();
     while (reader.pos < end) {
@@ -66,7 +73,10 @@ export const ProtoMessage: MessageFns<ProtoMessage> = {
             break;
           }
 
-          message.metadata = ProtoMessage_MessageMetadata.decode(reader, reader.uint32());
+          message.metadata = ProtoMessage_MessageMetadata.decode(
+            reader,
+            reader.uint32()
+          );
           continue;
         }
       }
@@ -80,8 +90,12 @@ export const ProtoMessage: MessageFns<ProtoMessage> = {
 
   fromJSON(object: any): ProtoMessage {
     return {
-      data: isSet(object.data) ? bytesFromBase64(object.data) : new Uint8Array(0),
-      metadata: isSet(object.metadata) ? ProtoMessage_MessageMetadata.fromJSON(object.metadata) : undefined,
+      data: isSet(object.data)
+        ? bytesFromBase64(object.data)
+        : new Uint8Array(0),
+      metadata: isSet(object.metadata)
+        ? ProtoMessage_MessageMetadata.fromJSON(object.metadata)
+        : undefined,
     };
   },
 
@@ -96,15 +110,20 @@ export const ProtoMessage: MessageFns<ProtoMessage> = {
     return obj;
   },
 
-  create<I extends Exact<DeepPartial<ProtoMessage>, I>>(base?: I): ProtoMessage {
+  create<I extends Exact<DeepPartial<ProtoMessage>, I>>(
+    base?: I
+  ): ProtoMessage {
     return ProtoMessage.fromPartial(base ?? ({} as any));
   },
-  fromPartial<I extends Exact<DeepPartial<ProtoMessage>, I>>(object: I): ProtoMessage {
+  fromPartial<I extends Exact<DeepPartial<ProtoMessage>, I>>(
+    object: I
+  ): ProtoMessage {
     const message = createBaseProtoMessage();
     message.data = object.data ?? new Uint8Array(0);
-    message.metadata = (object.metadata !== undefined && object.metadata !== null)
-      ? ProtoMessage_MessageMetadata.fromPartial(object.metadata)
-      : undefined;
+    message.metadata =
+      object.metadata !== undefined && object.metadata !== null
+        ? ProtoMessage_MessageMetadata.fromPartial(object.metadata)
+        : undefined;
     return message;
   },
 };
@@ -125,221 +144,247 @@ function createBaseProtoMessage_MessageMetadata(): ProtoMessage_MessageMetadata 
   };
 }
 
-export const ProtoMessage_MessageMetadata: MessageFns<ProtoMessage_MessageMetadata> = {
-  encode(message: ProtoMessage_MessageMetadata, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.id !== "") {
-      writer.uint32(10).string(message.id);
-    }
-    if (message.topic !== "") {
-      writer.uint32(18).string(message.topic);
-    }
-    if (message.timestamp !== 0) {
-      writer.uint32(24).int64(message.timestamp);
-    }
-    if (message.attempts !== 0) {
-      writer.uint32(32).int32(message.attempts);
-    }
-    if (message.correlationId !== undefined) {
-      writer.uint32(42).string(message.correlationId);
-    }
-    if (message.priority !== undefined) {
-      writer.uint32(48).int32(message.priority);
-    }
-    if (message.ttl !== undefined) {
-      writer.uint32(56).int64(message.ttl);
-    }
-    if (message.ttd !== undefined) {
-      writer.uint32(64).int64(message.ttd);
-    }
-    if (message.batchId !== undefined) {
-      writer.uint32(74).string(message.batchId);
-    }
-    if (message.batchIndex !== undefined) {
-      writer.uint32(80).int32(message.batchIndex);
-    }
-    if (message.batchSize !== undefined) {
-      writer.uint32(88).int32(message.batchSize);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): ProtoMessage_MessageMetadata {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    let end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseProtoMessage_MessageMetadata();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.id = reader.string();
-          continue;
-        }
-        case 2: {
-          if (tag !== 18) {
-            break;
-          }
-
-          message.topic = reader.string();
-          continue;
-        }
-        case 3: {
-          if (tag !== 24) {
-            break;
-          }
-
-          message.timestamp = longToNumber(reader.int64());
-          continue;
-        }
-        case 4: {
-          if (tag !== 32) {
-            break;
-          }
-
-          message.attempts = reader.int32();
-          continue;
-        }
-        case 5: {
-          if (tag !== 42) {
-            break;
-          }
-
-          message.correlationId = reader.string();
-          continue;
-        }
-        case 6: {
-          if (tag !== 48) {
-            break;
-          }
-
-          message.priority = reader.int32();
-          continue;
-        }
-        case 7: {
-          if (tag !== 56) {
-            break;
-          }
-
-          message.ttl = longToNumber(reader.int64());
-          continue;
-        }
-        case 8: {
-          if (tag !== 64) {
-            break;
-          }
-
-          message.ttd = longToNumber(reader.int64());
-          continue;
-        }
-        case 9: {
-          if (tag !== 74) {
-            break;
-          }
-
-          message.batchId = reader.string();
-          continue;
-        }
-        case 10: {
-          if (tag !== 80) {
-            break;
-          }
-
-          message.batchIndex = reader.int32();
-          continue;
-        }
-        case 11: {
-          if (tag !== 88) {
-            break;
-          }
-
-          message.batchSize = reader.int32();
-          continue;
-        }
+export const ProtoMessage_MessageMetadata: MessageFns<ProtoMessage_MessageMetadata> =
+  {
+    encode(
+      message: ProtoMessage_MessageMetadata,
+      writer: BinaryWriter = new BinaryWriter()
+    ): BinaryWriter {
+      if (message.id !== "") {
+        writer.uint32(10).string(message.id);
       }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
+      if (message.topic !== "") {
+        writer.uint32(18).string(message.topic);
       }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
+      if (message.timestamp !== 0) {
+        writer.uint32(24).int64(message.timestamp);
+      }
+      if (message.attempts !== 0) {
+        writer.uint32(32).int32(message.attempts);
+      }
+      if (message.correlationId !== undefined) {
+        writer.uint32(42).string(message.correlationId);
+      }
+      if (message.priority !== undefined) {
+        writer.uint32(48).int32(message.priority);
+      }
+      if (message.ttl !== undefined) {
+        writer.uint32(56).int64(message.ttl);
+      }
+      if (message.ttd !== undefined) {
+        writer.uint32(64).int64(message.ttd);
+      }
+      if (message.batchId !== undefined) {
+        writer.uint32(74).string(message.batchId);
+      }
+      if (message.batchIndex !== undefined) {
+        writer.uint32(80).int32(message.batchIndex);
+      }
+      if (message.batchSize !== undefined) {
+        writer.uint32(88).int32(message.batchSize);
+      }
+      return writer;
+    },
 
-  fromJSON(object: any): ProtoMessage_MessageMetadata {
-    return {
-      id: isSet(object.id) ? globalThis.String(object.id) : "",
-      topic: isSet(object.topic) ? globalThis.String(object.topic) : "",
-      timestamp: isSet(object.timestamp) ? globalThis.Number(object.timestamp) : 0,
-      attempts: isSet(object.attempts) ? globalThis.Number(object.attempts) : 0,
-      correlationId: isSet(object.correlationId) ? globalThis.String(object.correlationId) : undefined,
-      priority: isSet(object.priority) ? globalThis.Number(object.priority) : undefined,
-      ttl: isSet(object.ttl) ? globalThis.Number(object.ttl) : undefined,
-      ttd: isSet(object.ttd) ? globalThis.Number(object.ttd) : undefined,
-      batchId: isSet(object.batchId) ? globalThis.String(object.batchId) : undefined,
-      batchIndex: isSet(object.batchIndex) ? globalThis.Number(object.batchIndex) : undefined,
-      batchSize: isSet(object.batchSize) ? globalThis.Number(object.batchSize) : undefined,
-    };
-  },
+    decode(
+      input: BinaryReader | Uint8Array,
+      length?: number
+    ): ProtoMessage_MessageMetadata {
+      const reader =
+        input instanceof BinaryReader ? input : new BinaryReader(input);
+      let end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseProtoMessage_MessageMetadata();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
 
-  toJSON(message: ProtoMessage_MessageMetadata): unknown {
-    const obj: any = {};
-    if (message.id !== "") {
-      obj.id = message.id;
-    }
-    if (message.topic !== "") {
-      obj.topic = message.topic;
-    }
-    if (message.timestamp !== 0) {
-      obj.timestamp = Math.round(message.timestamp);
-    }
-    if (message.attempts !== 0) {
-      obj.attempts = Math.round(message.attempts);
-    }
-    if (message.correlationId !== undefined) {
-      obj.correlationId = message.correlationId;
-    }
-    if (message.priority !== undefined) {
-      obj.priority = Math.round(message.priority);
-    }
-    if (message.ttl !== undefined) {
-      obj.ttl = Math.round(message.ttl);
-    }
-    if (message.ttd !== undefined) {
-      obj.ttd = Math.round(message.ttd);
-    }
-    if (message.batchId !== undefined) {
-      obj.batchId = message.batchId;
-    }
-    if (message.batchIndex !== undefined) {
-      obj.batchIndex = Math.round(message.batchIndex);
-    }
-    if (message.batchSize !== undefined) {
-      obj.batchSize = Math.round(message.batchSize);
-    }
-    return obj;
-  },
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
 
-  create<I extends Exact<DeepPartial<ProtoMessage_MessageMetadata>, I>>(base?: I): ProtoMessage_MessageMetadata {
-    return ProtoMessage_MessageMetadata.fromPartial(base ?? ({} as any));
-  },
-  fromPartial<I extends Exact<DeepPartial<ProtoMessage_MessageMetadata>, I>>(object: I): ProtoMessage_MessageMetadata {
-    const message = createBaseProtoMessage_MessageMetadata();
-    message.id = object.id ?? "";
-    message.topic = object.topic ?? "";
-    message.timestamp = object.timestamp ?? 0;
-    message.attempts = object.attempts ?? 0;
-    message.correlationId = object.correlationId ?? undefined;
-    message.priority = object.priority ?? undefined;
-    message.ttl = object.ttl ?? undefined;
-    message.ttd = object.ttd ?? undefined;
-    message.batchId = object.batchId ?? undefined;
-    message.batchIndex = object.batchIndex ?? undefined;
-    message.batchSize = object.batchSize ?? undefined;
-    return message;
-  },
-};
+            message.topic = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.timestamp = longToNumber(reader.int64());
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.attempts = reader.int32();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.correlationId = reader.string();
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.priority = reader.int32();
+            continue;
+          }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.ttl = longToNumber(reader.int64());
+            continue;
+          }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.ttd = longToNumber(reader.int64());
+            continue;
+          }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.batchId = reader.string();
+            continue;
+          }
+          case 10: {
+            if (tag !== 80) {
+              break;
+            }
+
+            message.batchIndex = reader.int32();
+            continue;
+          }
+          case 11: {
+            if (tag !== 88) {
+              break;
+            }
+
+            message.batchSize = reader.int32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    },
+
+    fromJSON(object: any): ProtoMessage_MessageMetadata {
+      return {
+        id: isSet(object.id) ? globalThis.String(object.id) : "",
+        topic: isSet(object.topic) ? globalThis.String(object.topic) : "",
+        timestamp: isSet(object.timestamp)
+          ? globalThis.Number(object.timestamp)
+          : 0,
+        attempts: isSet(object.attempts)
+          ? globalThis.Number(object.attempts)
+          : 0,
+        correlationId: isSet(object.correlationId)
+          ? globalThis.String(object.correlationId)
+          : undefined,
+        priority: isSet(object.priority)
+          ? globalThis.Number(object.priority)
+          : undefined,
+        ttl: isSet(object.ttl) ? globalThis.Number(object.ttl) : undefined,
+        ttd: isSet(object.ttd) ? globalThis.Number(object.ttd) : undefined,
+        batchId: isSet(object.batchId)
+          ? globalThis.String(object.batchId)
+          : undefined,
+        batchIndex: isSet(object.batchIndex)
+          ? globalThis.Number(object.batchIndex)
+          : undefined,
+        batchSize: isSet(object.batchSize)
+          ? globalThis.Number(object.batchSize)
+          : undefined,
+      };
+    },
+
+    toJSON(message: ProtoMessage_MessageMetadata): unknown {
+      const obj: any = {};
+      if (message.id !== "") {
+        obj.id = message.id;
+      }
+      if (message.topic !== "") {
+        obj.topic = message.topic;
+      }
+      if (message.timestamp !== 0) {
+        obj.timestamp = Math.round(message.timestamp);
+      }
+      if (message.attempts !== 0) {
+        obj.attempts = Math.round(message.attempts);
+      }
+      if (message.correlationId !== undefined) {
+        obj.correlationId = message.correlationId;
+      }
+      if (message.priority !== undefined) {
+        obj.priority = Math.round(message.priority);
+      }
+      if (message.ttl !== undefined) {
+        obj.ttl = Math.round(message.ttl);
+      }
+      if (message.ttd !== undefined) {
+        obj.ttd = Math.round(message.ttd);
+      }
+      if (message.batchId !== undefined) {
+        obj.batchId = message.batchId;
+      }
+      if (message.batchIndex !== undefined) {
+        obj.batchIndex = Math.round(message.batchIndex);
+      }
+      if (message.batchSize !== undefined) {
+        obj.batchSize = Math.round(message.batchSize);
+      }
+      return obj;
+    },
+
+    create<I extends Exact<DeepPartial<ProtoMessage_MessageMetadata>, I>>(
+      base?: I
+    ): ProtoMessage_MessageMetadata {
+      return ProtoMessage_MessageMetadata.fromPartial(base ?? ({} as any));
+    },
+    fromPartial<I extends Exact<DeepPartial<ProtoMessage_MessageMetadata>, I>>(
+      object: I
+    ): ProtoMessage_MessageMetadata {
+      const message = createBaseProtoMessage_MessageMetadata();
+      message.id = object.id ?? "";
+      message.topic = object.topic ?? "";
+      message.timestamp = object.timestamp ?? 0;
+      message.attempts = object.attempts ?? 0;
+      message.correlationId = object.correlationId ?? undefined;
+      message.priority = object.priority ?? undefined;
+      message.ttl = object.ttl ?? undefined;
+      message.ttd = object.ttd ?? undefined;
+      message.batchId = object.batchId ?? undefined;
+      message.batchIndex = object.batchIndex ?? undefined;
+      message.batchSize = object.batchSize ?? undefined;
+      return message;
+    },
+  };
 
 function bytesFromBase64(b64: string): Uint8Array {
   if ((globalThis as any).Buffer) {
@@ -366,17 +411,31 @@ function base64FromBytes(arr: Uint8Array): string {
   }
 }
 
-type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;
+type Builtin =
+  | Date
+  | Function
+  | Uint8Array
+  | string
+  | number
+  | boolean
+  | undefined;
 
-export type DeepPartial<T> = T extends Builtin ? T
-  : T extends globalThis.Array<infer U> ? globalThis.Array<DeepPartial<U>>
-  : T extends ReadonlyArray<infer U> ? ReadonlyArray<DeepPartial<U>>
-  : T extends {} ? { [K in keyof T]?: DeepPartial<T[K]> }
+export type DeepPartial<T> = T extends Builtin
+  ? T
+  : T extends globalThis.Array<infer U>
+  ? globalThis.Array<DeepPartial<U>>
+  : T extends ReadonlyArray<infer U>
+  ? ReadonlyArray<DeepPartial<U>>
+  : T extends {}
+  ? { [K in keyof T]?: DeepPartial<T[K]> }
   : Partial<T>;
 
 type KeysOfUnion<T> = T extends T ? keyof T : never;
-export type Exact<P, I extends P> = P extends Builtin ? P
-  : P & { [K in keyof P]: Exact<P[K], I[K]> } & { [K in Exclude<keyof I, KeysOfUnion<P>>]: never };
+export type Exact<P, I extends P> = P extends Builtin
+  ? P
+  : P & { [K in keyof P]: Exact<P[K], I[K]> } & {
+      [K in Exclude<keyof I, KeysOfUnion<P>>]: never;
+    };
 
 function longToNumber(int64: { toString(): string }): number {
   const num = globalThis.Number(int64.toString());
