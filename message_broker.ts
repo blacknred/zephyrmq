@@ -120,21 +120,39 @@ bus.on("consumerLag", ({ topic, onsumerId: consumer_id, lag }) => {
 //
 //
 
-//
-//
-//
-// interfaces.ts
-interface IPriorityQueue<Data = any> {
-  enqueue(data: Data, priority?: number): void;
-  dequeue(): Data | undefined;
-  peek(): Data | undefined;
-  isEmpty(): boolean;
-  size(): number;
+// SRC/MESSAGE.TS
+interface IMessageMetadata {
+  id: string;
+  topic: string;
+  attempts: number;
+  timestamp: number;
+  correlationId?: string;
+  priority?: number;
+  ttl?: number;
+  ttd?: number;
+  batchId?: string;
+  batchIndex?: number;
+  batchSize?: number;
+  consumedAt?: number;
+}
+class Message<Data = any> {
+  public metadata: IMessageMetadata;
+  constructor(
+    public data: Data,
+    metadata: Omit<IMessageMetadata, "timestamp" | "attempts">
+  ) {
+    this.metadata = {
+      ...metadata,
+      timestamp: Date.now(),
+      attempts: 1,
+    };
+  }
 }
 //
 //
 //
-// ConsistencyHasher.ts
+//
+// SRC/HASHER/
 interface IHashService {
   hash(key: string): number;
 }
@@ -187,14 +205,28 @@ class InMemoryConsistencyHasher implements IConsistencyHasher {
     return this.ring.get(node);
   }
 }
-//
-//
-//
-// src/codecs/JSONCodec.ts
-interface ICodec {
-  encode<T>(message: Message<T>): Uint8Array;
-  decode<T>(bytes: Uint8Array): Message<T>;
+interface IRoutingStrategy {
+  getConsumerId(key: string): string;
+  addConsumer(id: string): void;
+  removeConsumer(id: string): void;
 }
+class ConsistentHashingStrategy implements IRoutingStrategy {
+  constructor(private hasher: IConsistencyHasher) {}
+
+  getConsumerId(key: string) {
+    return this.hasher.getNode(key)!;
+  }
+  addConsumer(id: string) {
+    return this.hasher.addNode(id);
+  }
+  removeConsumer(id: string) {
+    return this.hasher.removeNode(id);
+  }
+}
+//
+//
+//
+// SRC/CODECS/
 const messageSchema = z.object({
   data: z.unknown(),
   metadata: z.object({
@@ -227,7 +259,7 @@ class ProtobufCodec implements ICodec {
     const { timestamp, attempts, priority, ttd, ttl, batchIndex, batchSize } =
       metadata;
     const protoMsg = ProtoMessage.create({
-      data: this.serializeData(data), // 👈 Custom data serializer
+      data: this.serializeData(data),
       metadata: {
         ...metadata,
         // Convert all numbers to bigint
@@ -261,113 +293,373 @@ class ProtobufCodec implements ICodec {
   }
 
   private serializeData<T>(data: T): Uint8Array {
-    // Use JSON as default, but can be overridden
+    // no data schema fallback - just binary
     return new TextEncoder().encode(JSON.stringify(data));
   }
 
   private deserializeData<T>(bytes: Uint8Array): T {
+    // no data schema fallback - just binary
     return JSON.parse(new TextDecoder().decode(bytes));
   }
 }
 //
 //
 //
-// Message.ts
-interface IMessageMetadata {
-  id: string;
-  topic: string;
-  attempts: number;
-  timestamp: number;
-  correlationId?: string;
-  priority?: number;
-  ttl?: number;
-  ttd?: number;
-  batchId?: string;
-  batchIndex?: number;
-  batchSize?: number;
+//
+// SRC/CONTEXT.TS
+interface IPriorityQueue<Data = any> {
+  enqueue(data: Data, priority?: number): void;
+  dequeue(): Data | undefined;
+  peek(): Data | undefined;
+  isEmpty(): boolean;
+  size(): number;
 }
-class Message<Data = any> {
-  public metadata: IMessageMetadata;
-  constructor(
-    public data: Data,
-    metadata: Omit<IMessageMetadata, "timestamp" | "attempts">
-  ) {
-    this.metadata = {
-      ...metadata,
-      timestamp: Date.now(),
-      attempts: 1,
-    };
-  }
+interface ICodec {
+  encode<T>(message: Message<T>): Uint8Array;
+  decode<T>(bytes: Uint8Array): Message<T>;
 }
-// src/validators.ts
 interface IValidator<Data> {
   validate(data: { message: Message<Data>; record: Uint8Array }): void;
 }
-class SizeValidator implements IValidator<Uint8Array> {
-  constructor(private maxSize: number) {}
-
-  validate({ record }: { record: Uint8Array }) {
-    if (record.length > this.maxSize) throw new Error("Message too large");
+interface IContext {
+  codec: ICodec;
+  eventBus: EventEmitter;
+  queueFactory: () => IPriorityQueue<Uint8Array>;
+  validator?: IValidator<any>;
+}
+class Context implements IContext {
+  constructor(
+    public codec: ICodec,
+    public eventBus: EventEmitter,
+    public queueFactory: () => IPriorityQueue<Uint8Array>,
+    public validator?: IValidator<any>
+  ) {}
+}
+//
+//
+//
+//
+// SRC/PIPELINE/PROCESSOR.TS
+interface IMessageProcessor {
+  process(record: Uint8Array, metadata: IMessageMetadata): boolean;
+}
+abstract class BaseProcessor implements IMessageProcessor {
+  constructor(protected context: IContext) {}
+  abstract process(record: Uint8Array, metadata: IMessageMetadata): boolean;
+  protected decode<Data>(record: Uint8Array): Message<Data> {
+    return this.context.codec.decode(record);
   }
 }
-class MessageValidator<Data> implements IValidator<Data> {
-  constructor(private schema: Zod.Schema<Data>) {}
-
-  validate({ message }: { message: Message<Data> }) {
-    this.schema.parse(message);
-  }
-}
-// src/factories/MessageFactory.ts
-class MessageFactory<Data> {
-  constructor(private validators: IValidator<Data>[], private codec: ICodec) {}
-
-  create(
-    data: Data[],
-    metadata: Partial<IMessageMetadata> & { topic: string }
-  ): Array<{ message: Message<Data>; record: Uint8Array }> {
-    return data.map((item, index) => {
-      const message = new Message(item, {
-        ...metadata,
-        id: crypto.randomUUID(),
-        ...(data.length > 1 && {
-          batchId: `batch-${Date.now()}`,
-          batchIndex: index,
-          batchSize: data.length,
-        }),
+// SRC/PIPELINE/PROCESSORS/
+class ExpirationProcessor extends BaseProcessor {
+  process(record: Uint8Array, metadata: IMessageMetadata): boolean {
+    if (!metadata.ttl) return false;
+    const isExpired = metadata.timestamp + metadata.ttl <= Date.now();
+    if (isExpired) {
+      this.context.eventBus.emit("expired", {
+        record,
+        metadata: {
+          ...metadata,
+          attempts: Infinity,
+        },
       });
-      const record = {
-        message,
-        record: this.codec.encode(message),
-      };
+    }
+    return isExpired;
+  }
+}
+class AttemptsProcessor extends BaseProcessor {
+  constructor(context: IContext, private maxAttempts: number) {
+    super(context);
+  }
+  process(record: Uint8Array, metadata: IMessageMetadata): boolean {
+    const shouldDeadLetter = metadata.attempts > this.maxAttempts;
+    if (shouldDeadLetter) {
+      this.context.eventBus.emit("maxAttempts", { record, metadata });
+    }
+    return shouldDeadLetter;
+  }
+}
+class DelayProcessor extends BaseProcessor {
+  constructor(context: IContext, private delayedQueue: IQueueStrategy) {
+    super(context);
+  }
+  process(record: Uint8Array, metadata: IMessageMetadata): boolean {
+    const shouldDelay = !!metadata.ttd && metadata.ttd > Date.now();
+    if (shouldDelay) {
+      this.delayedQueue.enqueue(record, metadata);
+      this.context.eventBus.emit("delayed", { record, metadata });
+    }
+    return shouldDelay;
+  }
+}
+class NoTopicProcessor extends BaseProcessor {
+  constructor(context: IContext, private topicRegistry: TopicRegistry) {
+    super(context);
+  }
+  process(record: Uint8Array, metadata: IMessageMetadata): boolean {
+    const topicExists = this.topicRegistry.get(metadata.topic);
 
-      this.validators.forEach((v) => v.validate(record));
-      return record;
+    if (!topicExists) {
+      this.context.eventBus.emit("deadLetter", { record });
+      this.context.eventBus.emit("topicNotFound", { record, metadata });
+      return true;
+    }
+
+    return false;
+  }
+}
+// SRC/PIPELINE/MESSAGE_PIPELINE.TS
+class MessagePipeline {
+  private processors: IMessageProcessor[] = [];
+  constructor(private context: IContext) {}
+  addProcessor(processor: IMessageProcessor): void {
+    this.processors.push(processor);
+  }
+  async process(
+    record: Uint8Array,
+    metadata: IMessageMetadata
+  ): Promise<boolean> {
+    for (const processor of this.processors) {
+      if (processor.process(record, metadata)) return true;
+    }
+    return false;
+  }
+}
+// SRC/PIPELINE/FACTORY
+class PipelineFactory {
+  constructor(
+    private context: IContext,
+    private topicRegistry: TopicRegistry,
+    private maxAttempts: number = 5
+  ) {}
+
+  create(): MessagePipeline {
+    const pipeline = new MessagePipeline(this.context);
+    const delayedQueue = new DelayedQueueStrategy(this.context);
+
+    pipeline.addProcessor(
+      new NoTopicProcessor(this.context, this.topicRegistry)
+    );
+    pipeline.addProcessor(new ExpirationProcessor(this.context));
+    pipeline.addProcessor(
+      new AttemptsProcessor(this.context, this.maxAttempts)
+    );
+    pipeline.addProcessor(new DelayProcessor(this.context, delayedQueue));
+
+    return pipeline;
+  }
+}
+//
+//
+//
+//
+// SRC/QUEUES/STRATEGIES.TS
+interface IQueueStrategy {
+  enqueue(record: Uint8Array, metadata: IMessageMetadata): void;
+  dequeue(): Uint8Array | undefined;
+  size(): number;
+}
+class PriorityQueueStrategy implements IQueueStrategy {
+  constructor(private queue: IPriorityQueue<Uint8Array>) {}
+  enqueue(record: Uint8Array, metadata: IMessageMetadata): void {
+    this.queue.enqueue(record, metadata.priority);
+  }
+  dequeue(): Uint8Array | undefined {
+    return this.queue.dequeue();
+  }
+  size(): number {
+    return this.queue.size();
+  }
+}
+class DelayedQueueStrategy implements IQueueStrategy {
+  private nextTimeout?: number;
+  constructor(
+    private context: IContext,
+    private queue = this.context.queueFactory()
+  ) {}
+  enqueue(record: Uint8Array, metadata: IMessageMetadata): void {
+    if (!metadata.ttd) throw new Error("TTD required for delayed messages");
+    this.queue.enqueue(record, metadata.ttd);
+    this.scheduleDelivery();
+  }
+  private scheduleDelivery(): void {
+    if (this.nextTimeout) clearTimeout(this.nextTimeout);
+    if (this.queue.isEmpty()) return;
+
+    const record = this.queue.peek()!;
+    const message = this.context.codec.decode(record);
+    const { ttd, timestamp } = message.metadata;
+    const delay = Math.max(0, timestamp + ttd! - Date.now());
+
+    this.nextTimeout = setTimeout(() => {
+      this.processQueue();
+    }, delay);
+  }
+
+  private processQueue(): void {
+    // while (!this.queue.isEmpty()) {
+    const record = this.queue.dequeue()!;
+    const { metadata } = this.context.codec.decode(record);
+    this.context.eventBus.on("delayedMessageReady", { record, metadata });
+    // }
+    this.scheduleDelivery();
+  }
+
+  dequeue(): Uint8Array | undefined {
+    return undefined; // Delayed queue doesn't support direct dequeue
+  }
+
+  size(): number {
+    return this.queue.size();
+  }
+}
+//
+//
+//
+//
+// MESSAGE_ROUTER.TS
+class DLQManager {
+  constructor(
+    private queue: IPriorityQueue<Uint8Array>,
+    private eventBus: EventEmitter
+  ) {
+    eventBus.on("deadLetter", ({ record }) => this.addMessage(record));
+  }
+  addMessage(record: Uint8Array) {
+    this.queue.enqueue(record);
+  }
+}
+class MessageRouter {
+  private pipeline: MessagePipeline;
+  constructor(
+    private topicRegistry: TopicRegistry,
+    private dlqManager: DLQManager,
+    private context: IContext,
+    maxAttempts: number
+  ) {
+    this.pipeline = new PipelineFactory(
+      context,
+      this.topicRegistry,
+      maxAttempts
+    ).create();
+
+    context.eventBus.on("delayedMessageReady", ({ record, metadata }) => {
+      this.route(record, metadata);
     });
   }
-}
-//
-//
-//
-// routing-engine.ts
-interface IRoutingStrategy {
-  getConsumerId(topic: string, key: string): string;
-  addConsumer(topic: string, id: string): void;
-  removeConsumer(topic: string, id: string): void;
-}
-class ConsistentHashingStrategy implements IRoutingStrategy {
-  constructor(private hasher: IConsistencyHasher) {}
 
-  getConsumerId(_topic: string, key: string) {
-    return this.hasher.getNode(key)!;
-  }
-  addConsumer(_topic: string, id: string) {
-    return this.hasher.addNode(id);
-  }
-  removeConsumer(_topic: string, id: string) {
-    return this.hasher.removeNode(id);
+  async route(record: Uint8Array, metadata: IMessageMetadata): Promise<void> {
+    if (await this.pipeline.process(record, metadata)) return;
+
+    const topic = this.topicRegistry.get(metadata.topic)!;
+    topic.queues.enqueue(record, metadata);
+    this.context.eventBus.emit("routed", { record, metadata });
   }
 }
-// Topic.ts
+//
+//
+//
+//
+// SRC/TOPICS/MEMBERSHIP.TS
+class TopicMembershipManager {
+  private producers = new Map<string, IClientMetadata>();
+  private consumers = new Map<string, IClientMetadata>();
+  constructor(private eventBus: EventEmitter) {}
+
+  addProducer(id: string): void {
+    this.producers.set(id, { lastActiveAt: Date.now() });
+    this.eventBus.emit("producerAdded", { producerId: id });
+  }
+
+  removeProducer(id: string): void {
+    this.producers.delete(id);
+    this.eventBus.emit("producerRemoved", { producerId: id });
+  }
+
+  addConsumer(id: string): void {
+    this.consumers.set(id, { lastActiveAt: Date.now() });
+    this.eventBus.emit("consumerAdded", { consumerId: id });
+  }
+
+  removeConsumer(id: string): void {
+    this.consumers.delete(id);
+    this.eventBus.emit("consumerRemoved", { consumerId: id });
+  }
+
+  getMembership(): { producers: string[]; consumers: string[] } {
+    return {
+      producers: Array.from(this.producers.keys()),
+      consumers: Array.from(this.consumers.keys()),
+    };
+  }
+}
+// SRC/TOPICS/QUEUE_MANAGER.TS
+class TopicQueueManager {
+  private unicastQueues = new Map<string, IQueueStrategy>();
+  constructor(
+    private sharedQueue: IQueueStrategy,
+    private routingStrategy: IRoutingStrategy,
+    private context: IContext
+  ) {}
+
+  getQueue(key?: string): IQueueStrategy {
+    if (key) {
+      const targetConsumer = this.routingStrategy.getConsumerId(key);
+      return this.unicastQueues.get(targetConsumer) || this.sharedQueue;
+    }
+    return this.sharedQueue;
+  }
+
+  addConsumerQueue(consumerId: string): void {
+    this.unicastQueues.set(
+      consumerId,
+      new PriorityQueueStrategy(this.context.queueFactory())
+    );
+  }
+
+  removeConsumerQueue(consumerId: string): void {
+    this.unicastQueues.delete(consumerId);
+  }
+
+  enqueue(record: Uint8Array, metadata: IMessageMetadata): void {
+    const queue = this.getQueue(metadata.correlationId);
+    queue.enqueue(record, metadata);
+  }
+
+  dequeue(consumerId: string): Uint8Array | undefined {
+    const queue = this.unicastQueues.get(consumerId);
+    if (queue?.size()) return queue.dequeue();
+    return this.sharedQueue.dequeue();
+  }
+}
+// SRC/TOPICS/METRICS.TS
+class TopicMetricsCollector {
+  private totalMessagesPublished = 0;
+  private timestamp = Date.now();
+
+  constructor(private eventBus: EventEmitter) {}
+
+  recordMessagePublished(producerId?: string): void {
+    this.totalMessagesPublished++;
+    if (producerId) {
+      this.eventBus.emit("messagePublished", { producerId });
+    }
+  }
+
+  getMetrics(): ITopicMetadata {
+    return {
+      name: "",
+      createdAt: new Date(this.timestamp).toISOString(),
+      pendingMessages: 0,
+      producersCount: 0,
+      producersIds: [],
+      totalMessagesPublished: this.totalMessagesPublished,
+      consumerCount: 0,
+      consumerIds: [],
+    };
+  }
+}
+// SRC/TOPICS/TOPIC.TS
 interface ITopicMetadata {
   name: string;
   createdAt: string;
@@ -377,19 +669,11 @@ interface ITopicMetadata {
   totalMessagesPublished: number;
   consumerCount: number;
   consumerIds: string[];
-  lagPerConsumer?: Record<
-    // Message lag per consumer (queue depth)
-    string, // Consumer ID
-    number // Pending messages
-  >;
   // config: {
   //   retentionMs?: number;           // How long messages are retained
   //   maxSizeBytes?: number;          // Max topic size
   //   partitions?: number;            // Number of partitions (if partitioned)
   // };
-  // subscriptionTypes: ("unicast" | "broadcast")[];
-  // broadcastConsumerCount: number;    // Consumers listening to broadcasts
-  // unicastConsumerCount: number;     // Consumers with dedicated queues
 }
 interface IClientMetadata {
   lastActiveAt: number;
@@ -397,114 +681,73 @@ interface IClientMetadata {
   pendingMessages?: number;
 }
 class Topic<Data> {
-  timestamp = Date.now();
-  private totalMessagesPublished: number = 0;
-  private producers = new Map<string, IClientMetadata>();
-  private consumers = new Map<string, IClientMetadata>();
-  unicastQueues: Map<string, IPriorityQueue<Uint8Array>> = new Map();
+  public readonly metrics: TopicMetricsCollector;
+  public readonly membership: TopicMembershipManager;
+  public readonly queues: TopicQueueManager;
 
   constructor(
     public name: string,
     private router: MessageRouter,
     private routingStrategy: IRoutingStrategy,
-    private sharedUnicastQueue: IPriorityQueue<Uint8Array>,
-    private codec: ICodec
-  ) {}
-
-  getConsumerId(key: string) {
-    return this.routingStrategy.getConsumerId(this.name, key);
-  }
-  addConsumer(id: string) {
-    this.routingStrategy.addConsumer(this.name, id);
-    this.consumers.set(id, { lastActiveAt: Date.now() });
-  }
-  removeConsumer(id: string) {
-    this.unicastQueues.delete(id);
-    this.routingStrategy.removeConsumer(this.name, id);
-    this.consumers.delete(id);
-  }
-  addProducer(id: string) {
-    this.producers.set(id, { lastActiveAt: Date.now() });
-  }
-  removeProducer(id: string) {
-    this.producers.delete(id);
+    private context: IContext
+  ) {
+    this.metrics = new TopicMetricsCollector(context.eventBus);
+    this.membership = new TopicMembershipManager(context.eventBus);
+    this.queues = new TopicQueueManager(
+      new PriorityQueueStrategy(context.queueFactory()),
+      routingStrategy,
+      context
+    );
   }
 
-  // message handling
-  send(producerId: string, record: Uint8Array, metadata: IMessageMetadata) {
+  send(
+    producerId: string,
+    record: Uint8Array,
+    metadata: IMessageMetadata
+  ): void {
     this.router.route(record, metadata);
-    if (producerId) this._recordProducerActivity(producerId);
+    this.metrics.recordMessagePublished(producerId);
   }
-  consume(consumerId: string, limit = 1, signal?: AbortSignal) {
-    if (signal?.aborted) return [];
 
-    const messages: Message<Data>[] = [];
-    const queues = [
-      this.unicastQueues.get(consumerId),
-      this.sharedUnicastQueue,
-    ];
+  consume(consumerId: string): Message | undefined {
+    const record = this.queues.dequeue(consumerId);
+    if (!record) return;
+    const message = this.context.codec.decode<Data>(record);
+    const { timestamp, ttl } = message.metadata;
 
-    for (const queue of queues) {
-      while (queue && !queue.isEmpty() && messages.length < limit) {
-        const record = queue.dequeue()!;
-        const message = this.codec.decode<Data>(record);
-        const { timestamp, ttl } = message.metadata;
-
-        if (ttl && timestamp + ttl <= Date.now()) {
-          this.router.route(record, {
-            ...message.metadata,
-            attempts: Infinity,
-          });
-
-          continue;
-        }
-
-        messages.push(message);
-      }
+    if (ttl && timestamp + ttl <= Date.now()) {
+      this.router.route(record, {
+        ...message.metadata,
+        attempts: Infinity,
+      });
+      return;
     }
-
-    this.recordConsumerLag(consumerId, messages.length);
-    return messages;
+    return message;
   }
 
-  // misc
-  private _recordProducerActivity(producerId: string) {
-    const messageCount = this.producers.get(producerId)?.messageCount || 0;
-    this.totalMessagesPublished++;
-    this.producers.set(producerId, {
-      lastActiveAt: Date.now(),
-      messageCount: messageCount + 1,
-    });
-  }
-  recordConsumerLag(consumerId: string, count: number) {
-    const pending = this.consumers.get(consumerId)?.pendingMessages || 0;
-    this.consumers.set(consumerId, {
-      lastActiveAt: Date.now(),
-      pendingMessages: Math.max(0, pending - count),
-    });
-  }
   getMetadata(): ITopicMetadata {
+    const base = this.metrics.getMetrics();
+    const { producers, consumers } = this.membership.getMembership();
+
     return {
+      ...base,
       name: this.name,
-      createdAt: new Date(this.timestamp).toISOString(),
-      pendingMessages: this.sharedUnicastQueue.size(),
-      producersCount: this.producers.size,
-      producersIds: [...this.producers.keys()],
-      totalMessagesPublished: this.totalMessagesPublished,
-      consumerCount: this.consumers.size,
-      consumerIds: [...this.consumers.keys()],
+      producersCount: producers.length,
+      producersIds: producers,
+      consumerCount: consumers.length,
+      consumerIds: consumers,
+      pendingMessages: this.queues.getQueue().size(),
     };
   }
 }
-// TopicRegistry.ts (need sharding)
+// SRC/TOPICS/TOPICREGISTRY.TS
 class TopicRegistry {
   private topics = new Map<string, Topic<any>>();
 
   constructor(
-    private queueFactory: () => IPriorityQueue<Uint8Array>,
-    private routingStrategy: () => IRoutingStrategy,
     private router: MessageRouter,
-    private codec: ICodec
+    private routingStrategy: () => IRoutingStrategy,
+    private context: IContext
   ) {}
 
   create<Data>(name: string): Topic<Data> {
@@ -518,13 +761,7 @@ class TopicRegistry {
 
     this.topics.set(
       name,
-      new Topic<Data>(
-        name,
-        this.router,
-        this.routingStrategy(),
-        this.queueFactory(),
-        this.codec
-      )
+      new Topic<Data>(name, this.router, this.routingStrategy(), this.context)
     );
 
     return this.topics.get(name)!;
@@ -548,273 +785,239 @@ class TopicRegistry {
     this.topics.delete(name);
   }
 }
-// ClientManager.ts
-class ClientManager {
-  constructor(
-    private topicRegistry: TopicRegistry,
-    private queueFactory: () => IPriorityQueue<Uint8Array>
-  ) {}
+// SRC/TOPICS/TOPICBROKER.TS (Facade)
+class TopicBroker {
+  private dlqManager: DLQManager;
+  private router: MessageRouter;
 
-  registerConsumer(topicName: string, consumerId: string) {
+  constructor(
+    private readonly topicRegistry: TopicRegistry,
+    private context: IContext,
+    private config: {
+      maxDeliveryAttempts?: number;
+      delayedQueuePolling?: number;
+    } = {}
+  ) {
+    this.dlqManager = new DLQManager(
+      this.context.queueFactory(),
+      this.context.eventBus
+    );
+    this.router = new MessageRouter(
+      this.topicRegistry,
+      this.dlqManager,
+      this.context,
+      this.config.maxDeliveryAttempts ?? 5
+    );
+  }
+
+  // Client Registration
+
+  registerProducer(topicName: string, producerId: string): void {
+    this.topicRegistry
+      .getOrThrow(topicName)!
+      .membership.addProducer(producerId);
+  }
+
+  unregisterProducer(topicName: string, producerId: string): void {
+    this.topicRegistry
+      .getOrThrow(topicName)!
+      .membership.removeProducer(producerId);
+  }
+
+  registerConsumer(topicName: string, consumerId: string): void {
     const topic = this.topicRegistry.getOrThrow(topicName);
-    topic?.unicastQueues.set(consumerId, this.queueFactory());
-    topic?.addConsumer(consumerId);
-    // TODO: logs
+    topic!.membership.addConsumer(consumerId);
+    topic!.queues.addConsumerQueue(consumerId);
   }
 
   unregisterConsumer(topicName: string, consumerId: string): void {
     const topic = this.topicRegistry.getOrThrow(topicName);
-    topic?.unicastQueues.delete(consumerId);
-    topic?.removeConsumer(consumerId);
-    // TODO: logs
+    topic!.membership.removeConsumer(consumerId);
+    topic!.queues.removeConsumerQueue(consumerId);
   }
 
-  registerProducer(topicName: string, producerId: string) {
-    const topic = this.topicRegistry.getOrThrow(topicName)!;
-    topic?.addProducer(producerId);
-    // TODO: logs
+  // Topic Management
+
+  createTopic(name: string): Topic<any> {
+    return this.topicRegistry.create(name);
   }
 
-  unregisterProducer(topicName: string, producerId: string): void {
-    const topic = this.topicRegistry.getOrThrow(topicName)!;
-    topic?.removeProducer(producerId);
-    // TODO: logs and
-  }
-}
-// DelayedQueueManager.ts
-class DelayedQueueManager {
-  private nextTimeout?: number;
-
-  constructor(
-    private queue: IPriorityQueue<Uint8Array>,
-    private codec: ICodec,
-    private onRoute: (record: Uint8Array, metadata: IMessageMetadata) => void
-  ) {}
-
-  addMessage(record: Uint8Array, ttd: number): void {
-    this.queue.enqueue(record, ttd);
-    this.scheduleDelivery();
+  getTopic(name: string): Topic<any> | undefined {
+    return this.topicRegistry.get(name);
   }
 
-  private scheduleDelivery(): void {
-    if (this.nextTimeout) clearTimeout(this.nextTimeout);
-    if (this.queue.isEmpty()) return;
-
-    const record = this.queue.peek()!;
-    const message = this.codec.decode(record);
-    const { ttd, timestamp } = message.metadata;
-    const delay = Math.max(0, timestamp + ttd! - Date.now());
-
-    this.nextTimeout = setTimeout(() => {
-      this.processQueue();
-    }, delay);
+  deleteTopic(name: string): void {
+    this.topicRegistry.delete(name);
   }
 
-  private processQueue(): void {
-    while (!this.queue.isEmpty()) {
-      const record = this.queue.dequeue()!;
-      const message = this.codec.decode(record);
-      this.onRoute(record, message.metadata);
-    }
-
-    this.scheduleDelivery();
-  }
-}
-class DLQManager {
-  constructor(private queue: IPriorityQueue<Uint8Array>) {}
-
-  addMessage(record: Uint8Array) {
-    this.queue.enqueue(record);
-  }
-}
-// MessageRouter.ts
-class MessageRouter {
-  constructor(
-    private topicRegistry: TopicRegistry,
-    private delayedQueueManager: DelayedQueueManager,
-    private dlqManager: DLQManager,
-    private maxDeliveryAttempts: number,
-    private eventBus?: EventEmitter
-  ) {}
+  // Message Routing
 
   route(record: Uint8Array, metadata: IMessageMetadata): void {
-    if (this._isExpired(metadata)) {
-      this.dlqManager.addMessage(record);
-      this._log(metadata, {
-        ttl: metadata.ttl,
-        target: "DLQ",
-        reason: "TTL_EXPIRED",
-      });
-      return;
-    }
-
-    if (this._isOutOfAttempts(metadata)) {
-      this.dlqManager.addMessage(record);
-      this._log(metadata, {
-        attempts: metadata.attempts,
-        target: "DLQ",
-        reason: "MAX_ATTEMPTS",
-      });
-      return;
-    }
-
-    if (this._isDelayed(metadata)) {
-      this.delayedQueueManager.addMessage(record, metadata.ttd!);
-      this._log(metadata, {
-        ttd: metadata.ttd,
-        target: "DELAYED",
-        reason: "TTD",
-      });
-      return;
-    }
-
-    this._routeToTopic(record, metadata);
-  }
-
-  private _isExpired({ ttl, timestamp }: IMessageMetadata): boolean {
-    return !!ttl && timestamp + ttl <= Date.now();
-  }
-
-  private _isOutOfAttempts({ attempts }: IMessageMetadata): boolean {
-    return attempts > this.maxDeliveryAttempts;
-  }
-
-  private _isDelayed({ ttd }: IMessageMetadata): boolean {
-    return !!ttd && ttd > Date.now();
-  }
-
-  private _routeToTopic(record: Uint8Array, metadata: IMessageMetadata) {
-    const { topic: topicName, correlationId, priority } = metadata;
-    const topic = this.topicRegistry.get(topicName);
-    if (!topic) {
-      this.dlqManager.addMessage(record);
-      this._log(metadata, {
-        target: "DLQ",
-        reason: "TOPIC_NOT_EXIST",
-      });
-      return;
-    }
-
-    if (correlationId) {
-      const consumerId = topic.getConsumerId(correlationId)!;
-      topic.unicastQueues.get(consumerId)?.enqueue(record, priority);
-    } else {
-      topic.sharedUnicastQueue.enqueue(record, priority);
-    }
-
-    this._log(metadata, { target: topic?.name });
-  }
-
-  private _log(
-    metadata: IMessageMetadata,
-    extraFields: Record<string, unknown>
-  ) {
-    this.eventBus?.emit("routed", {
-      messageId: metadata.id,
-      topic: metadata.topic,
-      ...extraFields,
-    });
-  }
-}
-// TopicBroker.ts (Facade)
-class TopicBroker {
-  constructor(
-    private readonly topicRegistry: TopicRegistry,
-    private readonly clientManager: ClientManager,
-    private readonly dlqManager: DLQManager,
-    private readonly router: MessageRouter,
-    private readonly eventBus: EventEmitter = new EventEmitter(),
-    private readonly codec: ICodec = new JSONCodec()
-  ) {}
-
-  getEventBus() {
-    return this.eventBus;
-  }
-
-  getCodec() {
-    return this.codec;
-  }
-
-  route(record: Uint8Array, metadata: IMessageMetadata) {
     // TODO: pre-routing logic (e.g., rate limiting)
     this.router.route(record, metadata);
   }
 
-  createTopic(name: string): void {
-    this.topicRegistry.create(name);
+  // Factories
+  createProducer<Data>(topicName: string): Producer<Data> {
+    return new ProducerFactory(this, this.context).create<Data>(topicName);
   }
 
-  getTopic(name: string) {
-    return this.topicRegistry.get(name);
-  }
-
-  getTopicMetadata(name: string): ITopicMetadata | undefined {
-    return this.topicRegistry.getOrThrow(name)?.getMetadata();
-  }
-
-  deleteTopic(name: string) {
-    this.topicRegistry.delete(name);
-  }
-
-  registerConsumer(topicName: string, consumerId: string) {
-    this.clientManager.registerConsumer(topicName, consumerId);
-  }
-
-  unregisterConsumer(topicName: string, consumerId: string) {
-    this.clientManager.unregisterConsumer(topicName, consumerId);
-  }
-
-  registerProducer(topicName: string, producerId: string) {
-    this.clientManager.registerProducer(topicName, producerId);
-  }
-
-  unregisterProducer(topicName: string, producerId: string) {
-    this.clientManager.unregisterProducer(topicName, producerId);
+  createConsumer<Data>(topicName: string): Consumer<Data> {
+    return new ConsumerFactory(this, this.context).create<Data>(topicName);
   }
 }
 //
 //
 //
-// Producer.ts (Facade)
+//
+// SRC/PRODUCERS/VALIDATORS/
+class SizeValidator implements IValidator<Uint8Array> {
+  constructor(private maxSize: number) {}
+
+  validate({ record }: { record: Uint8Array }) {
+    if (record.length > this.maxSize) throw new Error("Message too large");
+  }
+}
+class MessageValidator<Data> implements IValidator<Data> {
+  constructor(private schema: Zod.Schema<Data>) {}
+
+  validate({ message }: { message: Message<Data> }) {
+    this.schema?.parse(message);
+  }
+}
+// SRC/PRODUCERS/MESSAGE_FACTORY.ts
+class MessageFactory<Data> {
+  constructor(private validators: IValidator<Data>[], private codec: ICodec) {}
+
+  create(
+    data: Data[],
+    metadata: Partial<IMessageMetadata> & { topic: string }
+  ): Array<{ message: Message<Data>; record: Uint8Array }> {
+    return data.map((item, index) => {
+      const message = new Message(item, {
+        ...metadata,
+        id: crypto.randomUUID(),
+        ...(data.length > 1 && {
+          batchId: `batch-${Date.now()}`,
+          batchIndex: index,
+          batchSize: data.length,
+        }),
+      });
+      const record = this.codec.encode(message);
+      this.validators.forEach((v) => v.validate({ message, record }));
+      return { message, record };
+    });
+  }
+}
+// SRC/PRODUCERS/METRICS.TS
+class ProducerMetrics {
+  private messagesSent = 0;
+  private lastMessageTimestamp = 0;
+
+  constructor(private producerId: string, private eventBus: EventEmitter) {}
+
+  recordMessage(count: number = 1): void {
+    this.messagesSent += count;
+    this.lastMessageTimestamp = Date.now();
+    this.eventBus.emit("producerActivity", {
+      producerId: this.producerId,
+      messagesSent: this.messagesSent,
+      timestamp: this.lastMessageTimestamp,
+    });
+  }
+
+  getMetrics() {
+    return {
+      producerId: this.producerId,
+      messagesSent: this.messagesSent,
+      lastActivity: this.lastMessageTimestamp,
+    };
+  }
+}
+// SRC/PRODUCERS/PRODUCER.TS
+interface MessageResult {
+  messageId: string;
+  status: "success" | "error";
+  timestamp: number;
+  error?: string;
+}
+interface SendResult {
+  producerId: string;
+  topic: string;
+  sentAt: number;
+  results: MessageResult[];
+}
 class Producer<Data> {
+  private metrics: ProducerMetrics;
+  private messageFactory: MessageFactory<Data>;
   constructor(
     private readonly topic: Topic<Data>,
-    private readonly messageFactory: MessageFactory<Data>,
+    private readonly context: IContext,
     private readonly options: { producerId: string; topic: string }
-  ) {}
+  ) {
+    this.metrics = new ProducerMetrics(options.producerId, context.eventBus);
+    this.messageFactory = new MessageFactory<Data>([], context.codec);
+  }
 
-  send(
+  async send(
     data: Data[],
     metadata: Pick<
       IMessageMetadata,
       "priority" | "correlationId" | "ttd" | "ttl"
     >
-  ): number {
+  ): Promise<SendResult> {
     const { topic, producerId } = this.options;
+    const results: MessageResult[] = [];
     const messages = this.messageFactory.create(data, {
       ...metadata,
       topic,
     });
 
-    messages.forEach(({ message: { metadata }, record }) => {
-      this.topic.send(producerId, record, metadata);
-    });
+    for (const { message, record } of messages) {
+      const { id: messageId, timestamp } = message.metadata;
+      try {
+        this.topic.send(producerId, record, message.metadata);
+        results.push({
+          messageId,
+          status: "success",
+          timestamp,
+        });
+      } catch (error) {
+        results.push({
+          messageId,
+          status: "error",
+          error: error instanceof Error ? error.message : "Unknown error",
+          timestamp: Date.now(),
+        });
+      }
+    }
 
-    return messages.length;
+    this.metrics.recordMessage(messages.length);
+    return {
+      producerId: this.options.producerId,
+      topic: this.options.topic,
+      sentAt: Date.now(),
+      results,
+    };
+  }
+
+  getMetrics() {
+    return this.metrics.getMetrics();
   }
 }
+// SRC/PRODUCERS/FACTORY.TS
 class ProducerFactory {
   private static iterator = 1;
   constructor(
     private readonly broker: TopicBroker,
-    private readonly messageFactory: MessageFactory<any>
+    private readonly context: IContext
   ) {}
 
   create<Data>(topicName: string) {
     const producerId = `producer-${ProducerFactory.iterator++}`;
     this.broker.registerProducer(topicName, producerId);
     const topic = this.broker.getTopic(topicName)!;
-    return new Producer<Data>(topic, this.messageFactory, {
+    return new Producer<Data>(topic, this.context, {
       topic: topicName,
       producerId,
     });
@@ -823,7 +1026,59 @@ class ProducerFactory {
 //
 //
 //
-// AckManager.ts
+//
+// SRC/CONSUMERS/METRICS.TS
+class ConsumerMetrics {
+  private messagesProcessed = 0;
+  private messagesFailed = 0;
+  private lastActivity = 0;
+  private processingTime = 0;
+  private pendingMessages = 0;
+
+  constructor(private consumerId: string, private eventBus: EventEmitter) {}
+
+  recordMessageProcessed(processingTimeMs: number): void {
+    this.messagesProcessed++;
+    this.lastActivity = Date.now();
+    this.processingTime += processingTimeMs;
+    this.pendingMessages = Math.max(0, this.pendingMessages - 1);
+
+    this.eventBus.emit("consumerActivity", {
+      consumerId: this.consumerId,
+      type: "processed",
+      processingTimeMs,
+    });
+  }
+
+  recordMessageFailed(): void {
+    this.messagesFailed++;
+    this.lastActivity = Date.now();
+    this.eventBus.emit("consumerActivity", {
+      consumerId: this.consumerId,
+      type: "failed",
+    });
+  }
+
+  recordMessageReceived(): void {
+    this.pendingMessages++;
+    this.lastActivity = Date.now();
+  }
+
+  getMetrics() {
+    return {
+      consumerId: this.consumerId,
+      messagesProcessed: this.messagesProcessed,
+      messagesFailed: this.messagesFailed,
+      pendingMessages: this.pendingMessages,
+      lastActivity: this.lastActivity,
+      avgProcessingTime:
+        this.messagesProcessed > 0
+          ? this.processingTime / this.messagesProcessed
+          : 0,
+    };
+  }
+}
+// SRC/CONSUMERS/ACK_MANAGER.ts
 class AckManager<Data> {
   private pending = new Map<string, Message<Data>>();
 
@@ -847,25 +1102,32 @@ class AckManager<Data> {
     return size;
   }
 }
-// SubscriptionManager.ts
+// SRC/CONSUMERS/SUBSCRIPTION_MANAGER.ts
 class SubscriptionManager<Data> {
   private isActive = false;
   private abortController = new AbortController();
 
-  constructor(private interval = 1000) {}
+  constructor(
+    private fetcher: () => Message<Data>[],
+    private onError?: (e?: Error) => void,
+    private delayInterval = 1000
+  ) {}
 
   async subscribe(
-    fetcher: () => Message<Data>[],
     handler: (messages: Message<Data>[]) => Promise<void>
   ): Promise<void> {
     this.isActive = true;
 
     while (this.isActive) {
       try {
-        const messages = fetcher();
-        if (messages.length > 0) await handler(messages);
-        await wait(this.interval, this.abortController.signal);
+        const messages = this.fetcher();
+        if (messages.length > 0) {
+          await handler(messages);
+        } else {
+          await wait(this.delayInterval, this.abortController.signal);
+        }
       } catch (err) {
+        this.onError?.(err);
         if (err.name !== "AbortError") throw err;
       }
     }
@@ -876,37 +1138,59 @@ class SubscriptionManager<Data> {
     this.abortController.abort();
   }
 }
-// src/consumers/Consumer.ts (Facade)
+// SRC/CONSUMERS/CONSUMER.ts (Facade)
 class Consumer<Data> {
+  private metrics: ConsumerMetrics;
+  private ackManager: AckManager<Data>;
+  private subscriptionManager: SubscriptionManager<Data>;
   constructor(
     private topic: Topic<Data>,
-    private ackManager: AckManager<Data>,
-    private subscriptionManager: SubscriptionManager<Data>,
-    private codec: ICodec,
-    private eventBus: EventEmitter,
-    private readonly options: {
+    private context: IContext,
+    private options: {
       consumerId: string;
       topic: string;
       limit?: number;
       autoAck?: boolean;
+      pollingInterval?: number;
     }
-  ) {}
+  ) {
+    this.metrics = new ConsumerMetrics(options.consumerId, context.eventBus);
+    this.ackManager = new AckManager<Data>();
+    this.subscriptionManager = new SubscriptionManager<Data>(
+      this.consume,
+      () => this.nack(),
+      this.options.pollingInterval
+    );
+  }
 
-  consume(): Message<Data>[] {
-    const { consumerId, limit } = this.options;
-    const messages = this.topic.consume(consumerId, limit);
-    messages.forEach(this.ackManager.addToPending);
+  consume() {
+    const { consumerId, limit = 1 } = this.options;
+    const messages: Message<Data>[] = [];
+    const now = Date.now();
 
-    this.eventBus.emit("messagesConsumed", {
-      messageCount: messages.length,
-      ...this.options,
-    });
+    for (let i = 0; i < limit; i++) {
+      const record = this.topic.consume(consumerId);
+      if (!record) continue;
+
+      const message = this.context.codec.decode<Data>(record);
+      this.context.eventBus.emit("messageConsumed", { consumerId, message });
+      message.metadata.consumedAt = now;
+      this.metrics.recordMessageReceived();
+
+      if (this.options.autoAck) {
+        this.metrics.recordMessageProcessed(0);
+      } else {
+        this.ackManager.addToPending(message);
+      }
+
+      messages.push(message);
+    }
 
     return messages;
   }
 
   subscribe(handler: (messages: Message<Data>[]) => Promise<void>): void {
-    this.subscriptionManager.subscribe(this.consume, handler);
+    this.subscriptionManager.subscribe(handler);
   }
 
   unsubscribe(): void {
@@ -914,30 +1198,35 @@ class Consumer<Data> {
   }
 
   ack(messageId?: string): void {
-    const ackedCount = this.ackManager.ack(messageId);
-    this.topic.recordConsumerLag(this.options.consumerId, ackedCount);
+    const messages = this.ackManager.getMessages(messageId);
+    const now = Date.now();
+
+    messages.forEach(({ metadata }) => {
+      this.ackManager.ack(metadata.id);
+      this.metrics.recordMessageProcessed(now - (metadata.consumedAt || now));
+    });
   }
 
   nack(messageId?: string, requeue = true): void {
     const messages = this.ackManager.getMessages(messageId);
 
     messages.forEach((message) => {
-      const record = this.codec.encode(message);
-      this.topic.send("", record, {
-        ...message.metadata,
-        attempts: requeue ? message.metadata.attempts + 1 : Infinity,
-      });
+      this.metrics.recordMessageFailed();
+      const { id, attempts } = message.metadata;
+      message.metadata.attempts = requeue ? attempts + 1 : Infinity;
+      const record = this.context.codec.encode(message);
+      this.topic.send("", record, message.metadata);
+      this.ackManager.ack(id);
     });
-
-    this.ackManager.ack(messageId);
   }
 }
-// src/factories/ConsumerFactory.ts
+// SRC/CONSUMERS/FACTORY.TS
 class ConsumerFactory {
-  private static consumerIterator = 1;
+  private static iterator = 1;
 
   constructor(
     private readonly broker: TopicBroker,
+    private readonly context: IContext,
     private readonly defaultOptions?: {
       limit?: number;
       autoAck?: boolean;
@@ -949,7 +1238,7 @@ class ConsumerFactory {
     topicName: string,
     options?: typeof this.defaultOptions
   ): Consumer<Data> {
-    const consumerId = `consumer-${ConsumerFactory.consumerIterator++}`;
+    const consumerId = `consumer-${ConsumerFactory.iterator++}`;
     this.broker.registerConsumer(topicName, consumerId);
     const topic = this.broker.getTopic(topicName)!;
     const limit = this.defaultOptions?.limit || options?.limit;
@@ -957,18 +1246,12 @@ class ConsumerFactory {
     const pollingInterval =
       this.defaultOptions?.pollingInterval || options?.pollingInterval;
 
-    return new Consumer<Data>(
-      topic,
-      new AckManager<Data>(),
-      new SubscriptionManager<Data>(pollingInterval),
-      this.broker.getCodec(),
-      this.broker.getEventBus(),
-      {
-        consumerId,
-        topic: topicName,
-        limit,
-        autoAck,
-      }
-    );
+    return new Consumer<Data>(topic, this.context, {
+      consumerId,
+      topic: topicName,
+      limit,
+      autoAck,
+      pollingInterval,
+    });
   }
 }
