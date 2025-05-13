@@ -3,13 +3,13 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import pino from "pino";
 import { Counter, Gauge } from "prom-client";
-import Zod, { z } from "zod";
 import { ProtoMessage } from "../generated/message";
 import { wait } from "./utils";
 import fs from "fs/promises";
 import path from "path";
 import snappy from "snappy";
 import Buffer from "node:buffer";
+import Ajv, { JSONSchemaType } from "ajv";
 
 // logs & metrics
 const bus = new EventEmitter();
@@ -25,18 +25,18 @@ bus.on("routed", (event: Metadata) =>
   logger.info(event, `Message routed to ${event.topic}.`)
 );
 bus.on("consumed", (event: Metadata[]) =>
-  logger.info(event, `Message consumed from ${event[0].topic}.`)
-);
-bus.on("topicNotFound", (event: Metadata) =>
-  logger.info(event, "Message Topic not found. Routed ro DLQ.")
-);
-bus.on("expired", (event: Metadata) =>
-  logger.info(event, "Message expired. Routed ro DLQ.")
-);
-bus.on("maxAttempts", (event: Metadata) =>
-  logger.info(event, "Message exceeded delivery maxAttempts. Routed ro DLQ.")
+  logger.info(event, `Message consumed from ${event[0]?.topic}.`)
 );
 bus.on("delayed", (event: Metadata) => logger.info(event, "Message delayed"));
+bus.on("topicNotFound", (event: Metadata) =>
+  logger.error(event, "Message Topic not found. Routed ro DLQ.")
+);
+bus.on("expired", (event: Metadata) =>
+  logger.warn(event, "Message expired. Routed ro DLQ.")
+);
+bus.on("maxAttempts", (event: Metadata) =>
+  logger.error(event, "Message exceeded delivery maxAttempts. Routed to DLQ.")
+);
 //
 // const topicDepth = new Counter({
 //   name: "queue_depth",
@@ -376,7 +376,6 @@ class JSONCodec implements ICodec {
   decode<Data>(bytes: Buffer) {
     try {
       const raw = JSON.parse(Buffer.toString(bytes));
-      // const message = messageSchema.parse(raw);
       const meta = new Metadata();
       this.metaProperties.forEach((k, i) => {
         meta[k] = raw[i + 1];
@@ -453,14 +452,13 @@ interface IContext {
   codec: ICodec;
   eventBus: EventEmitter;
   queueFactory: () => IPriorityQueue<Buffer>;
-  validator?: IValidator<any>;
+  // validator?: IValidator<any>;
 }
 class Context implements IContext {
   constructor(
     public codec: ICodec,
     public eventBus: EventEmitter,
-    public queueFactory: () => IPriorityQueue<Buffer>,
-    public validator?: IValidator<any>
+    public queueFactory: () => IPriorityQueue<Buffer> // public validator?: IValidator<any>
   ) {}
 }
 //
@@ -680,6 +678,49 @@ class MessageRouter {
 //
 //
 //
+// SRC/VALIDATION/VALIDATOR_REGISTRY.TS
+class ValidatorRegistry {
+  private validators = new Map<string, (data: any) => boolean>();
+  private ajv: Ajv;
+
+  constructor(options?: Ajv.Options) {
+    this.ajv = new Ajv({
+      allErrors: true,
+      coerceTypes: false,
+      useDefaults: true,
+      ...options,
+    });
+  }
+
+  register<Data>(topic: string, schema: JSONSchemaType<Data>): void {
+    if (this.validators.has(topic)) {
+      throw new Error(`Schema already exists for topic ${topic}`);
+    }
+
+    const validate = this.ajv.compile(schema);
+    this.validators.set(topic, (data) => {
+      const valid = validate(data);
+      if (!valid) {
+        throw new Error(
+          `Validation failed: ${this.ajv.errorsText(validate.errors)}`
+        );
+      }
+      return true;
+    });
+  }
+
+  get(topic: string): ((data: any) => boolean) | undefined {
+    return this.validators.get(topic);
+  }
+
+  remove(topic: string): void {
+    this.validators.delete(topic);
+  }
+}
+//
+//
+//
+//
 // SRC/TOPICS/MEMBERSHIP.TS
 class TopicMembershipManager {
   private producers = new Map<string, IClientMetadata>();
@@ -800,11 +841,6 @@ class Topic<Data> {
   public readonly membership: TopicMembershipManager;
   public readonly queues: TopicQueueManager;
   // private storage: IStorage | null;
-  // config: {
-  //   retentionMs?: number;           // How long messages are retained
-  //   maxSizeBytes?: number;          // Max topic size
-  //   partitions?: number;            // Number of partitions (if partitioned)
-  // };
   constructor(
     public name: string,
     private router: MessageRouter,
@@ -901,17 +937,22 @@ class TopicRegistry {
 }
 // SRC/TOPICS/TOPICBROKER.TS (Facade)
 class TopicBroker {
+  public readonly validatorRegistry: ValidatorRegistry;
   private dlqManager: DLQManager;
   private router: MessageRouter;
 
   constructor(
     private readonly topicRegistry: TopicRegistry,
-    private context: IContext,
-    private config: {
+    private readonly context: IContext,
+    public readonly config: {
       maxDeliveryAttempts?: number;
-      delayedQueuePolling?: number;
+      maxMessageSize?: number;
+      schemaRegistryOptions?: Ajv.Options;
     } = {}
   ) {
+    this.validatorRegistry = new ValidatorRegistry(
+      config.schemaRegistryOptions
+    );
     this.dlqManager = new DLQManager(
       this.context.queueFactory(),
       this.context.eventBus
@@ -920,7 +961,7 @@ class TopicBroker {
       this.topicRegistry,
       this.dlqManager,
       this.context,
-      this.config.maxDeliveryAttempts ?? 5
+      this.config.maxDeliveryAttempts ?? 1
     );
   }
 
@@ -952,7 +993,18 @@ class TopicBroker {
 
   // Topic Management
 
-  createTopic(name: string): Topic<any> {
+  createTopic<Data>(
+    name: string,
+    options: {
+      schema?: JSONSchemaType<Data>;
+      //   retentionMs?: number;           // How long messages are retained
+      //   maxSizeBytes?: number;          // Max topic size
+      //   partitions?: number;            // Number of partitions (if partitioned)
+    }
+  ): Topic<Data> {
+    if (options?.schema) {
+      this.validatorRegistry.register(name, options.schema);
+    }
     return this.topicRegistry.create(name);
   }
 
@@ -981,6 +1033,16 @@ class TopicBroker {
 interface IValidator<Data> {
   validate(data: { data: Data; record: Buffer<Data> }): void;
 }
+class SchemaValidator<Data> implements IValidator<Data> {
+  constructor(
+    private readonly validatorRegistry: ValidatorRegistry,
+    private topic: string
+  ) {}
+
+  validate({ data }): void {
+    this.validatorRegistry.get(this.topic)?.(data);
+  }
+}
 class SizeValidator implements IValidator<Buffer> {
   constructor(private maxSize: number) {}
 
@@ -988,20 +1050,14 @@ class SizeValidator implements IValidator<Buffer> {
     if (record.length > this.maxSize) throw new Error("Message too large");
   }
 }
-class MessageValidator<Data> implements IValidator<Data> {
-  constructor(private schema: Zod.Schema<Data>) {}
 
-  validate({ data }: { data: Data }) {
-    this.schema?.parse(data);
-  }
-}
 // SRC/PRODUCERS/MESSAGE_FACTORY.ts
 type MetadataInput = Pick<
   Metadata,
   "priority" | "correlationId" | "ttd" | "ttl"
 >;
 class MessageFactory<Data> {
-  constructor(private validators: IValidator<Data>[], private codec: ICodec) {}
+  constructor(private codec: ICodec, private validators: IValidator<Data>[]) {}
 
   create(
     batch: Data[],
@@ -1063,11 +1119,22 @@ class Producer<Data> {
   private messageFactory: MessageFactory<Data>;
   constructor(
     private readonly topic: Topic<Data>,
+    private readonly validatorRegistry: ValidatorRegistry,
     private readonly context: IContext,
-    private readonly options: { producerId: string; topic: string }
+    private readonly options: {
+      producerId: string;
+      topic: string;
+      maxMessageSize?: number;
+    }
   ) {
     this.metrics = new ProducerMetrics(options.producerId, context.eventBus);
-    this.messageFactory = new MessageFactory<Data>([], context.codec);
+    const validators: IValidator<Data>[] = [
+      new SchemaValidator(validatorRegistry, this.options.topic),
+    ];
+    if (options.maxMessageSize) {
+      validators.push(new SizeValidator(options.maxMessageSize));
+    }
+    this.messageFactory = new MessageFactory<Data>(context.codec, validators);
   }
 
   async send(
@@ -1128,10 +1195,16 @@ class ProducerFactory {
     const producerId = `producer-${ProducerFactory.iterator++}`;
     this.broker.registerProducer(topicName, producerId);
     const topic = this.broker.getTopic(topicName)!;
-    return new Producer<Data>(topic, this.context, {
-      topic: topicName,
-      producerId,
-    });
+    return new Producer<Data>(
+      topic,
+      this.broker.validatorRegistry,
+      this.context,
+      {
+        maxMessageSize: this.broker.config.maxMessageSize,
+        topic: topicName,
+        producerId,
+      }
+    );
   }
 }
 //
