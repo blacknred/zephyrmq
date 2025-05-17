@@ -26,14 +26,8 @@ bus.on("consumed", (event: Metadata[]) =>
   logger.info(event, `Message consumed from ${event[0]?.topic}.`)
 );
 bus.on("delayed", (event: Metadata) => logger.info(event, "Message delayed"));
-bus.on("topicNotFound", (event: Metadata) =>
-  logger.error(event, "Message Topic not found. Routed ro DLQ.")
-);
-bus.on("expired", (event: Metadata) =>
-  logger.warn(event, "Message expired. Routed ro DLQ.")
-);
-bus.on("maxAttempts", (event: Metadata) =>
-  logger.error(event, "Message exceeded delivery maxAttempts. Routed to DLQ.")
+bus.on("dlq", (event: Metadata, reason: string) =>
+  logger.warn(event, `Routed ro DLQ. Reason: ${reason}.`)
 );
 //
 // const topicDepth = new Counter({
@@ -598,55 +592,37 @@ class Context implements IContext {
 interface IMessageProcessor {
   process(record: Buffer, meta: Metadata): boolean;
 }
-abstract class BaseProcessor implements IMessageProcessor {
-  constructor(protected context: IContext) {}
-  abstract process(record: Buffer, meta: Metadata): boolean;
-  // protected decode<Data>(record: Buffer): Message<Data> {
-  //   return this.context.codec.decode(record);
-  // }
-}
 // SRC/PIPELINE/PROCESSORS/
-class ExpirationProcessor extends BaseProcessor {
+class ExpirationProcessor implements IMessageProcessor {
+  constructor(private dlq: TopicDLQManager) {}
   process(record: Buffer, meta: Metadata): boolean {
     if (!meta.ttl) return false;
     const isExpired = meta.ts + meta.ttl <= Date.now();
-    if (isExpired) {
-      this.context.eventBus.emit("dlq", record);
-      this.context.eventBus.emit("expired", meta);
-    }
+    if (isExpired) this.dlq.send(record, meta, "expired");
     return isExpired;
   }
 }
-class AttemptsProcessor extends BaseProcessor {
-  constructor(context: IContext, private maxAttempts: number) {
-    super(context);
-  }
+class AttemptsProcessor implements IMessageProcessor {
+  constructor(private dlq: TopicDLQManager, private maxAttempts: number) {}
   process(record: Buffer, meta: Metadata): boolean {
     const shouldDeadLetter = meta.attempts > this.maxAttempts;
     if (shouldDeadLetter) {
-      this.context.eventBus.emit("dlq", record);
-      this.context.eventBus.emit("maxAttempts", meta);
+      this.dlq.send(record, meta, "max_attempts");
     }
     return shouldDeadLetter;
   }
 }
-class DelayProcessor extends BaseProcessor {
-  constructor(context: IContext, private delayedQueue: IQueueStrategy) {
-    super(context);
-  }
+class DelayProcessor implements IMessageProcessor {
+  constructor(private delayedQueue: TopicDelayedQueueManager) {}
   process(record: Buffer, meta: Metadata): boolean {
     const shouldDelay = !!meta.ttd && meta.ttd > Date.now();
-    if (shouldDelay) {
-      this.delayedQueue.enqueue(record, meta);
-      this.context.eventBus.emit("delayed", meta);
-    }
+    if (shouldDelay) this.delayedQueue.send(record, meta);
     return shouldDelay;
   }
 }
 // SRC/PIPELINE/MESSAGE_PIPELINE.TS
 class MessagePipeline {
   private processors: IMessageProcessor[] = [];
-  constructor(private context: IContext) {}
   addProcessor(processor: IMessageProcessor): void {
     this.processors.push(processor);
   }
@@ -657,86 +633,21 @@ class MessagePipeline {
     return false;
   }
 }
-//
-//
-//
-//
-// SRC/QUEUES/STRATEGIES.TS
-interface IQueueStrategy {
-  enqueue(record: Buffer, meta: Metadata): void;
-  dequeue(): Buffer | undefined;
-  size(): number;
-}
-class PriorityQueueStrategy implements IQueueStrategy {
-  constructor(private queue: IPriorityQueue<Buffer>) {}
-  enqueue(record: Buffer, meta: Metadata): void {
-    this.queue.enqueue(record, meta.priority);
-  }
-  dequeue(): Buffer | undefined {
-    return this.queue.dequeue();
-  }
-  size(): number {
-    return this.queue.size();
-  }
-}
-class DelayedQueueStrategy implements IQueueStrategy {
-  private queue: IPriorityQueue<Buffer>;
-  private nextTimeout?: number;
-  constructor(
-    private context: IContext,
-    private onProcess: (record: any, meta: Metadata) => void
-  ) {
-    this.queue = this.context.queueFactory();
-  }
+// SRC/PIPELINE/PIPELINE_FACTORY.TS
+class PipelineFactory {
+  create(
+    dlqManager: TopicDLQManager,
+    delayedQueue: TopicDelayedQueueManager,
+    maxAttempts?: number
+  ): MessagePipeline {
+    const pipeline = new MessagePipeline();
+    pipeline.addProcessor(new ExpirationProcessor(dlqManager));
+    pipeline.addProcessor(new DelayProcessor(delayedQueue));
+    if (maxAttempts !== undefined) {
+      pipeline.addProcessor(new AttemptsProcessor(dlqManager, maxAttempts));
+    }
 
-  private scheduleDelivery(): void {
-    if (this.nextTimeout) clearTimeout(this.nextTimeout);
-    if (this.queue.isEmpty()) return;
-
-    // TODO: implement peakPriority to drop decoding
-    const record = this.queue.peek()!;
-    const [, meta] = this.context.codec.decode(record);
-    const delay = Math.max(0, meta.ts + meta.ttd! - Date.now());
-
-    this.nextTimeout = setTimeout(this.processQueue.bind(this), delay);
-  }
-
-  private processQueue(): void {
-    const record = this.queue.dequeue();
-    if (!record) return;
-    const [, meta] = this.context.codec.decode(record);
-    this.onProcess(record, meta);
-    this.scheduleDelivery();
-  }
-
-  enqueue(record: Buffer, meta: Metadata): void {
-    if (!meta.ttd) throw new Error("TTD required for delayed messages");
-    this.queue.enqueue(record, meta.ttd);
-    this.scheduleDelivery();
-  }
-
-  dequeue(): Buffer | undefined {
-    return undefined;
-  }
-
-  size(): number {
-    return this.queue.size();
-  }
-}
-//
-//
-//
-//
-// MESSAGE_ROUTER.TS
-class DLQManager {
-  constructor(
-    private queue: IPriorityQueue<Buffer>,
-    private eventBus: EventEmitter
-  ) {
-    eventBus.on("dlq", (record) => this.addMessage(record));
-  }
-  addMessage(record: Buffer) {
-    this.queue.enqueue(record);
+    return pipeline;
   }
 }
 //
@@ -787,7 +698,37 @@ class ValidatorRegistry {
 //
 //
 //
-// SRC/TOPICS/MEMBERSHIP.TS
+// SRC/TOPICS/METRICS.TS
+interface ITopicMetadata {
+  name: string;
+  createdAt: string;
+  pendingMessages: number;
+  dlqSize: number;
+  delayedQueueSize: number;
+  producersCount: number;
+  producersIds: number[];
+  totalMessagesPublished: number;
+  consumerCount: number;
+  consumerIds: number[];
+}
+class TopicMetricsCollector {
+  private totalMessagesPublished = 0;
+  private ts = Date.now();
+  constructor(private eventBus: EventEmitter) {}
+
+  recordMessagePublished(meta: Metadata): void {
+    this.totalMessagesPublished++;
+    this.eventBus.emit("routed", { meta });
+  }
+
+  getMetrics(): Partial<ITopicMetadata> {
+    return {
+      createdAt: new Date(this.ts).toISOString(),
+      totalMessagesPublished: this.totalMessagesPublished,
+    };
+  }
+}
+// SRC/TOPICS/MEMBERSHIP_MANAGER.TS
 interface IClientMetadata {
   lastActiveAt: number;
   messageCount?: number;
@@ -827,14 +768,16 @@ class TopicMembershipManager {
 }
 // SRC/TOPICS/QUEUE_MANAGER.TS
 class TopicQueueManager {
-  private unicastQueues = new Map<number, IQueueStrategy>();
+  private sharedQueue: IPriorityQueue;
+  private unicastQueues = new Map<number, IPriorityQueue>();
   constructor(
-    private sharedQueue: IQueueStrategy,
     private routingStrategy: IRoutingStrategy,
-    private context: IContext
-  ) {}
+    private queueFactory: () => IPriorityQueue<Buffer>
+  ) {
+    this.sharedQueue = this.queueFactory();
+  }
 
-  getQueue(key?: string): IQueueStrategy {
+  getQueue(key?: string): IPriorityQueue {
     if (key) {
       const targetConsumer = this.routingStrategy.getConsumerId(key);
       return this.unicastQueues.get(targetConsumer) || this.sharedQueue;
@@ -843,10 +786,7 @@ class TopicQueueManager {
   }
 
   addConsumerQueue(consumerId: number): void {
-    this.unicastQueues.set(
-      consumerId,
-      new PriorityQueueStrategy(this.context.queueFactory())
-    );
+    this.unicastQueues.set(consumerId, this.queueFactory());
   }
 
   removeConsumerQueue(consumerId: number): void {
@@ -855,7 +795,7 @@ class TopicQueueManager {
 
   enqueue(record: Buffer, meta: Metadata): void {
     const queue = this.getQueue(meta.correlationId);
-    queue.enqueue(record, meta);
+    queue.enqueue(record, meta.priority);
   }
 
   dequeue(consumerId: number): Buffer | undefined {
@@ -864,60 +804,153 @@ class TopicQueueManager {
     return this.sharedQueue.dequeue();
   }
 }
-// SRC/TOPICS/METRICS.TS
-interface ITopicMetadata {
-  name: string;
-  createdAt: string;
-  pendingMessages: number;
-  producersCount: number;
-  producersIds: number[];
-  totalMessagesPublished: number;
-  consumerCount: number;
-  consumerIds: number[];
-}
-class TopicMetricsCollector {
-  private totalMessagesPublished = 0;
-  private ts = Date.now();
+// SRC/TOPICS/DELAYED_QUEUE_MANAGER.TS
+class TopicDelayedQueueManager {
+  private queue: IPriorityQueue<Buffer>;
+  private nextTimeout?: number;
+  private isProcessing = false;
 
-  constructor(private eventBus: EventEmitter) {}
-
-  recordMessagePublished(meta: Metadata): void {
-    this.totalMessagesPublished++;
-    this.eventBus.emit("routed", { meta });
+  constructor(
+    private context: IContext,
+    private onReady: (record: Buffer, meta: Metadata) => Promise<void>
+  ) {
+    this.queue = this.context.queueFactory();
   }
 
-  getMetrics(): ITopicMetadata {
-    return {
-      name: "",
-      createdAt: new Date(this.ts).toISOString(),
-      pendingMessages: 0,
-      producersCount: 0,
-      producersIds: [],
-      totalMessagesPublished: this.totalMessagesPublished,
-      consumerCount: 0,
-      consumerIds: [],
-    };
+  send(record: Buffer, meta: Metadata): void {
+    this.queue.enqueue(record, meta.ttd);
+    this.context.eventBus.emit("delayed", meta);
+    this.scheduleProcessing();
+  }
+
+  size(): number {
+    return this.queue.size();
+  }
+
+  private scheduleProcessing(): void {
+    if (this.isProcessing || this.queue.isEmpty()) return;
+
+    // TODO: implement peakPriority to drop decoding
+    const record = this.queue.peek()!;
+    const [, meta] = this.context.codec.decode(record);
+    const delay = Math.max(0, meta.ts + meta.ttd! - Date.now());
+
+    if (this.nextTimeout) clearTimeout(this.nextTimeout);
+    this.nextTimeout = setTimeout(() => this.processQueue(), delay);
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
+
+    try {
+      while (!this.queue.isEmpty()) {
+        const record = this.queue.peek()!;
+        const [, meta] = this.context.codec.decode(record);
+        if (meta.ts + meta.ttd! > Date.now()) break; // Not ready yet
+
+        this.queue.dequeue();
+        await this.onReady(record, meta);
+      }
+    } finally {
+      this.isProcessing = false;
+      this.scheduleProcessing();
+    }
+  }
+}
+// SRC/TOPICS/DLQ_MANAGER.TS
+class TopicDLQManager {
+  private queue: IPriorityQueue;
+
+  constructor(private context: IContext) {
+    this.queue = this.context.queueFactory();
+  }
+
+  send(
+    record: Buffer,
+    meta: Metadata,
+    reason: "expired" | "max_attempts" | "validation" | "processing_error"
+  ): void {
+    this.queue.enqueue(record, meta.ts);
+    this.context.eventBus.emit("dlq", meta, reason);
+  }
+
+  size(): number {
+    return this.queue.size();
+  }
+
+  async consume(): Promise<[any, Metadata] | undefined> {
+    const record = this.queue.dequeue();
+    if (!record) return;
+    return this.context.codec.decode(record);
+  }
+
+  async replayMessages(
+    handler: (record: Buffer) => Promise<void>,
+    filter?: (meta: Metadata) => boolean
+  ): Promise<number> {
+    const tempQueue = this.context.queueFactory();
+    let count = 0;
+
+    // Move all messages to temp queue
+    while (this.queue.size() > 0) {
+      const record = this.queue.dequeue()!;
+      tempQueue.enqueue(record);
+    }
+
+    // Process messages
+    while (tempQueue.size() > 0) {
+      const record = tempQueue.dequeue()!;
+      const [, meta] = this.context.codec.decode(record);
+
+      if (!filter || filter(meta)) {
+        await handler(record);
+        count++;
+      } else {
+        // Return filtered-out messages to DLQ
+        this.queue.enqueue(record);
+      }
+    }
+
+    return count;
   }
 }
 // SRC/TOPICS/TOPIC.TS
+interface ITopicConfig<Data> {
+  schema?: JSONSchemaType<Data>;
+  persist?: boolean;
+  retentionMs?: number; // 86_400_000 1 day
+  archivalThreshold?: number; //100_000
+  maxSizeBytes?: number;
+  maxDeliveryAttempts?: number;
+  maxMessageSize?: number;
+  //   partitions?: number;
+}
 class Topic<Data> {
+  private readonly pipeline: MessagePipeline;
   public readonly metrics: TopicMetricsCollector;
   public readonly membership: TopicMembershipManager;
   public readonly queues: TopicQueueManager;
+  public readonly dlq: TopicDLQManager;
+  public readonly delayedQueue: TopicDelayedQueueManager;
   // private storage: IStorage | null;
 
   constructor(
     public name: string,
     private context: IContext,
-    private pipeline: MessagePipeline,
-    routingStrategy: IRoutingStrategy
+    routingStrategy: IRoutingStrategy,
+    private config?: ITopicConfig<Data>
   ) {
     this.metrics = new TopicMetricsCollector(context.eventBus);
     this.membership = new TopicMembershipManager(context.eventBus);
-    this.queues = new TopicQueueManager(
-      new PriorityQueueStrategy(context.queueFactory()),
-      routingStrategy,
-      context
+    this.queues = new TopicQueueManager(routingStrategy, context.queueFactory);
+    this.delayedQueue = new TopicDelayedQueueManager(context, this.send);
+    this.dlq = new TopicDLQManager(context);
+
+    this.pipeline = new PipelineFactory().create(
+      this.dlq,
+      this.delayedQueue,
+      config?.maxDeliveryAttempts
     );
   }
 
@@ -932,6 +965,7 @@ class Topic<Data> {
     if (!record) return;
     const message = this.context.codec.decode<Data>(record);
     if (await this.pipeline.process(record, message[1])) return;
+    message[1].consumedAt = Date.now();
     return message;
   }
 
@@ -947,45 +981,21 @@ class Topic<Data> {
       consumerCount: consumers.length,
       consumerIds: consumers,
       pendingMessages: this.queues.getQueue().size(),
-    };
+      dlqSize: this.dlq.size(),
+      delayedQueueSize: this.delayedQueue.size(),
+    } as ITopicMetadata;
   }
 }
 // SRC/TOPICS/TOPICREGISTRY.TS
 class TopicRegistry {
   private topics = new Map<string, Topic<any>>();
-  private messagePipeline: MessagePipeline;
 
   constructor(
     private routingStrategy: () => IRoutingStrategy,
-    private context: IContext,
-    maxAttempts?: number
-  ) {
-    const delayedQueue = new DelayedQueueStrategy(
-      this.context,
-      (record, meta) => {
-        const topic = this.get(meta.topic);
-        if (!topic) {
-          this.context.eventBus.emit("dlq", record);
-          this.context.eventBus.emit("topicNotFound", meta);
-        } else {
-          topic.send(record, meta);
-        }
-      }
-    );
+    private context: IContext
+  ) {}
 
-    this.messagePipeline = new MessagePipeline(this.context);
-    this.messagePipeline.addProcessor(new ExpirationProcessor(this.context));
-    this.messagePipeline.addProcessor(
-      new DelayProcessor(this.context, delayedQueue)
-    );
-    if (maxAttempts) {
-      this.messagePipeline.addProcessor(
-        new AttemptsProcessor(this.context, maxAttempts)
-      );
-    }
-  }
-
-  create<Data>(name: string): Topic<Data> {
+  create<Data>(name: string, config: ITopicConfig<Data>): Topic<Data> {
     if (this.topics.has(name)) {
       throw new Error("Topic already exists");
     }
@@ -996,12 +1006,7 @@ class TopicRegistry {
 
     this.topics.set(
       name,
-      new Topic<Data>(
-        name,
-        this.context,
-        this.messagePipeline,
-        this.routingStrategy()
-      )
+      new Topic<Data>(name, this.context, this.routingStrategy(), config)
     );
 
     return this.topics.get(name)!;
@@ -1027,30 +1032,21 @@ class TopicRegistry {
 }
 // SRC/TOPICS/TOPICBROKER.TS (Facade)
 class TopicBroker {
-  public readonly validatorRegistry: ValidatorRegistry;
   private readonly topicRegistry: TopicRegistry;
-  private dlqManager: DLQManager;
+  public readonly validatorRegistry: ValidatorRegistry;
 
   constructor(
+    routingStrategy: () => IRoutingStrategy,
     private readonly context: IContext,
-    private routingStrategy: () => IRoutingStrategy,
     public readonly config: {
       maxDeliveryAttempts?: number;
       maxMessageSize?: number;
       schemaRegistryOptions?: Ajv.Options;
     } = {}
   ) {
+    this.topicRegistry = new TopicRegistry(routingStrategy, context);
     this.validatorRegistry = new ValidatorRegistry(
       config.schemaRegistryOptions
-    );
-    this.topicRegistry = new TopicRegistry(
-      routingStrategy,
-      context,
-      this.config.maxDeliveryAttempts
-    );
-    this.dlqManager = new DLQManager(
-      this.context.queueFactory(),
-      this.context.eventBus
     );
   }
 
@@ -1082,19 +1078,14 @@ class TopicBroker {
 
   // Topic Management
 
-  createTopic<Data>(
-    name: string,
-    options: {
-      schema?: JSONSchemaType<Data>;
-      //   retentionMs?: number;           // How long messages are retained
-      //   maxSizeBytes?: number;          // Max topic size
-      //   partitions?: number;            // Number of partitions (if partitioned)
+  createTopic<Data>(name: string, config: ITopicConfig<Data>): Topic<Data> {
+    if (config?.schema) {
+      this.validatorRegistry.register(name, config.schema);
     }
-  ): Topic<Data> {
-    if (options?.schema) {
-      this.validatorRegistry.register(name, options.schema);
+    if (!config.maxDeliveryAttempts) {
+      config.maxDeliveryAttempts = this.config.maxDeliveryAttempts;
     }
-    return this.topicRegistry.create(name);
+    return this.topicRegistry.create(name, config);
   }
 
   getTopic(name: string): Topic<any> | undefined {
@@ -1175,7 +1166,6 @@ class MessageFactory<Data> {
 class ProducerMetrics {
   private messagesSent = 0;
   private lastMessages = 0;
-
   constructor(private producerId: number, private eventBus: EventEmitter) {}
 
   recordMessage(count: number = 1): void {
@@ -1438,13 +1428,11 @@ class Consumer<Data> {
     const { id, limit = 1 } = this.options;
     const messages: Data[] = [];
     const metas: Metadata[] = [];
-    const now = Date.now();
 
     for (let i = 0; i < limit; i++) {
       const message = await this.topic.consume(id);
       if (!message) continue;
 
-      message[1].consumedAt = now;
       this.metrics.recordMessageReceived();
 
       if (this.options.autoAck) {
@@ -1460,6 +1448,28 @@ class Consumer<Data> {
     this.context.eventBus.emit("consumed", metas);
     return messages;
   }
+
+  async consumeDlq() {
+    const { id, limit = 1 } = this.options;
+    const messages: Data[] = [];
+
+    for (let i = 0; i < limit; i++) {
+      const message = await this.topic.consume(id);
+      if (message) messages.push(message[0]);
+    }
+
+    return messages;
+  }
+
+  // async replayDlq(filter?: (meta: Metadata) => boolean): Promise<number> {
+  //   return this.topic.dlq.replayMessages(
+  //     async (record) => {
+  //       const [, meta] = this.context.codec.decode(record);
+  //       await this.topic.send(record, meta);
+  //     },
+  //     filter
+  //   );
+  // }
 
   subscribe(handler: (messages: Data[]) => Promise<void>): void {
     this.subscriptionManager.subscribe(handler);
