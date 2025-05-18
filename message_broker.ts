@@ -10,7 +10,7 @@ import Buffer from "node:buffer";
 import Ajv, { JSONSchemaType } from "ajv";
 
 // logs & metrics
-const bus = new EventEmitter();
+const bus = new NonBlockingEventEmitter();
 const logger = pino({
   level: process.env.LOG_LEVEL || "info",
   transport:
@@ -19,7 +19,7 @@ const logger = pino({
       : undefined,
   base: { service: "message-broker" },
 });
-bus.on("routed", (event: Metadata) =>
+bus.on("sent", (event: Metadata) =>
   logger.info(event, `Message routed to ${event.topic}.`)
 );
 bus.on("consumed", (event: Metadata[]) =>
@@ -70,56 +70,6 @@ bus.on("dlq", (event: Metadata, reason: string) =>
 //     }, 15_000);
 //   }
 // }
-
-// type QueueMetrics = {
-//   depth: number;
-//   enqueueRate: number; // Messages/sec
-//   dequeueRate: number;
-//   avgLatencyMs: number; // Time in queue
-// };
-
-// class BrokerMetrics {
-//   private metrics: Record<string, QueueMetrics> = {};
-
-//   update(topic: string, operation: 'enqueue' | 'dequeue', latencyMs: number) {
-//     if (!this.metrics[topic]) {
-//       this.metrics[topic] = { depth: 0, enqueueRate: 0, dequeueRate: 0, avgLatencyMs: 0 };
-//     }
-//     const m = this.metrics[topic];
-//     m.depth += operation === 'enqueue' ? 1 : -1;
-//     m[`${operation}Rate`] += 1;
-//     m.avgLatencyMs = (m.avgLatencyMs * 0.9) + (latencyMs * 0.1); // Exponential moving average
-//   }
-
-//   getMetrics(): Readonly<Record<string, QueueMetrics>> {
-//     return this.metrics;
-//   }
-// }
-//   enqueue(topic: string, message: Message) {
-//     const start = Date.now();
-//     this.queues[topic].enqueue(Message.encode(message));
-//     this.metrics.update(topic, 'enqueue', Date.now() - start);
-//   }
-
-//   dequeue(topic: string): Message | undefined {
-//     const start = Date.now();
-//     const data = this.queues[topic].dequeue();
-//     if (data) {
-//       this.metrics.update(topic, 'dequeue', Date.now() - start);
-//       return Message.decode(data);
-//     }
-//   }
-// {
-//   "orders": {
-//     "depth": 42,
-//     "enqueueRate": 10,
-//     "dequeueRate": 8,
-//     "avgLatencyMs": 50
-//   }
-// }
-///
-//
-//
 //
 //
 //
@@ -133,21 +83,22 @@ class SHA256HashService implements IHashService {
     return parseInt(hex.slice(0, 8), 16);
   }
 }
-interface IConsistencyHasher {
+interface IHashRing {
   addNode(id: number): void;
   removeNode(id: number): void;
   getNode(key: string): number | undefined;
 }
-/** Consistent hashing class.
+/** Hash ring.
  * The system works regardless of how different the key hashes are because the lookup is always
  * relative to the fixed node positions on the ring. Sorted nodes in a ring:
  * [**100(A)**, _180(user-123 key hash always belong to the B)_, **200(B)**, **300(A)**, **400(B)**, **500(A)**, **600(B)**]
  */
-class InMemoryConsistencyHasher implements IConsistencyHasher {
+class InMemoryHashRing implements IHashRing {
+  // TODO: need persistence
   private ring = new Map<number, number>();
 
   /**
-   * Create a new instance of ConsistencyHasher with the given number of virtual nodes.
+   * Create a new instance of HashRing with the given number of virtual nodes.
    * @param {number} [replicas=3] The number of virtual nodes to create for each node.
    * The more virtual nodes gives you fewer hotspots, more balanced traffic. However, setting
    * this number too high can lead to a large memory footprint and slower lookups.
@@ -182,7 +133,7 @@ interface IRoutingStrategy {
   removeConsumer(id: number): void;
 }
 class ConsistentHashingStrategy implements IRoutingStrategy {
-  constructor(private hasher: IConsistencyHasher) {}
+  constructor(private hasher: IHashRing) {}
 
   getConsumerId(key: string) {
     return this.hasher.getNode(key)!;
@@ -598,7 +549,7 @@ class ExpirationProcessor implements IMessageProcessor {
   process(record: Buffer, meta: Metadata): boolean {
     if (!meta.ttl) return false;
     const isExpired = meta.ts + meta.ttl <= Date.now();
-    if (isExpired) this.dlq.send(record, meta, "expired");
+    if (isExpired) this.dlq.publish(record, meta, "expired");
     return isExpired;
   }
 }
@@ -607,7 +558,7 @@ class AttemptsProcessor implements IMessageProcessor {
   process(record: Buffer, meta: Metadata): boolean {
     const shouldDeadLetter = meta.attempts > this.maxAttempts;
     if (shouldDeadLetter) {
-      this.dlq.send(record, meta, "max_attempts");
+      this.dlq.publish(record, meta, "max_attempts");
     }
     return shouldDeadLetter;
   }
@@ -616,7 +567,7 @@ class DelayProcessor implements IMessageProcessor {
   constructor(private delayedQueue: TopicDelayedQueueManager) {}
   process(record: Buffer, meta: Metadata): boolean {
     const shouldDelay = !!meta.ttd && meta.ttd > Date.now();
-    if (shouldDelay) this.delayedQueue.send(record, meta);
+    if (shouldDelay) this.delayedQueue.publish(record, meta);
     return shouldDelay;
   }
 }
@@ -704,66 +655,112 @@ interface ITopicMetadata {
   createdAt: string;
   pendingMessages: number;
   dlqSize: number;
+  totalDlqMessages: number;
   delayedQueueSize: number;
-  producersCount: number;
-  producersIds: number[];
   totalMessagesPublished: number;
-  consumerCount: number;
-  consumerIds: number[];
+  depth: number;
+  enqueueRate: number; // Messages/sec
+  dequeueRate: number;
+  avgLatencyMs: number; // Time in queue
+  clients: IClientState[];
 }
 class TopicMetricsCollector {
   private totalMessagesPublished = 0;
   private ts = Date.now();
-  constructor(private eventBus: EventEmitter) {}
+  private depth = 0;
+  private enqueueRate = 0;
+  private dequeueRate = 0;
+  private avgLatencyMs = 0;
 
-  recordMessagePublished(meta: Metadata): void {
+  constructor() {}
+
+  recordPublish(latencyMs: number): void {
     this.totalMessagesPublished++;
-    this.eventBus.emit("routed", { meta });
+    this.depth += 1;
+    this.enqueueRate += 1;
+    this.updateAvgLatency(latencyMs);
+  }
+
+  recordConsumption(latencyMs: number): void {
+    this.depth -= 1;
+    this.dequeueRate += 1;
+    this.updateAvgLatency(latencyMs);
+  }
+
+  private updateAvgLatency(latencyMs: number) {
+    this.avgLatencyMs = this.avgLatencyMs * 0.9 + latencyMs * 0.1; // Exponential moving average
   }
 
   getMetrics(): Partial<ITopicMetadata> {
     return {
       createdAt: new Date(this.ts).toISOString(),
       totalMessagesPublished: this.totalMessagesPublished,
+      depth: this.depth,
+      enqueueRate: this.enqueueRate,
+      dequeueRate: this.dequeueRate,
+      avgLatencyMs: this.avgLatencyMs,
     };
   }
 }
-// SRC/TOPICS/MEMBERSHIP_MANAGER.TS
-interface IClientMetadata {
+interface IClientState {
+  clientType: "producer" | "consumer";
+  registeredAt: number;
   lastActiveAt: number;
-  messageCount?: number;
+  // Metrics
+  status: "active" | "idle" | "lagging";
+  messageCount: number;
+  processingTime: number;
+  avgProcessingTime: number;
   pendingMessages?: number;
 }
-class TopicMembershipManager {
-  private producers = new Map<number, IClientMetadata>();
-  private consumers = new Map<number, IClientMetadata>();
-  constructor(private eventBus: EventEmitter) {}
+// SRC/TOPICS/CLIENT_REGISTRY.TS
+class TopicClientRegistry {
+  private clients = new Map<number, IClientState>();
+  constructor(private topicName: string, private eventBus: EventEmitter) {}
 
-  addProducer(id: number): void {
-    this.producers.set(id, { lastActiveAt: Date.now() });
-    this.eventBus.emit("producerAdded", { producerId: id });
+  registerClient(id: number, type: "producer" | "consumer") {
+    const now = Date.now();
+    this.clients.set(id, {
+      registeredAt: now,
+      lastActiveAt: now,
+      clientType: type,
+      messageCount: 0,
+      processingTime: 0,
+      avgProcessingTime: 0,
+      status: "active",
+    });
+
+    this.eventBus.emit("client_registered", this.topicName, id);
   }
 
-  removeProducer(id: number): void {
-    this.producers.delete(id);
-    this.eventBus.emit("producerRemoved", { producerId: id });
+  unregisterClient(id: number) {
+    this.clients.delete(id);
+    this.eventBus.emit("client_unregistered", this.topicName, id);
   }
 
-  addConsumer(id: number): void {
-    this.consumers.set(id, { lastActiveAt: Date.now() });
-    this.eventBus.emit("consumerAdded", { consumerId: id });
+  recordActivity(clientId: number, activityRecord: Partial<IClientState>) {
+    if (!this.clients.has(clientId)) return;
+    const client = this.clients.get(clientId)!;
+    client.lastActiveAt = Date.now();
+
+    for (let key in activityRecord) {
+      if (typeof client[key] != "number") {
+        client[key] = activityRecord[key];
+      } else {
+        client[key] = client[key] + activityRecord[key];
+      }
+    }
+
+    if (client.messageCount > 0) {
+      client.avgProcessingTime = client.processingTime / client.messageCount;
+    }
+
+    this.clients.set(clientId, client);
   }
 
-  removeConsumer(id: number): void {
-    this.consumers.delete(id);
-    this.eventBus.emit("consumerRemoved", { consumerId: id });
-  }
-
-  getMembership(): { producers: number[]; consumers: number[] } {
-    return {
-      producers: Array.from(this.producers.keys()),
-      consumers: Array.from(this.consumers.keys()),
-    };
+  getMetadata(clientId?: number) {
+    if (clientId) return this.clients.get(clientId);
+    return Array.from(this.clients.values());
   }
 }
 // SRC/TOPICS/QUEUE_MANAGER.TS
@@ -817,7 +814,7 @@ class TopicDelayedQueueManager {
     this.queue = this.context.queueFactory();
   }
 
-  send(record: Buffer, meta: Metadata): void {
+  publish(record: Buffer, meta: Metadata): void {
     this.queue.enqueue(record, meta.ttd);
     this.context.eventBus.emit("delayed", meta);
     this.scheduleProcessing();
@@ -861,28 +858,30 @@ class TopicDelayedQueueManager {
 // SRC/TOPICS/DLQ_MANAGER.TS
 class TopicDLQManager {
   private queue: IPriorityQueue;
+  public totalMessagesProcessed = 0;
 
   constructor(private context: IContext) {
     this.queue = this.context.queueFactory();
   }
 
-  send(
+  publish(
     record: Buffer,
     meta: Metadata,
     reason: "expired" | "max_attempts" | "validation" | "processing_error"
   ): void {
     this.queue.enqueue(record, meta.ts);
+    this.totalMessagesProcessed++;
     this.context.eventBus.emit("dlq", meta, reason);
-  }
-
-  size(): number {
-    return this.queue.size();
   }
 
   async consume(): Promise<[any, Metadata] | undefined> {
     const record = this.queue.dequeue();
     if (!record) return;
     return this.context.codec.decode(record);
+  }
+
+  size() {
+    return this.queue.size();
   }
 
   async replayMessages(
@@ -928,11 +927,11 @@ interface ITopicConfig<Data> {
 }
 class Topic<Data> {
   private readonly pipeline: MessagePipeline;
-  public readonly metrics: TopicMetricsCollector;
-  public readonly membership: TopicMembershipManager;
-  public readonly queues: TopicQueueManager;
-  public readonly dlq: TopicDLQManager;
-  public readonly delayedQueue: TopicDelayedQueueManager;
+  private readonly metrics: TopicMetricsCollector;
+  public readonly clients: TopicClientRegistry;
+  private readonly queues: TopicQueueManager;
+  private readonly dlq: TopicDLQManager;
+  private readonly delayedQueue: TopicDelayedQueueManager;
   // private storage: IStorage | null;
 
   constructor(
@@ -941,10 +940,10 @@ class Topic<Data> {
     routingStrategy: IRoutingStrategy,
     private config?: ITopicConfig<Data>
   ) {
-    this.metrics = new TopicMetricsCollector(context.eventBus);
-    this.membership = new TopicMembershipManager(context.eventBus);
+    this.metrics = new TopicMetricsCollector();
+    this.clients = new TopicClientRegistry(name, context.eventBus);
     this.queues = new TopicQueueManager(routingStrategy, context.queueFactory);
-    this.delayedQueue = new TopicDelayedQueueManager(context, this.send);
+    this.delayedQueue = new TopicDelayedQueueManager(context, this.publish);
     this.dlq = new TopicDLQManager(context);
 
     this.pipeline = new PipelineFactory().create(
@@ -954,35 +953,41 @@ class Topic<Data> {
     );
   }
 
-  async send(record: Buffer, meta: Metadata): Promise<void> {
+  async publish(record: Buffer, meta: Metadata): Promise<void> {
+    const start = Date.now();
+
     if (await this.pipeline.process(record, meta)) return;
     this.queues.enqueue(record, meta);
-    this.metrics.recordMessagePublished(meta);
+
+    this.metrics.recordPublish(Date.now() - start);
+    queueMicrotask(() => this.context.eventBus.emit("sent", meta));
   }
 
   async consume(consumerId: number): Promise<[Data, Metadata] | undefined> {
+    const start = Date.now();
+
     const record = this.queues.dequeue(consumerId);
     if (!record) return;
     const message = this.context.codec.decode<Data>(record);
     if (await this.pipeline.process(record, message[1])) return;
-    message[1].consumedAt = Date.now();
+
+    const end = Date.now();
+    message[1].consumedAt = end;
+    this.metrics.recordConsumption(end - start);
+    this.context.eventBus.emit("consumed", message[1]);
+
     return message;
   }
 
   getMetadata(): ITopicMetadata {
-    const base = this.metrics.getMetrics();
-    const { producers, consumers } = this.membership.getMembership();
-
     return {
-      ...base,
+      ...this.metrics.getMetrics(),
       name: this.name,
-      producersCount: producers.length,
-      producersIds: producers,
-      consumerCount: consumers.length,
-      consumerIds: consumers,
       pendingMessages: this.queues.getQueue().size(),
-      dlqSize: this.dlq.size(),
       delayedQueueSize: this.delayedQueue.size(),
+      dlqSize: this.dlq.size(),
+      totalDlqMessages: this.dlq.totalMessagesProcessed,
+      clients: this.clients.getMetadata(),
     } as ITopicMetadata;
   }
 }
@@ -1055,24 +1060,24 @@ class TopicBroker {
   registerProducer(topicName: string, producerId: number): void {
     this.topicRegistry
       .getOrThrow(topicName)!
-      .membership.addProducer(producerId);
+      .clients.registerClient(producerId, "producer");
   }
 
   unregisterProducer(topicName: string, producerId: number): void {
     this.topicRegistry
       .getOrThrow(topicName)!
-      .membership.removeProducer(producerId);
+      .clients.unregisterClient(producerId);
   }
 
   registerConsumer(topicName: string, consumerId: number): void {
     const topic = this.topicRegistry.getOrThrow(topicName);
-    topic!.membership.addConsumer(consumerId);
+    topic!.clients.registerClient(consumerId, "consumer");
     topic!.queues.addConsumerQueue(consumerId);
   }
 
   unregisterConsumer(topicName: string, consumerId: number): void {
     const topic = this.topicRegistry.getOrThrow(topicName);
-    topic!.membership.removeConsumer(consumerId);
+    topic!.clients.unregisterClient(consumerId);
     topic!.queues.removeConsumerQueue(consumerId);
   }
 
@@ -1162,30 +1167,6 @@ class MessageFactory<Data> {
     });
   }
 }
-// SRC/PRODUCERS/METRICS.TS
-class ProducerMetrics {
-  private messagesSent = 0;
-  private lastMessages = 0;
-  constructor(private producerId: number, private eventBus: EventEmitter) {}
-
-  recordMessage(count: number = 1): void {
-    this.messagesSent += count;
-    this.lastMessages = Date.now();
-    this.eventBus.emit("producerActivity", {
-      producerId: this.producerId,
-      messagesSent: this.messagesSent,
-      ts: this.lastMessages,
-    });
-  }
-
-  getMetrics() {
-    return {
-      producerId: this.producerId,
-      messagesSent: this.messagesSent,
-      lastActivity: this.lastMessages,
-    };
-  }
-}
 // SRC/PRODUCERS/PRODUCER.TS
 interface MessageResult {
   id: number;
@@ -1194,7 +1175,6 @@ interface MessageResult {
   error?: string;
 }
 class Producer<Data> {
-  private metrics: ProducerMetrics;
   private messageFactory: MessageFactory<Data>;
   constructor(
     private readonly topic: Topic<Data>,
@@ -1206,7 +1186,6 @@ class Producer<Data> {
       maxMessageSize?: number;
     }
   ) {
-    this.metrics = new ProducerMetrics(options.id, context.eventBus);
     const validators: IValidator<Data>[] = [
       new SchemaValidator(validatorRegistry, this.options.topic),
     ];
@@ -1216,7 +1195,7 @@ class Producer<Data> {
     this.messageFactory = new MessageFactory<Data>(context.codec, validators);
   }
 
-  async send(
+  async publish(
     batch: Data[],
     metadata: MetadataInput = {}
   ): Promise<{
@@ -1225,7 +1204,14 @@ class Producer<Data> {
     sentAt: number;
     results: MessageResult[];
   }> {
+    let messagesSent = 0;
+    const now = Date.now();
     const results: MessageResult[] = [];
+
+    this.topic.clients.recordActivity(this.options.id, {
+      status: "active",
+    });
+
     const messages = this.messageFactory.create(batch, {
       ...metadata,
       ...this.options,
@@ -1233,24 +1219,24 @@ class Producer<Data> {
     });
 
     for (const { record, meta } of messages) {
+      const { id, ts } = meta;
+
       try {
-        await this.topic.send(record, meta);
-        results.push({
-          id: meta.id,
-          status: "success",
-          ts: meta.ts,
-        });
-      } catch (error) {
-        results.push({
-          id: meta.id,
-          status: "error",
-          error: error instanceof Error ? error.message : "Unknown error",
-          ts: Date.now(),
-        });
+        await this.topic.publish(record, meta);
+        results.push({ id, ts, status: "success" });
+        messagesSent++;
+      } catch (err) {
+        const error = err instanceof Error ? err.message : "Unknown error";
+        results.push({ id, ts, error, status: "error" });
       }
     }
 
-    this.metrics.recordMessage(messages.length);
+    this.topic.clients.recordActivity(this.options.id, {
+      messageCount: messagesSent,
+      processingTime: Date.now() - now,
+      status: "idle",
+    });
+
     return {
       producerId: this.options.id,
       topic: this.options.topic,
@@ -1259,8 +1245,8 @@ class Producer<Data> {
     };
   }
 
-  getMetrics() {
-    return this.metrics.getMetrics();
+  getMetadata() {
+    return this.topic.clients.getMetadata(this.options.id);
   }
 }
 // SRC/PRODUCERS/FACTORY.TS
@@ -1290,57 +1276,6 @@ class ProducerFactory {
 //
 //
 //
-// SRC/CONSUMERS/METRICS.TS
-class ConsumerMetrics {
-  private messagesProcessed = 0;
-  private messagesFailed = 0;
-  private lastActivity = 0;
-  private processingTime = 0;
-  private pendingMessages = 0;
-
-  constructor(private consumerId: number, private eventBus: EventEmitter) {}
-
-  recordMessageProcessed(processingTimeMs: number): void {
-    this.messagesProcessed++;
-    this.lastActivity = Date.now();
-    this.processingTime += processingTimeMs;
-    this.pendingMessages = Math.max(0, this.pendingMessages - 1);
-
-    this.eventBus.emit("consumerActivity", {
-      consumerId: this.consumerId,
-      type: "processed",
-      processingTimeMs,
-    });
-  }
-
-  recordMessageFailed(): void {
-    this.messagesFailed++;
-    this.lastActivity = Date.now();
-    this.eventBus.emit("consumerActivity", {
-      consumerId: this.consumerId,
-      type: "failed",
-    });
-  }
-
-  recordMessageReceived(): void {
-    this.pendingMessages++;
-    this.lastActivity = Date.now();
-  }
-
-  getMetrics() {
-    return {
-      consumerId: this.consumerId,
-      messagesProcessed: this.messagesProcessed,
-      messagesFailed: this.messagesFailed,
-      pendingMessages: this.pendingMessages,
-      lastActivity: this.lastActivity,
-      avgProcessingTime:
-        this.messagesProcessed > 0
-          ? this.processingTime / this.messagesProcessed
-          : 0,
-    };
-  }
-}
 // SRC/CONSUMERS/ACK_MANAGER.ts
 class AckManager<Data> {
   private pending = new Map<number, [Data, Metadata]>();
@@ -1401,7 +1336,6 @@ class SubscriptionManager<Data> {
 }
 // SRC/CONSUMERS/CONSUMER.ts (Facade)
 class Consumer<Data> {
-  private metrics: ConsumerMetrics;
   private ackManager: AckManager<Data>;
   private subscriptionManager: SubscriptionManager<Data>;
   constructor(
@@ -1415,7 +1349,6 @@ class Consumer<Data> {
       pollingInterval?: number;
     }
   ) {
-    this.metrics = new ConsumerMetrics(options.id, context.eventBus);
     this.ackManager = new AckManager<Data>();
     this.subscriptionManager = new SubscriptionManager<Data>(
       this.consume,
@@ -1433,11 +1366,7 @@ class Consumer<Data> {
       const message = await this.topic.consume(id);
       if (!message) continue;
 
-      this.metrics.recordMessageReceived();
-
-      if (this.options.autoAck) {
-        this.metrics.recordMessageProcessed(0);
-      } else {
+      if (!this.options.autoAck) {
         this.ackManager.addToPending(message);
       }
 
@@ -1445,7 +1374,19 @@ class Consumer<Data> {
       metas.push(message[1]);
     }
 
-    this.context.eventBus.emit("consumed", metas);
+    if (this.options.autoAck) {
+      this.topic.clients.recordActivity(this.options.id, {
+        messageCount: messages.length,
+        processingTime: 0,
+        status: "idle",
+      });
+    } else {
+      this.topic.clients.recordActivity(this.options.id, {
+        pendingMessages: messages.length,
+        status: "active",
+      });
+    }
+
     return messages;
   }
 
@@ -1465,7 +1406,7 @@ class Consumer<Data> {
   //   return this.topic.dlq.replayMessages(
   //     async (record) => {
   //       const [, meta] = this.context.codec.decode(record);
-  //       await this.topic.send(record, meta);
+  //       await this.topic.publish(record, meta);
   //     },
   //     filter
   //   );
@@ -1481,24 +1422,37 @@ class Consumer<Data> {
 
   ack(messageId?: number): void {
     const messages = this.ackManager.getMessages(messageId);
+    messages.forEach(([, meta]) => this.ackManager.ack(meta.id));
     const now = Date.now();
 
-    messages.forEach((message) => {
-      this.ackManager.ack(message[1].id);
-      this.metrics.recordMessageProcessed(now - (message[1].consumedAt || now));
+    this.topic.clients.recordActivity(this.options.id, {
+      pendingMessages: -messages.length,
+      messageCount: messages.length,
+      processingTime: now - (messages[0][1].consumedAt || now),
+      status: "idle",
     });
   }
 
-  nack(messageId?: number, requeue = true): void {
+  async nack(messageId?: number, requeue = true): Promise<void> {
     const messages = this.ackManager.getMessages(messageId);
 
-    messages.forEach(([data, meta]) => {
-      this.metrics.recordMessageFailed();
+    for (let [data, meta] of messages) {
       meta.attempts = requeue ? meta.attempts + 1 : Infinity;
       const record = this.context.codec.encode(data, meta);
-      this.topic.send(record, meta);
+      await this.topic.publish(record, meta);
       this.ackManager.ack(meta.id);
+    }
+
+    const now = Date.now();
+    this.topic.clients.recordActivity(this.options.id, {
+      pendingMessages: -messages.length,
+      processingTime: now - (messages[0][1].consumedAt || now),
+      status: "idle",
     });
+  }
+
+  getMetadata() {
+    return this.topic.clients.getMetadata(this.options.id);
   }
 }
 // SRC/CONSUMERS/FACTORY.TS
