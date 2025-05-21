@@ -7,33 +7,34 @@ import path from "path";
 import Buffer from "node:buffer";
 import Ajv, { JSONSchemaType } from "ajv";
 import { HighCapacityBinaryHeapPriorityQueue } from "../queues";
+import { ICodec } from "./codec/binary_codec";
+import { ThreadedBinaryCodec } from "./codec/binary_codec.threaded";
 //
 //
 //
 //
 // MESSAGE *********************************************************
 // SRC/MESSAGE/METADATA.TS
-class MessageMetadata {
+export class MessageMetadata {
   // Fixed-width fields
-  id: number; // 4 bytes
-  ts: number; // 8 bytes (double)
-  producerId: number; // 4 bytes
+  id: number = 0; // 4 bytes
+  ts: number = Date.now(); // 8 bytes (double)
+  producerId: number = 0; // 4 bytes
   priority?: number; // 1 byte (0-255)
   ttl?: number; // 4 bytes
   ttd?: number; // 4 bytes
   batchId?: number; // 4 bytes
   batchIdx?: number; // 2 bytes
   batchSize?: number; // 2 bytes
-  attempts: number; // 1 byte
+  attempts: number = 1; // 1 byte
   consumedAt?: number; // 8 bytes
+  size: number = 0;
+  needAcks: number = 0;
 
   // Variable-width fields
-  topic: string;
+  topic: string = "";
   correlationId?: string;
-  // TODO: add next 3 fields
   routingKey?: string;
-  size: number;
-  needAcks: number;
 
   // Bit flags for optional fields (1 byte)
   get flags(): number {
@@ -42,157 +43,9 @@ class MessageMetadata {
       (this.ttl !== undefined ? 0x02 : 0) |
       (this.ttd !== undefined ? 0x04 : 0) |
       (this.batchId !== undefined ? 0x08 : 0) |
-      (this.correlationId !== undefined ? 0x10 : 0)
+      (this.correlationId !== undefined ? 0x10 : 0) |
+      (this.routingKey !== undefined ? 0x20 : 0)
     );
-  }
-}
-// SRC/MESSAGE/CODECS/
-interface ICodec {
-  encode<T>(data: T, meta: MessageMetadata): Buffer;
-  decode<T>(buffer: Buffer): [T, MessageMetadata];
-}
-// Binary packing codec.
-// vs json: -50% ram, 3x encode, 5x decode
-// binary_codec(+ajv precompiled validation) vs protobuf(+validation): 2x faster, -10% size, -40% ram;
-// but no cross-lang, no schema-evolution, no faster if mostly optional keys
-class BinaryCodec implements ICodec {
-  encode<T>(data: T, meta: MessageMetadata): Buffer {
-    // Serialize payload first to determine size
-    const payloadJson = JSON.stringify(data);
-    const payloadBuf = Buffer.from(payloadJson);
-
-    // Calculate string sizes
-    const topicBuf = Buffer.from(meta.topic, "utf8");
-    const corrIdBuf = meta.correlationId
-      ? Buffer.from(meta.correlationId, "utf8")
-      : Buffer.alloc(0);
-
-    // Allocate buffer (46B fixed + vars + payload)
-    const buffer = Buffer.allocUnsafe(
-      46 + topicBuf.length + corrIdBuf.length + payloadBuf.length
-    );
-
-    let offset = 0;
-
-    // --- MessageMetadata Header (46 bytes fixed) ---
-    buffer.writeUInt32BE(meta.id, offset);
-    offset += 4; // 4B
-    buffer.writeDoubleBE(meta.ts, offset);
-    offset += 8; // 8B
-    buffer.writeUInt32BE(meta.producerId, offset);
-    offset += 4; // 4B
-    buffer.writeUInt8(meta.flags, offset);
-    offset += 1; // 1B
-
-    // Optional fixed fields
-    if (meta.priority !== undefined) {
-      buffer.writeUInt8(meta.priority, offset);
-      offset += 1; // 1B
-    }
-    if (meta.ttl !== undefined) {
-      buffer.writeUInt32BE(meta.ttl, offset);
-      offset += 4; // 4B
-    }
-    if (meta.ttd !== undefined) {
-      buffer.writeUInt32BE(meta.ttd, offset);
-      offset += 4; // 4B
-    }
-    if (meta.batchId !== undefined) {
-      buffer.writeUInt32BE(meta.batchId, offset);
-      offset += 4; // 4B
-      buffer.writeUInt16BE(meta.batchIdx!, offset);
-      offset += 2; // 2B
-      buffer.writeUInt16BE(meta.batchSize!, offset);
-      offset += 2; // 2B
-    }
-
-    buffer.writeUInt8(meta.attempts, offset);
-    offset += 1; // 1B
-
-    if (meta.consumedAt !== undefined) {
-      buffer.writeDoubleBE(meta.consumedAt, offset);
-      offset += 8; // 8B
-    }
-
-    // --- Variable-Length Fields ---
-    // Topic (length-prefixed)
-    buffer.writeUInt8(topicBuf.length, offset);
-    offset += 1;
-    topicBuf.copy(buffer, offset);
-    offset += topicBuf.length;
-
-    // Correlation ID (if exists)
-    if (meta.correlationId) {
-      buffer.writeUInt8(corrIdBuf.length, offset);
-      offset += 1;
-      corrIdBuf.copy(buffer, offset);
-      offset += corrIdBuf.length;
-    }
-
-    // --- Payload ---
-    buffer.writeUInt32BE(payloadBuf.length, offset);
-    offset += 4;
-    payloadBuf.copy(buffer, offset);
-
-    return buffer;
-  }
-
-  decode<T>(buffer: Buffer): [T, MessageMetadata] {
-    const meta = new MessageMetadata();
-    let offset = 0;
-
-    // --- MessageMetadata Header ---
-    meta.id = buffer.readUInt32BE(offset);
-    offset += 4;
-    meta.ts = buffer.readDoubleBE(offset);
-    offset += 8;
-    meta.producerId = buffer.readUInt32BE(offset);
-    offset += 4;
-    const flags = buffer.readUInt8(offset);
-    offset += 1;
-
-    // Optional fixed fields
-    if (flags & 0x01) meta.priority = buffer.readUInt8(offset++);
-    if (flags & 0x02) meta.ttl = buffer.readUInt32BE(offset);
-    offset += 4;
-    if (flags & 0x04) meta.ttd = buffer.readUInt32BE(offset);
-    offset += 4;
-    if (flags & 0x08) {
-      meta.batchId = buffer.readUInt32BE(offset);
-      offset += 4;
-      meta.batchIdx = buffer.readUInt16BE(offset);
-      offset += 2;
-      meta.batchSize = buffer.readUInt16BE(offset);
-      offset += 2;
-    }
-
-    meta.attempts = buffer.readUInt8(offset++);
-
-    if (flags & 0x10) {
-      meta.consumedAt = buffer.readDoubleBE(offset);
-      offset += 8;
-    }
-
-    // --- Variable-Length Fields ---
-    // Topic
-    const topicLen = buffer.readUInt8(offset++);
-    meta.topic = buffer.toString("utf8", offset, offset + topicLen);
-    offset += topicLen;
-
-    // Correlation ID
-    if (flags & 0x20) {
-      const corrIdLen = buffer.readUInt8(offset++);
-      meta.correlationId = buffer.toString("utf8", offset, offset + corrIdLen);
-      offset += corrIdLen;
-    }
-
-    // --- Payload ---
-    const payloadLen = buffer.readUInt32BE(offset);
-    offset += 4;
-    const payload = buffer.toString("utf8", offset, offset + payloadLen);
-    const data = JSON.parse(payload) as T;
-
-    return [data, meta];
   }
 }
 // SRC/MESSAGE/VALIDATORS/
@@ -482,7 +335,7 @@ class SHA256HashService implements IHashService {
 interface IHashRing {
   addNode(id: number): void;
   removeNode(id: number): void;
-  getNode(key: string): Generator<number, never, unknown>;
+  getNode(key: string): Generator<number, void, unknown>;
 }
 /** Hash ring.
  * The system works regardless of how different the key hashes are because the lookup is always relative to the fixed node positions on the ring.
@@ -520,15 +373,16 @@ class InMemoryHashRing implements IHashRing {
     }
   }
 
-  *getNode(key: string): Generator<number, never, unknown> {
+  *getNode(key: string): Generator<number, void, unknown> {
     if (this.sortedHashes.length === 0) {
       throw new Error("No nodes available in the hash ring");
     }
 
+    let nodeCount = this.sortedHashes.length;
     const keyHash = this.hashService.hash(key);
     let currentIndex = this.findNodeIndex(keyHash);
 
-    while (true) {
+    while (--nodeCount > 0) {
       yield this.hashToNodeMap.get(this.sortedHashes[currentIndex])!;
       currentIndex = (currentIndex + 1) % this.sortedHashes.length;
     }
@@ -578,7 +432,7 @@ class InMemoryHashRing implements IHashRing {
   }
 }
 interface IRoutingStrategy {
-  getCorrelatedEntry(correlationId: string): Generator<number, never, unknown>;
+  getCorrelatedEntry(correlationId: string): Generator<number, void, unknown>;
   addEntry(id: number, routingKeys?: string[]): void;
   removeEntry(id: number): void;
 }
@@ -601,7 +455,7 @@ class KeysHashRoutingStrategy implements IRoutingStrategy {
     return excludedEntries;
   }
 
-  getCorrelatedEntry(correlationId: string): Generator<number, never, unknown> {
+  getCorrelatedEntry(correlationId: string): Generator<number, void, unknown> {
     return this.ring.getNode(correlationId);
   }
 
@@ -846,9 +700,8 @@ class TopicMessageLogManager<Data> {
   }
 
   async write(message: Buffer, meta: MessageMetadata): Promise<number> {
-    const encodedMessage = await this.codec.encode(message);
     const encodedMeta = await this.codec.encodeMetadata(meta);
-    this.messages.set(meta.id, encodedMessage);
+    this.messages.set(meta.id, message);
     this.metadatas.set(meta.id, encodedMeta);
 
     this.scheduleFlush();
@@ -858,20 +711,20 @@ class TopicMessageLogManager<Data> {
   async readMessage(id: number) {
     const buffer = this.messages.get(id);
     if (!buffer) return;
-    return this.codec.decode<Data>(buffer) as Data;
+    return this.codec.decode<Data>(buffer);
   }
 
   async readMetadata<K extends keyof MessageMetadata>(id: number, keys?: K[]) {
     const buffer = this.metadatas.get(id);
     if (!buffer) return;
-    return this.codec.decodeMetadata<Data>(buffer, keys) as unknown as Pick<
-      MessageMetadata,
-      K
-    >;
+    return this.codec.decodeMetadata(buffer, keys);
   }
 
   async updateMetadata(id: number, meta: Partial<MessageMetadata>) {
-    // TODO: read update and save without decoding
+    const buffer = this.metadatas.get(id);
+    if (!buffer) return;
+    const newBuffer = this.codec.updateMetadata(buffer, meta);
+    this.metadatas.set(id, newBuffer);
   }
 
   private scheduleFlush() {
@@ -959,6 +812,8 @@ class TopicQueueManager {
           return 1;
         }
       }
+      const fallbackQueue = this.queues.keys().next().value;
+      this.queues.get(fallbackQueue)?.enqueue(meta.id, meta.priority);
     }
 
     // just populate in non-excluded queues
@@ -1124,7 +979,7 @@ interface ITopicConfig {
   maxSizeBytes?: number;
   maxDeliveryAttempts?: number;
   maxMessageSize?: number;
-  // routingStrategy?: "hash";
+  ackTimeoutMs?: number; // e.g., 30_000
   //   partitions?: number;
 }
 class Topic<Data> {
@@ -1312,7 +1167,7 @@ class TopicFactory {
       persist: true,
     }
   ) {
-    this.codec = codec ?? new BinaryCodec();
+    this.codec = codec ?? new ThreadedBinaryCodec();
   }
 
   create<Data>(name: string, config?: Partial<ITopicConfig>): Topic<Data> {
