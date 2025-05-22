@@ -1,5 +1,5 @@
 import Buffer from "node:buffer";
-import { MessageMetadata } from "../22";
+import { MessageMetadata } from "../25.ts";
 
 // SRC/MESSAGE/CODECS/
 export interface ICodec {
@@ -22,19 +22,19 @@ export interface ICodec {
 // but no cross-lang, no schema-evolution, no faster if mostly optional keys
 export class BinaryCodec implements ICodec {
   // Encodes payload only
-  encode<T>(data: T): Buffer {
+  async encode<T>(data: T): Promise<Buffer> {
     const payloadJson = JSON.stringify(data);
     return Buffer.from(payloadJson);
   }
 
   // Decodes payload only
-  decode<T>(buffer: Buffer): T {
+  async decode<T>(buffer: Buffer): Promise<T> {
     const payload = JSON.parse(buffer.toString("utf8")) as T;
     return payload;
   }
 
   // Encodes metadata into a separate buffer
-  encodeMetadata(meta: MessageMetadata): Buffer {
+  async encodeMetadata(meta: MessageMetadata): Promise<Buffer> {
     // Calculate size for all optional fields
     const routingKeyBuf = meta.routingKey
       ? Buffer.from(meta.routingKey, "utf8")
@@ -132,10 +132,10 @@ export class BinaryCodec implements ICodec {
   }
 
   // Decodes full/partial metadata from buffer
-  decodeMetadata<K extends keyof MessageMetadata>(
+  async decodeMetadata<K extends keyof MessageMetadata>(
     buffer: Buffer,
     keys?: K[]
-  ): Pick<MessageMetadata, K> {
+  ): Promise<Pick<MessageMetadata, K> {
     const meta: Partial<MessageMetadata> = {};
     let offset = 0;
 
@@ -256,10 +256,10 @@ export class BinaryCodec implements ICodec {
   }
 
   // Updates specific metadata in the buffer without decoding full message
-  updateMetadata(
+  async updateMetadata(
     buffer: Buffer,
     partialMeta: Partial<MessageMetadata>
-  ): Buffer {
+  ): Promise<Buffer> {
     const tempBuffer = Buffer.alloc(buffer.length);
     buffer.copy(tempBuffer);
 

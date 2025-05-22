@@ -123,19 +123,23 @@ class MessageFactory<Data> {
 //
 //
 // PRODUCER ********************************************************
+interface ICanPublish {
+  name: string;
+  publish: (
+    producerId: number,
+    message: Buffer,
+    meta: MessageMetadata
+  ) => Promise<void>;
+  recordClientActivity(
+    clientId: number,
+    activityRecord: Partial<ITopicClientState>
+  ): void;
+}
 // SRC/PRODUCER/PRODUCER.TS
 class Producer<Data> {
   constructor(
+    private readonly topic: ICanPublish,
     private readonly messageFactory: MessageFactory<Data>,
-    private readonly send: (
-      message: Buffer,
-      meta: MessageMetadata
-    ) => Promise<void>,
-    private readonly recordActivity: (
-      clientId: number,
-      activityRecord: Partial<ITopicClientState>
-    ) => void,
-    private readonly topicName: string,
     private readonly id: number
   ) {}
 
@@ -148,13 +152,13 @@ class Producer<Data> {
       error?: string;
     }[] = [];
 
-    this.recordActivity(this.id, {
+    this.topic.recordClientActivity(this.id, {
       status: "active",
     });
 
     const messages = this.messageFactory.create(batch, {
       ...metadata,
-      topic: this.topicName,
+      topic: this.topic.name,
       producerId: this.id,
     });
 
@@ -162,7 +166,7 @@ class Producer<Data> {
       const { id, ts } = meta;
 
       try {
-        await this.send(message, meta);
+        await this.topic.publish(this.id, message, meta);
         results.push({ id, ts, status: "success" });
         messagesSent++;
       } catch (err) {
@@ -171,7 +175,7 @@ class Producer<Data> {
       }
     }
 
-    this.recordActivity(this.id, {
+    this.topic.recordClientActivity(this.id, {
       messageCount: messagesSent,
       processingTime: Date.now() - messages[0]?.meta.ts,
       status: "idle",
@@ -184,7 +188,6 @@ class Producer<Data> {
 class ProducerFactory<Data> {
   private messageFactory: MessageFactory<Data>;
   constructor(
-    private topicName: string,
     codec: ICodec,
     getTopicCapacity: () => number,
     schemaValidator?: (data: any) => boolean,
@@ -201,21 +204,8 @@ class ProducerFactory<Data> {
     this.messageFactory = new MessageFactory<Data>(codec, validators);
   }
 
-  create(
-    send: (message: Buffer, meta: MessageMetadata) => Promise<void>,
-    recordActivity: (
-      clientId: number,
-      activityRecord: Partial<ITopicClientState>
-    ) => void,
-    id = uniqueIntGenerator()
-  ) {
-    return new Producer(
-      this.messageFactory,
-      send,
-      recordActivity,
-      this.topicName,
-      id
-    );
+  create(publisher: ICanPublish, id = uniqueIntGenerator()) {
+    return new Producer(publisher, this.messageFactory, id);
   }
 }
 //
@@ -223,12 +213,25 @@ class ProducerFactory<Data> {
 //
 //
 // CONSUMER ********************************************************
+interface ICanConsume<Data> {
+  consume(consumerId: number, autoAck?: boolean): Promise<Data | undefined>;
+  ack(consumerId: number, messageId?: number): Promise<number[]>;
+  nack(
+    consumerId: number,
+    messageId?: number,
+    requeue?: boolean
+  ): Promise<number[]>;
+  recordClientActivity(
+    clientId: number,
+    activityRecord: Partial<ITopicClientState>
+  ): void;
+}
 // SRC/CONSUMER/CONSUMER.ts (Facade)
 class Consumer<Data> {
   private readonly limit: number;
   private lastConsumptionTs: number;
   constructor(
-    private readonly topic: Topic<Data>,
+    private readonly topic: ICanConsume<Data>,
     private readonly id: number,
     private readonly autoAck?: boolean,
     limit?: number
@@ -286,12 +289,44 @@ class Consumer<Data> {
     });
   }
 
-  createDlqConsumer() {
-    const consumer = this.topic.createDlqConsumer();
+  // subscribe(handler: (message: Data) => Promise<void>): void {
+  //   this.topic.subscribe(this.id, handler);
+  // }
+
+  // unsubscribe(): void {
+  //   this.topic.unsubscribe(this.id);
+  // }
+}
+interface ICanConsumeDLQ<Data> {
+  createDlqReader(
+    consumerId: number
+  ): AsyncGenerator<{ message: Data; meta: MessageMetadata }, void, unknown>;
+  replayDlq(
+    consumerId: number,
+    handler: (message: unknown, meta: MessageMetadata) => Promise<void>,
+    filter?: (meta: MessageMetadata) => boolean
+  ): Promise<number>;
+  recordClientActivity(
+    clientId: number,
+    activityRecord: Partial<ITopicClientState>
+  ): void;
+}
+class DLQConsumer<Data> {
+  private readonly limit: number;
+  constructor(
+    private readonly topic: ICanConsumeDLQ<Data>,
+    private readonly id: number,
+    limit?: number
+  ) {
+    this.limit = Math.max(1, limit!);
+  }
+
+  createReader() {
+    const reader = this.topic.createDlqReader(this.id);
     return async () => {
       const messages = [];
 
-      for await (const message of consumer) {
+      for await (const message of reader) {
         if (!message) break;
         // @ts-ignore
         messages.push(message);
@@ -306,16 +341,20 @@ class Consumer<Data> {
     handler: (message: unknown, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ) {
-    return this.topic.replayDlq(handler, filter);
+    const start = Date.now();
+    this.topic.recordClientActivity(this.id, {
+      status: "active",
+    });
+
+    const replayedCount = await this.topic.replayDlq(this.id, handler, filter);
+
+    this.topic.recordClientActivity(this.id, {
+      messageCount: replayedCount,
+      processingTime: Date.now() - start,
+      status: "idle",
+    });
+    return replayedCount;
   }
-
-  // subscribe(handler: (message: Data) => Promise<void>): void {
-  //   this.topic.subscribe(this.id, handler);
-  // }
-
-  // unsubscribe(): void {
-  //   this.topic.unsubscribe(this.id);
-  // }
 }
 //
 //
@@ -607,7 +646,7 @@ class TopicMetricsCollector {
 }
 // SRC/TOPIC/CLIENT_REGISTRY.TS
 interface ITopicClientState {
-  clientType: "producer" | "consumer";
+  clientType: "producer" | "consumer" | "dlq_consumer";
   registeredAt: number;
   lastActiveAt: number;
   // Metrics
@@ -622,7 +661,7 @@ class TopicClientRegistry {
   private totalConsumers = 0;
   private totalProducers = 0;
 
-  register(type: "producer" | "consumer", id = uniqueIntGenerator()) {
+  register(type: ITopicClientState["clientType"], id = uniqueIntGenerator()) {
     const now = Date.now();
     this.clients.set(id, {
       registeredAt: now,
@@ -634,18 +673,28 @@ class TopicClientRegistry {
       status: "active",
     });
 
-    if (type === "producer") this.totalProducers++;
-    else this.totalConsumers++;
+    this[`total${type[0].toUpperCase() + type.slice(1)}s`]++;
     return this.clients.get(id);
   }
 
   unregister(id: number) {
     const client = this.clients.get(id);
-    if (client?.clientType === "producer") this.totalProducers++;
-    else this.totalConsumers++;
+    if (!client) return;
+    const type = client.clientType;
+    this[`total${type[0].toUpperCase() + type.slice(1)}s`]--;
 
     this.clients.delete(id);
     return this.clients.size;
+  }
+
+  validate(id: number, expectedType?: ITopicClientState["clientType"]) {
+    const metadata = this.clients.get(id);
+    if (!metadata) {
+      throw new Error(`Client with ID ${id} not found`);
+    }
+    if (expectedType && metadata.clientType !== expectedType) {
+      throw new Error(`Client with ID ${id} is not a ${expectedType}`);
+    }
   }
 
   count(type: "producer" | "consumer") {
@@ -934,7 +983,7 @@ class TopicDLQManager {
     this.logger?.log(`Routed to DLQ. Reason: ${reason}.`, meta, "warn");
   }
 
-  async *createConsumer() {
+  async *createReader() {
     for (const [messageId, reason] of this.messages.entries()) {
       const meta = await this.messageLogManager.readMetadata(messageId);
       const message = await this.messageLogManager.readMessage(messageId);
@@ -982,7 +1031,9 @@ interface ITopicConfig {
   ackTimeoutMs?: number; // e.g., 30_000
   //   partitions?: number;
 }
-class Topic<Data> {
+class Topic<Data>
+  implements ICanPublish, ICanConsume<Data>, ICanConsumeDLQ<Data>
+{
   constructor(
     public readonly name: string,
     private readonly pipeline: MessagePipeline,
@@ -998,6 +1049,8 @@ class Topic<Data> {
     delayedQueue.setOnReadyHandler(this.delayedQueuePublish);
   }
 
+  // utils
+
   private async delayedQueuePublish(messageId: number) {
     const meta = await this.messageLogManager.readMetadata(messageId);
     if (!meta) return;
@@ -1006,7 +1059,29 @@ class Topic<Data> {
     this.logger?.log(`Delayed message is routed to ${this.name}.`, meta);
   }
 
-  private async publish(message: Buffer, meta: MessageMetadata): Promise<void> {
+  private async checkIsConsumed(
+    messageId: number,
+    needAcks: number,
+    ts: number
+  ) {
+    const consumedAt = --needAcks < 1 ? Date.now() : undefined;
+    await this.messageLogManager.updateMetadata(messageId, {
+      needAcks,
+      consumedAt,
+    });
+    if (consumedAt) {
+      this.metrics.recordDequeue(consumedAt - ts);
+    }
+  }
+
+  // core
+
+  async publish(
+    producerId: number,
+    message: Buffer,
+    meta: MessageMetadata
+  ): Promise<void> {
+    this.clientRegistry.validate(producerId, "producer");
     await this.messageLogManager.write(message, meta);
     this.metrics.recordEnqueue(meta.size, Date.now() - meta.ts);
 
@@ -1017,7 +1092,40 @@ class Topic<Data> {
     this.logger?.log(`Message is routed to ${this.name}.`, meta);
   }
 
+  async consume(consumerId: number, autoAck = false) {
+    this.clientRegistry.validate(consumerId, "consumer");
+    const messageId = this.queueManager.dequeue(consumerId, autoAck);
+    if (!messageId) return;
+    const meta = await this.messageLogManager.readMetadata(messageId);
+    if (!meta) return;
+    const message = await this.messageLogManager.readMessage(messageId);
+
+    if (autoAck) {
+      await this.checkIsConsumed(messageId, meta.needAcks, meta.ts);
+    }
+
+    this.logger?.log(`Message is consumed from ${this.name}.`, meta);
+    return message;
+  }
+
+  async ack(consumerId: number, messageId?: number) {
+    this.clientRegistry.validate(consumerId, "consumer");
+    const messages = this.queueManager.ack(consumerId, messageId);
+
+    for (const messageId of messages) {
+      const meta = await this.messageLogManager.readMetadata(messageId, [
+        "needAcks",
+        "ts",
+      ]);
+      if (!meta) continue;
+      await this.checkIsConsumed(messageId, meta.needAcks, meta.ts);
+    }
+
+    return messages;
+  }
+
   async nack(consumerId: number, messageId?: number, requeue = true) {
+    this.clientRegistry.validate(consumerId, "consumer");
     const messages = this.queueManager.ack(consumerId, messageId);
 
     for (const messageId of messages) {
@@ -1037,61 +1145,21 @@ class Topic<Data> {
     return messages;
   }
 
-  async consume(consumerId: number, autoAck = false) {
-    const messageId = this.queueManager.dequeue(consumerId, autoAck);
-    if (!messageId) return;
-    const meta = await this.messageLogManager.readMetadata(messageId);
-    if (!meta) return;
-    const message = await this.messageLogManager.readMessage(messageId);
-
-    if (autoAck) {
-      await this.checkIsConsumed(messageId, meta.needAcks, meta.ts);
-    }
-
-    this.logger?.log(`Message is consumed from ${this.name}.`, meta);
-    return message;
-  }
-
-  async ack(consumerId: number, messageId?: number) {
-    const messages = this.queueManager.ack(consumerId, messageId);
-
-    for (const messageId of messages) {
-      const meta = await this.messageLogManager.readMetadata(messageId, [
-        "needAcks",
-        "ts",
-      ]);
-      if (!meta) continue;
-      await this.checkIsConsumed(messageId, meta.needAcks, meta.ts);
-    }
-
-    return messages;
-  }
-
-  private async checkIsConsumed(
-    messageId: number,
-    needAcks: number,
-    ts: number
-  ) {
-    const consumedAt = --needAcks < 1 ? Date.now() : undefined;
-    await this.messageLogManager.updateMetadata(messageId, {
-      needAcks,
-      consumedAt,
-    });
-    if (consumedAt) {
-      this.metrics.recordDequeue(consumedAt - ts);
-    }
-  }
-
-  createDlqConsumer() {
-    return this.dlqManager.createConsumer();
+  createDlqReader(consumerId: number) {
+    this.clientRegistry.validate(consumerId, "dlq_consumer");
+    return this.dlqManager.createReader();
   }
 
   async replayDlq(
+    consumerId: number,
     handler: (message: unknown, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ) {
+    this.clientRegistry.validate(consumerId, "dlq_consumer");
     return this.dlqManager.replayMessages(handler, filter);
   }
+
+  // clients
 
   createProducer() {
     const id = uniqueIntGenerator();
@@ -1101,11 +1169,7 @@ class Topic<Data> {
       clientId: id,
     });
 
-    return this.producerFactory.create(
-      this.publish,
-      this.recordClientActivity,
-      id
-    );
+    return this.producerFactory.create(this, id);
   }
 
   createConsumer(options: {
@@ -1126,6 +1190,17 @@ class Topic<Data> {
     return new Consumer(this, id, autoAck, limit);
   }
 
+  createDLQConsumer(limit?: number) {
+    const id = uniqueIntGenerator();
+    this.clientRegistry.register("dlq_consumer", id);
+    this.logger?.log(`dlq_consumer_created`, {
+      topic: this.name,
+      clientId: id,
+    });
+
+    return new DLQConsumer(this, id, limit);
+  }
+
   deleteClient(id: number) {
     this.clientRegistry.unregister(id);
     this.queueManager.removeConsumerQueue(id);
@@ -1141,6 +1216,8 @@ class Topic<Data> {
   ) {
     this.clientRegistry.recordActivity(...args);
   }
+
+  // metadata
 
   getMetadata() {
     return {
@@ -1211,7 +1288,6 @@ class TopicFactory {
       metrics,
       clientRegistry,
       new ProducerFactory(
-        name,
         this.codec,
         () => metrics.getMetrics().totalBytes,
         validator,
