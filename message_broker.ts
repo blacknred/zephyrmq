@@ -91,31 +91,36 @@ class MessageFactory<Data> {
     private validators: IMessageValidator<Data>[]
   ) {}
 
-  create(
+  async create(
     batch: Data[],
     metadataInput: MetadataInput & { topic: string; producerId: number }
-  ): Array<{ message: Buffer; meta: MessageMetadata }> {
+  ) {
     const batchId = Date.now();
-    return batch.map((data, index) => {
-      const meta = new MessageMetadata();
-      Object.assign(meta, metadataInput);
-      meta.id = uniqueIntGenerator();
-      meta.ts = Date.now();
-      meta.attempts = 1;
-      meta.needAcks = 0;
+    return Promise.all(
+      batch.map(async (data, index) => {
+        const meta = new MessageMetadata();
+        Object.assign(meta, metadataInput);
+        meta.id = uniqueIntGenerator();
+        meta.ts = Date.now();
+        meta.attempts = 1;
+        meta.needAcks = 0;
 
-      if (batch.length > 1) {
-        meta.batchId = batchId;
-        meta.batchIdx = index;
-        meta.batchSize = batch.length;
-      }
+        if (batch.length > 1) {
+          meta.batchId = batchId;
+          meta.batchIdx = index;
+          meta.batchSize = batch.length;
+        }
 
-      const message = this.codec.encode(data);
-      meta.size = message.byteLength;
-
-      this.validators.forEach((v) => v.validate({ data, meta }));
-      return { message, meta };
-    });
+        try {
+          const message = await this.codec.encode(data);
+          meta.size = message.byteLength;
+          this.validators.forEach((v) => v.validate({ data, meta }));
+          return { meta, message, error: null };
+        } catch (error) {
+          return { meta, error, message: null };
+        }
+      })
+    );
   }
 }
 //
@@ -135,7 +140,7 @@ interface ICanPublish {
     activityRecord: Partial<ITopicClientState>
   ): void;
 }
-// SRC/PRODUCER/PRODUCER.TS
+// SRC/PRODUCERS/PRODUCER.TS (Facade)
 class Producer<Data> {
   constructor(
     private readonly topic: ICanPublish,
@@ -144,6 +149,7 @@ class Producer<Data> {
   ) {}
 
   async publish(batch: Data[], metadata: MetadataInput = {}) {
+    const start = Date.now();
     let messagesSent = 0;
     const results: {
       id: number;
@@ -156,14 +162,20 @@ class Producer<Data> {
       status: "active",
     });
 
-    const messages = this.messageFactory.create(batch, {
+    const messages = await this.messageFactory.create(batch, {
       ...metadata,
       topic: this.topic.name,
       producerId: this.id,
     });
 
-    for (const { message, meta } of messages) {
+    for (const { message, meta, error } of messages) {
       const { id, ts } = meta;
+
+      if (error) {
+        const err = error instanceof Error ? error.message : "Unknown error";
+        results.push({ id, ts, error: err, status: "error" });
+        continue;
+      }
 
       try {
         await this.topic.publish(this.id, message, meta);
@@ -177,14 +189,14 @@ class Producer<Data> {
 
     this.topic.recordClientActivity(this.id, {
       messageCount: messagesSent,
-      processingTime: Date.now() - messages[0]?.meta.ts,
+      processingTime: Date.now() - start,
       status: "idle",
     });
 
     return results;
   }
 }
-// SRC/PRODUCER/FACTORY
+// SRC/PRODUCERS/PRODUCER_FACTORY
 class ProducerFactory<Data> {
   private messageFactory: MessageFactory<Data>;
   constructor(
@@ -213,6 +225,41 @@ class ProducerFactory<Data> {
 //
 //
 // CONSUMER ********************************************************
+// SRC/CONSUMERS/SUBSCRIPTION_MANAGER.TS
+class SubscriptionManager<Data> {
+  private isActive = false;
+  private abortController = new AbortController();
+
+  constructor(private delayInterval = 1000) {}
+
+  async subscribe(
+    handler: (messages: Data[]) => Promise<void>,
+    fetcher: () => Promise<Data[]>,
+    onError?: (e?: Error) => void
+  ): Promise<void> {
+    this.isActive = true;
+
+    while (this.isActive) {
+      try {
+        const messages = await fetcher();
+        if (messages.length > 0) {
+          await handler(messages);
+        } else {
+          await wait(this.delayInterval, this.abortController.signal);
+        }
+      } catch (err) {
+        onError?.(err);
+        if (err.name !== "AbortError") throw err;
+      }
+    }
+  }
+
+  unsubscribe(): void {
+    this.isActive = false;
+    this.abortController.abort();
+  }
+}
+// SRC/CONSUMERS/CONSUMER.TS (Facade)
 interface ICanConsume<Data> {
   consume(consumerId: number, autoAck?: boolean): Promise<Data | undefined>;
   ack(consumerId: number, messageId?: number): Promise<number[]>;
@@ -226,12 +273,12 @@ interface ICanConsume<Data> {
     activityRecord: Partial<ITopicClientState>
   ): void;
 }
-// SRC/CONSUMER/CONSUMER.ts (Facade)
 class Consumer<Data> {
   private readonly limit: number;
   private lastConsumptionTs: number;
   constructor(
     private readonly topic: ICanConsume<Data>,
+    private readonly subscriptionManager: SubscriptionManager<Data>,
     private readonly id: number,
     private readonly autoAck?: boolean,
     limit?: number
@@ -289,21 +336,38 @@ class Consumer<Data> {
     });
   }
 
-  // subscribe(handler: (message: Data) => Promise<void>): void {
-  //   this.topic.subscribe(this.id, handler);
-  // }
+  subscribe(handler: (messages: Data[]) => Promise<void>): void {
+    this.subscriptionManager.subscribe(handler, this.consume);
+  }
 
-  // unsubscribe(): void {
-  //   this.topic.unsubscribe(this.id);
-  // }
+  unsubscribe(): void {
+    this.subscriptionManager.unsubscribe();
+  }
 }
+// SRC/CONSUMERS/CONSUMER_FACTORY
+class ConsumerFactory<Data> {
+  create(
+    consumer: ICanConsume<Data>,
+    id = uniqueIntGenerator(),
+    options?: {
+      limit?: number;
+      autoAck?: boolean;
+      pollingInterval?: number;
+    }
+  ) {
+    const { limit, autoAck, pollingInterval } = options || {};
+    const subscriptionManager = new SubscriptionManager<Data>(pollingInterval);
+    return new Consumer(consumer, subscriptionManager, id, autoAck, limit);
+  }
+}
+// SRC/CONSUMERS/DLQ_CONSUMER.TS (Facade)
 interface ICanConsumeDLQ<Data> {
   createDlqReader(
     consumerId: number
-  ): AsyncGenerator<{ message: Data; meta: MessageMetadata }, void, unknown>;
+  ): AsyncGenerator<DLQEntry<Data>, void, unknown>;
   replayDlq(
     consumerId: number,
-    handler: (message: unknown, meta: MessageMetadata) => Promise<void>,
+    handler: (message: Data, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ): Promise<number>;
   recordClientActivity(
@@ -313,32 +377,31 @@ interface ICanConsumeDLQ<Data> {
 }
 class DLQConsumer<Data> {
   private readonly limit: number;
+  private reader: AsyncGenerator<DLQEntry<Data>, void, unknown>;
   constructor(
     private readonly topic: ICanConsumeDLQ<Data>,
+    private readonly subscriptionManager: SubscriptionManager<DLQEntry<Data>>,
     private readonly id: number,
     limit?: number
   ) {
     this.limit = Math.max(1, limit!);
+    this.reader = this.topic.createDlqReader(this.id);
   }
 
-  createReader() {
-    const reader = this.topic.createDlqReader(this.id);
-    return async () => {
-      const messages = [];
+  async consume() {
+    const messages: DLQEntry<Data>[] = [];
 
-      for await (const message of reader) {
-        if (!message) break;
-        // @ts-ignore
-        messages.push(message);
-        if (messages.length == this.limit) break;
-      }
+    for await (const message of this.reader) {
+      if (!message) break;
+      messages.push(message);
+      if (messages.length == this.limit) break;
+    }
 
-      return messages;
-    };
+    return messages;
   }
 
   async replayDlq(
-    handler: (message: unknown, meta: MessageMetadata) => Promise<void>,
+    handler: (message: Data, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ) {
     const start = Date.now();
@@ -354,6 +417,31 @@ class DLQConsumer<Data> {
       status: "idle",
     });
     return replayedCount;
+  }
+
+  subscribe(handler: (messages: DLQEntry<Data>[]) => Promise<void>): void {
+    this.subscriptionManager.subscribe(handler, this.consume);
+  }
+
+  unsubscribe(): void {
+    this.subscriptionManager.unsubscribe();
+  }
+}
+// SRC/CONSUMERS/DLQ_CONSUMER_FACTORY
+class DLQConsumerFactory<Data> {
+  create(
+    consumer: ICanConsumeDLQ<Data>,
+    id = uniqueIntGenerator(),
+    options?: {
+      limit?: number;
+      pollingInterval?: number;
+    }
+  ) {
+    const { limit, pollingInterval } = options || {};
+    const subscriptionManager = new SubscriptionManager<DLQEntry<Data>>(
+      pollingInterval
+    );
+    return new DLQConsumer(consumer, subscriptionManager, id, limit);
   }
 }
 //
@@ -533,8 +621,8 @@ interface IMessageProcessor {
   process(meta: MessageMetadata): boolean;
 }
 // SRC/PIPELINE/PROCESSORS/
-class ExpirationProcessor implements IMessageProcessor {
-  constructor(private dlq: TopicDLQManager) {}
+class ExpirationProcessor<Data> implements IMessageProcessor {
+  constructor(private dlq: TopicDLQManager<Data>) {}
   process(meta: MessageMetadata): boolean {
     if (!meta.ttl) return false;
     const isExpired =
@@ -543,8 +631,11 @@ class ExpirationProcessor implements IMessageProcessor {
     return isExpired;
   }
 }
-class AttemptsProcessor implements IMessageProcessor {
-  constructor(private dlq: TopicDLQManager, private maxAttempts: number) {}
+class AttemptsProcessor<Data> implements IMessageProcessor {
+  constructor(
+    private dlq: TopicDLQManager<Data>,
+    private maxAttempts: number
+  ) {}
   process(meta: MessageMetadata): boolean {
     const shouldDeadLetter = meta.attempts > this.maxAttempts;
     if (shouldDeadLetter) {
@@ -576,9 +667,9 @@ class MessagePipeline {
   }
 }
 // SRC/PIPELINE/PIPELINE_FACTORY.TS
-class PipelineFactory {
+class PipelineFactory<Data> {
   create(
-    dlqManager: TopicDLQManager,
+    dlqManager: TopicDLQManager<Data>,
     delayedQueue: TopicDelayedQueueManager,
     maxAttempts?: number
   ): MessagePipeline {
@@ -800,13 +891,13 @@ class TopicMessageLogManager<Data> {
   };
 }
 // SRC/TOPIC/QUEUE_MANAGER.TS
-class TopicQueueManager {
+class TopicQueueManager<Data> {
   private totalQueuedMessages: 0;
   private queues = new Map<number, IPriorityQueue<number>>();
   private pendingMessages = new Map<number, Set<number>>();
 
   constructor(
-    private dlqManager: TopicDLQManager,
+    private dlqManager: TopicDLQManager<Data>,
     private routingStrategy: KeysHashRoutingStrategy
   ) {}
 
@@ -899,8 +990,10 @@ class TopicQueueManager {
     return Array.from(pendingMessages);
   }
 
-  size() {
-    return this.totalQueuedMessages;
+  getMetadata() {
+    return {
+      size: this.totalQueuedMessages,
+    };
   }
 }
 // SRC/TOPIC/DELAYED_QUEUE_MANAGER.TS
@@ -955,16 +1048,26 @@ class TopicDelayedQueueManager {
       this.scheduleProcessing();
     }
   };
+
+  getMetadata() {
+    return {
+      size: this.queue.size(),
+    };
+  }
 }
 // SRC/TOPIC/DLQ_MANAGER.TS
-type DLQReason =
-  | "no_consumers"
-  | "expired"
-  | "max_attempts"
-  | "validation"
-  | "processing_error";
-class TopicDLQManager {
-  private messages = new Map<number, DLQReason>();
+interface DLQEntry<Data> {
+  reason:
+    | "no_consumers"
+    | "expired"
+    | "max_attempts"
+    | "validation"
+    | "processing_error";
+  message: Data;
+  meta: MessageMetadata;
+}
+class TopicDLQManager<Data> {
+  private messages = new Map<number, DLQEntry<Data>["reason"]>();
   public totalMessagesProcessed = 0;
 
   constructor(
@@ -977,27 +1080,27 @@ class TopicDLQManager {
     return this.messages.size;
   }
 
-  publish(meta: MessageMetadata, reason: DLQReason): void {
+  publish(meta: MessageMetadata, reason: DLQEntry<Data>["reason"]): void {
     this.messages.set(meta.id, reason);
     this.totalMessagesProcessed++;
     this.logger?.log(`Routed to DLQ. Reason: ${reason}.`, meta, "warn");
   }
 
-  async *createReader() {
+  async *createReader(): AsyncGenerator<DLQEntry<Data>, void, unknown> {
     for (const [messageId, reason] of this.messages.entries()) {
       const meta = await this.messageLogManager.readMetadata(messageId);
       const message = await this.messageLogManager.readMessage(messageId);
       if (!meta) continue;
-      yield { message, meta: { ...meta, reason } };
+      yield { message, meta, reason };
     }
   }
 
   async replayMessages(
-    handler: (message: unknown, meta: MessageMetadata) => Promise<void>,
+    handler: (message: Data, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ) {
     let count = 0;
-    const records = this.createConsumer();
+    const records = this.createReader();
 
     for await (const { message, meta } of records) {
       if (!filter || filter(meta)) {
@@ -1016,6 +1119,13 @@ class TopicDLQManager {
     );
 
     return count;
+  }
+
+  getMetadata() {
+    return {
+      totalProcessed: this.totalMessagesProcessed,
+      size: this.messages.size,
+    };
   }
 }
 // SRC/TOPIC/TOPIC.TS
@@ -1038,12 +1148,14 @@ class Topic<Data>
     public readonly name: string,
     private readonly pipeline: MessagePipeline,
     private readonly messageLogManager: TopicMessageLogManager<Data>,
-    private readonly queueManager: TopicQueueManager,
-    private readonly dlqManager: TopicDLQManager,
+    private readonly queueManager: TopicQueueManager<Data>,
+    private readonly dlqManager: TopicDLQManager<Data>,
     private readonly delayedQueue: TopicDelayedQueueManager,
     private readonly metrics: TopicMetricsCollector,
     private readonly clientRegistry: TopicClientRegistry,
     private readonly producerFactory: ProducerFactory<Data>,
+    private readonly consumerFactory: ConsumerFactory<Data>,
+    private readonly dlqConsumerFactory: DLQConsumerFactory<Data>,
     private readonly logger?: LogCollector
   ) {
     delayedQueue.setOnReadyHandler(this.delayedQueuePublish);
@@ -1152,7 +1264,7 @@ class Topic<Data>
 
   async replayDlq(
     consumerId: number,
-    handler: (message: unknown, meta: MessageMetadata) => Promise<void>,
+    handler: (message: Data, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ) {
     this.clientRegistry.validate(consumerId, "dlq_consumer");
@@ -1172,25 +1284,24 @@ class Topic<Data>
     return this.producerFactory.create(this, id);
   }
 
-  createConsumer(options: {
+  createConsumer(options?: {
     routingKeys?: string[];
     limit?: number;
     autoAck?: boolean;
     pollingInterval?: number;
   }) {
-    const { limit, autoAck, routingKeys } = options;
     const id = uniqueIntGenerator();
     this.clientRegistry.register("consumer", id);
-    this.queueManager.addConsumerQueue(id, routingKeys);
+    this.queueManager.addConsumerQueue(id, options?.routingKeys);
     this.logger?.log(`consumer_created`, {
       topic: this.name,
       clientId: id,
     });
 
-    return new Consumer(this, id, autoAck, limit);
+    return this.consumerFactory.create(this, id, options);
   }
 
-  createDLQConsumer(limit?: number) {
+  createDLQConsumer(options?: { limit?: number; pollingInterval?: number }) {
     const id = uniqueIntGenerator();
     this.clientRegistry.register("dlq_consumer", id);
     this.logger?.log(`dlq_consumer_created`, {
@@ -1198,7 +1309,7 @@ class Topic<Data>
       clientId: id,
     });
 
-    return new DLQConsumer(this, id, limit);
+    return this.dlqConsumerFactory.create(this, id, options);
   }
 
   deleteClient(id: number) {
@@ -1223,11 +1334,10 @@ class Topic<Data>
     return {
       ...this.metrics.getMetrics(),
       name: this.name,
-      pendingMessages: this.queueManager.size(),
-      delayedQueueSize: this.delayedQueue.size(),
-      dlqSize: this.dlqManager.size(),
-      totalDlqMessages: this.dlqManager.totalMessagesProcessed,
       clients: this.clientRegistry.getMetadata(),
+      pendingMessages: this.queueManager.getMetadata(),
+      delayedQueue: this.delayedQueue.getMetadata(),
+      dlq: this.dlqManager.getMetadata(),
     };
   }
 }
@@ -1266,9 +1376,13 @@ class TopicFactory {
       mergedConfig.persistThreshold
     );
 
-    const dlqManager = new TopicDLQManager(name, messageLogManager, logger);
+    const dlqManager = new TopicDLQManager<Data>(
+      name,
+      messageLogManager,
+      logger
+    );
     const delayedQueueManager = new TopicDelayedQueueManager(logger);
-    const queueManager = new TopicQueueManager(
+    const queueManager = new TopicQueueManager<Data>(
       dlqManager,
       new KeysHashRoutingStrategy(new InMemoryHashRing(new SHA256HashService()))
     );
@@ -1293,6 +1407,8 @@ class TopicFactory {
         validator,
         mergedConfig.maxMessageSize
       ),
+      new ConsumerFactory(),
+      new DLQConsumerFactory(),
       logger
     );
   }
