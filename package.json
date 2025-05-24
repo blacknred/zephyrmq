@@ -12,7 +12,7 @@
   },
   "license": "ISC",
   "author": "blcknrd",
-  "type": "esm",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -22,5 +22,9 @@
     "pino": "^9.6.0",
     "ts-proto": "^2.7.0",
     "zod": "^3.24.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "typescript": "^5.8.3"
   }
 }

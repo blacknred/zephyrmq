@@ -160,6 +160,7 @@ class Producer<Data> {
 
     this.topic.recordClientActivity(this.id, {
       status: "active",
+      pendingMessages: batch.length,
     });
 
     const messages = await this.messageFactory.create(batch, {
@@ -189,6 +190,7 @@ class Producer<Data> {
 
     this.topic.recordClientActivity(this.id, {
       messageCount: messagesSent,
+      pendingMessages: -batch.length,
       processingTime: Date.now() - start,
       status: "idle",
     });
@@ -300,6 +302,7 @@ class Consumer<Data> {
     if (this.autoAck) {
       this.topic.recordClientActivity(this.id, {
         messageCount: messages.length,
+        pendingMessages: 0,
         processingTime: 0,
         status: "idle",
       });
@@ -385,6 +388,7 @@ class DLQConsumer<Data> {
     limit?: number
   ) {
     this.limit = Math.max(1, limit!);
+    // singleton reader allows you to read only once, waiting for the newest messages to arrive
     this.reader = this.topic.createDlqReader(this.id);
   }
 
@@ -565,21 +569,28 @@ interface IRoutingStrategy {
 }
 class KeysHashRoutingStrategy implements IRoutingStrategy {
   private subscriptions = new Map<number, Set<string>>();
-  private excludedEntriesCache = new Map<string, Set<number>>();
+  private entriesCache = new Map<
+    string | undefined,
+    [Set<number>, Set<number>]
+  >();
   constructor(private ring: IHashRing) {}
 
-  getExcludedEntries(routingKey: string): Set<number> {
+  getEntries(routingKey?: string) {
     // use cache to prevent hot spot
-    const cached = this.excludedEntriesCache.get(routingKey);
-    if (cached) return cached;
+    if (!this.entriesCache.has(routingKey)) {
+      const bindedEntries = new Set<number>();
+      const excludedEntries = new Set<number>();
+      for (const [entry, keys] of this.subscriptions) {
+        if (!routingKey || !keys.has(routingKey)) {
+          excludedEntries.add(entry);
+        } else {
+          bindedEntries.add(entry);
+        }
+      }
 
-    const excludedEntries = new Set<number>();
-    for (const [entry, keys] of this.subscriptions) {
-      if (keys.has(routingKey)) excludedEntries.add(entry);
+      this.entriesCache.set(routingKey, [bindedEntries, excludedEntries]);
     }
-
-    this.excludedEntriesCache.set(routingKey, excludedEntries);
-    return excludedEntries;
+    return this.entriesCache.get(routingKey)!;
   }
 
   getCorrelatedEntry(correlationId: string): Generator<number, void, unknown> {
@@ -593,9 +604,7 @@ class KeysHashRoutingStrategy implements IRoutingStrategy {
       this.subscriptions.set(consumerId, new Set(routingKeys));
 
       // shuffle cache
-      for (const key of routingKeys) {
-        this.excludedEntriesCache.delete(key);
-      }
+      this.entriesCache.clear();
     }
   }
 
@@ -604,12 +613,107 @@ class KeysHashRoutingStrategy implements IRoutingStrategy {
     this.subscriptions.delete(consumerId);
 
     // shuffle cache
-    for (const [key, entries] of this.excludedEntriesCache) {
-      if (entries.has(consumerId)) {
-        this.excludedEntriesCache.delete(key);
-      }
-    }
+    this.entriesCache.clear();
   }
+}
+//
+//
+//
+//
+// MESSAGE_STORAGE *************************************************
+interface IMessageStorage<Data> {
+  writeAll(message: Buffer, meta: MessageMetadata): Promise<number>;
+  readAll(
+    id: number
+  ): Promise<
+    [
+      Awaited<Data> | undefined,
+      Pick<MessageMetadata, keyof MessageMetadata> | undefined
+    ]
+  >;
+  readMessage(id: number): Promise<Data | undefined>;
+  readMetadata<K extends keyof MessageMetadata>(
+    id: number,
+    keys?: K[]
+  ): Promise<Pick<MessageMetadata, K> | undefined>;
+  updateMetadata(id: number, meta: Partial<MessageMetadata>): Promise<void>;
+  flush(): Promise<void>;
+}
+// SRC/STORAGE/MESSAGE_LOG_MANAGER.TS
+class LevelDBMessageStorage<Data> implements IMessageStorage<Data> {
+  // separates metadata/messages buffers since we: 1. need read only data/metadata, 2. need update only metadata, 3. need often read metadata (retention timer)
+  private messages = new Map<number, Buffer<Data>>();
+  private metadatas = new Map<number, Buffer<MessageMetadata>>();
+  private flushId?: number;
+
+  constructor(
+    private topic: string,
+    private codec: ICodec,
+    private retentionMs = 86_400_000, // 1day
+    private isPersist = true,
+    private persistThresholdMs = 100,
+    private chunkSize = 50
+  ) {
+    // TODO: timeout retention check meta:
+    // meta.consumedAt ====> delete
+    // meta.ts + meta.ttl < now ====> DLQ
+    // (non-expired & non-consumed) && now - meta.ts >= retentionMs ====> DLQ
+  }
+
+  async writeAll(message: Buffer, meta: MessageMetadata): Promise<number> {
+    const encodedMeta = await this.codec.encodeMetadata(meta);
+    this.messages.set(meta.id, message);
+    this.metadatas.set(meta.id, encodedMeta);
+
+    this.scheduleFlush();
+    return this.messages.size;
+  }
+
+  async readAll(id: number) {
+    return Promise.all([this.readMessage(id), this.readMetadata(id)]);
+  }
+
+  async readMessage(id: number) {
+    const buffer = this.messages.get(id);
+    if (!buffer) return;
+    return this.codec.decode<Data>(buffer);
+  }
+
+  async readMetadata<K extends keyof MessageMetadata>(id: number, keys?: K[]) {
+    const buffer = this.metadatas.get(id);
+    if (!buffer) return;
+    return this.codec.decodeMetadata(buffer, keys);
+  }
+
+  async updateMetadata(id: number, meta: Partial<MessageMetadata>) {
+    const buffer = this.metadatas.get(id);
+    if (!buffer) return;
+    const newBuffer = this.codec.updateMetadata(buffer, meta);
+    this.metadatas.set(id, newBuffer);
+  }
+
+  private scheduleFlush() {
+    if (!this.isPersist) return;
+    this.flushId ??= setImmediate(this.flush, this.persistThresholdMs);
+  }
+
+  flush = async () => {
+    this.flushId = undefined;
+    let count = 0;
+    const idIterator = this.metadatas.keys();
+
+    for (let id of idIterator) {
+      if (this.chunkSize && count >= this.chunkSize) break;
+      // leveldb put
+      this.messages.delete(id);
+      this.metadatas.delete(id);
+      count++;
+    }
+
+    if (this.metadatas.size > 0) {
+      this.scheduleFlush();
+    }
+  };
 }
 //
 //
@@ -644,8 +748,8 @@ class AttemptsProcessor<Data> implements IMessageProcessor {
     return shouldDeadLetter;
   }
 }
-class DelayProcessor implements IMessageProcessor {
-  constructor(private delayedQueue: TopicDelayedQueueManager) {}
+class DelayProcessor<Data> implements IMessageProcessor {
+  constructor(private delayedQueue: TopicDelayedQueueManager<Data>) {}
   process(meta: MessageMetadata): boolean {
     if (!meta.ttd) return false;
     const shouldDelay = meta.ts + meta.ttd > Date.now();
@@ -670,7 +774,7 @@ class MessagePipeline {
 class PipelineFactory<Data> {
   create(
     dlqManager: TopicDLQManager<Data>,
-    delayedQueue: TopicDelayedQueueManager,
+    delayedQueue: TopicDelayedQueueManager<Data>,
     maxAttempts?: number
   ): MessagePipeline {
     const pipeline = new MessagePipeline();
@@ -737,6 +841,7 @@ class TopicMetricsCollector {
 }
 // SRC/TOPIC/CLIENT_REGISTRY.TS
 interface ITopicClientState {
+  id: number;
   clientType: "producer" | "consumer" | "dlq_consumer";
   registeredAt: number;
   lastActiveAt: number;
@@ -745,40 +850,70 @@ interface ITopicClientState {
   messageCount: number;
   processingTime: number;
   avgProcessingTime: number;
-  pendingMessages?: number;
+  pendingMessages: number;
 }
-class TopicClientRegistry {
+class TopicClientManager {
+  // TODO: persist
   private clients = new Map<number, ITopicClientState>();
+  private activeConsumers = new Set<number>();
   private totalConsumers = 0;
   private totalProducers = 0;
+  private totalDLQProducers = 0;
+  private timer: number;
 
-  register(type: ITopicClientState["clientType"], id = uniqueIntGenerator()) {
+  constructor(
+    private inactivityThresholdMs = 300_000,
+    private processingTimeThresholdMs = 50_000,
+    private pendingThresholdMs = 100
+  ) {
+    // Check more frequently than inactivityThreshold
+    this.timer = setInterval(
+      this.checkInactiveConsumers,
+      Math.max(1000, this.inactivityThresholdMs / 2)
+    );
+  }
+
+  private checkInactiveConsumers = () => {
+    const now = Date.now();
+    for (let consumerId of this.activeConsumers) {
+      const lastActiveAt = this.clients.get(consumerId)?.lastActiveAt;
+      if (lastActiveAt && now - lastActiveAt < this.inactivityThresholdMs) {
+        this.activeConsumers.delete(consumerId);
+      }
+    }
+  };
+
+  addClient(type: ITopicClientState["clientType"], id = uniqueIntGenerator()) {
     const now = Date.now();
     this.clients.set(id, {
       registeredAt: now,
       lastActiveAt: now,
       clientType: type,
       messageCount: 0,
+      pendingMessages: 0,
       processingTime: 0,
       avgProcessingTime: 0,
       status: "active",
+      id,
     });
 
+    if (type === "consumer") this.activeConsumers.add(id);
     this[`total${type[0].toUpperCase() + type.slice(1)}s`]++;
     return this.clients.get(id);
   }
 
-  unregister(id: number) {
+  removeClient(id: number) {
     const client = this.clients.get(id);
     if (!client) return;
     const type = client.clientType;
+    if (type === "consumer") this.activeConsumers.delete(id);
     this[`total${type[0].toUpperCase() + type.slice(1)}s`]--;
 
     this.clients.delete(id);
     return this.clients.size;
   }
 
-  validate(id: number, expectedType?: ITopicClientState["clientType"]) {
+  validateClient(id: number, expectedType?: ITopicClientState["clientType"]) {
     const metadata = this.clients.get(id);
     if (!metadata) {
       throw new Error(`Client with ID ${id} not found`);
@@ -788,9 +923,17 @@ class TopicClientRegistry {
     }
   }
 
-  count(type: "producer" | "consumer") {
-    if (type == "producer") return this.totalProducers;
-    return this.totalConsumers;
+  getClient(clientId: number) {
+    return this.clients.get(clientId);
+  }
+
+  getClients(filter?: (client: ITopicClientState) => boolean) {
+    if (!filter) return Array.from(this.clients.values());
+    const results: ITopicClientState[] = [];
+    for (const state of this.clients.values()) {
+      if (filter(state)) results.push(state);
+    }
+    return results;
   }
 
   recordActivity(clientId: number, activityRecord: Partial<ITopicClientState>) {
@@ -811,183 +954,246 @@ class TopicClientRegistry {
     }
 
     this.clients.set(clientId, client);
+    if (client.clientType !== "consumer") return;
+
+    // active consumers update
+    this.activeConsumers.add(clientId);
+    if (
+      activityRecord.status == "lagging" ||
+      client.avgProcessingTime > this.processingTimeThresholdMs ||
+      client.pendingMessages > this.pendingThresholdMs
+    ) {
+      this.activeConsumers.delete(clientId);
+    }
   }
 
-  getMetadata(clientId?: number) {
-    if (clientId) return this.clients.get(clientId);
-    return Array.from(this.clients.values());
+  getMetadata() {
+    return {
+      totalConsumers: this.totalConsumers,
+      activeConsumers: this.activeConsumers,
+      totalProducers: this.totalProducers,
+      totalDLQProducers: this.totalDLQProducers,
+    };
   }
 }
-// SRC/TOPIC/MESSAGE_LOG_MANAGER.TS
-class TopicMessageLogManager<Data> {
-  // separates metadata/messages buffers since we: 1. need read only data/metadata, 2. need update only metadata, 3. need often read metadata (retention timer)
-  private messages = new Map<number, Buffer<Data>>();
-  private metadatas = new Map<number, Buffer<MessageMetadata>>();
-  private flushId?: number;
+class TopicAckManager<Data> {
+  // TODO: persist
+  private pendingMessages = new Map<number, Map<number, number>>();
+  private awaitedAcksCount = new Map<number, number>();
+  private timer?: number;
 
   constructor(
-    private topic: string,
-    private codec: ICodec,
-    private retentionMs = 86_400_000, // 1day
-    private isPersist = true,
-    private persistThreshold = 100,
-    private chunkSize = 50
+    private pipeline: MessagePipeline,
+    private messageStorage: IMessageStorage<Data>,
+    private queueManager: TopicQueueManager,
+    private metrics: TopicMetricsCollector,
+    private logger?: LogCollector,
+    private ackTimeoutMs: number = 30_000
   ) {
-    // TODO: timeout retention check meta:
-    // meta.consumedAt ====> delete
-    // meta.ts + meta.ttl < now ====> DLQ
-    // (non-expired & non-consumed) && now - meta.ts >= retentionMs ====> DLQ
+    // Check more frequently than ackTimeoutMs
+    this.timer = setInterval(
+      this.nackTimedOutPendings,
+      Math.max(1000, this.ackTimeoutMs / 2)
+    );
   }
 
-  async write(message: Buffer, meta: MessageMetadata): Promise<number> {
-    const encodedMeta = await this.codec.encodeMetadata(meta);
-    this.messages.set(meta.id, message);
-    this.metadatas.set(meta.id, encodedMeta);
-
-    this.scheduleFlush();
-    return this.messages.size;
-  }
-
-  async readMessage(id: number) {
-    const buffer = this.messages.get(id);
-    if (!buffer) return;
-    return this.codec.decode<Data>(buffer);
-  }
-
-  async readMetadata<K extends keyof MessageMetadata>(id: number, keys?: K[]) {
-    const buffer = this.metadatas.get(id);
-    if (!buffer) return;
-    return this.codec.decodeMetadata(buffer, keys);
-  }
-
-  async updateMetadata(id: number, meta: Partial<MessageMetadata>) {
-    const buffer = this.metadatas.get(id);
-    if (!buffer) return;
-    const newBuffer = this.codec.updateMetadata(buffer, meta);
-    this.metadatas.set(id, newBuffer);
-  }
-
-  private scheduleFlush() {
-    if (!this.isPersist) return;
-    this.flushId ??= setImmediate(this.flush, this.persistThreshold);
-  }
-
-  flush = async () => {
-    this.flushId = undefined;
-    let count = 0;
-    const idIterator = this.metadatas.keys();
-
-    for (let id of idIterator) {
-      if (this.chunkSize && count >= this.chunkSize) break;
-      // leveldb put
-      this.messages.delete(id);
-      this.metadatas.delete(id);
-      count++;
-    }
-
-    if (this.metadatas.size > 0) {
-      this.scheduleFlush();
+  private nackTimedOutPendings = async () => {
+    const now = Date.now();
+    for (const [consumerId, messages] of this.pendingMessages.entries()) {
+      for (const [messageId, consumedAt] of messages.entries()) {
+        if (now - consumedAt > this.ackTimeoutMs) {
+          await this.nack(consumerId, messageId, true);
+        }
+      }
     }
   };
-}
-// SRC/TOPIC/QUEUE_MANAGER.TS
-class TopicQueueManager<Data> {
-  private totalQueuedMessages: 0;
-  private queues = new Map<number, IPriorityQueue<number>>();
-  private pendingMessages = new Map<number, Set<number>>();
 
+  async decrementAwaitedAcks(messageId: number) {
+    let neededAcks = this.awaitedAcksCount.get(messageId);
+    if (!neededAcks) return;
+    this.awaitedAcksCount.set(messageId, --neededAcks);
+    if (neededAcks > 0) return;
+
+    const meta = await this.messageStorage.readMetadata(messageId, ["ts"]);
+    if (!meta) return;
+    const consumedAt = Date.now();
+    await this.messageStorage.updateMetadata(messageId, { consumedAt });
+    this.metrics.recordDequeue(consumedAt - meta.ts);
+  }
+
+  setAwaitedAcksCount(messageid: number, awaitedAcks: number) {
+    this.awaitedAcksCount.set(messageid, awaitedAcks);
+  }
+
+  async ack(consumerId: number, messageId?: number) {
+    const pendingMessages: number[] = [];
+
+    if (messageId) {
+      pendingMessages.push(messageId);
+      this.removePending(consumerId, messageId);
+    } else {
+      const pendingMap = this.pendingMessages.get(consumerId)!;
+      pendingMessages.push(...pendingMap.keys());
+      this.removePending(consumerId);
+    }
+
+    for (const messageId of pendingMessages) {
+      await this.decrementAwaitedAcks(messageId);
+    }
+
+    return pendingMessages;
+  }
+
+  async nack(consumerId: number, messageId?: number, requeue = true) {
+    const messages = await this.ack(consumerId, messageId);
+
+    for (const messageId of messages) {
+      const meta = await this.messageStorage.readMetadata(messageId);
+      if (!meta) continue;
+      await this.messageStorage.updateMetadata(messageId, {
+        attempts: requeue ? meta.attempts + 1 : Infinity,
+        consumedAt: undefined,
+      });
+
+      if (this.pipeline.process(meta)) continue;
+
+      this.queueManager.enqueue(consumerId, meta);
+      this.logger?.log(
+        `Message is nacked to ${requeue ? "queue" : "DLQ"}.`,
+        meta
+      );
+    }
+
+    return messages;
+  }
+
+  addPending(consumerId: number, messageId: number): void {
+    if (!this.pendingMessages.has(consumerId)) {
+      this.pendingMessages.set(consumerId, new Map());
+    }
+    this.pendingMessages.get(consumerId)?.set(messageId, Date.now());
+  }
+
+  removePending(consumerId: number, messageId?: number): void {
+    if (messageId) {
+      this.pendingMessages.get(consumerId)?.delete(messageId);
+    } else {
+      this.pendingMessages.get(consumerId)?.clear();
+    }
+
+    if (this.pendingMessages.get(consumerId)?.size == 0) {
+      this.pendingMessages.delete(consumerId);
+    }
+  }
+
+  getMetadata() {
+    return {};
+  }
+}
+// SRC/TOPIC/ROUTER.ts
+class TopicMessageRouter<Data> {
   constructor(
+    private clientManager: TopicClientManager,
+    private queueManager: TopicQueueManager,
     private dlqManager: TopicDLQManager<Data>,
     private routingStrategy: KeysHashRoutingStrategy
   ) {}
 
-  addConsumerQueue(consumerId: number, routingKeys?: string[]) {
-    this.queues.set(consumerId, new HighCapacityBinaryHeapPriorityQueue());
-    this.pendingMessages.set(consumerId, new Set());
+  addRoutingEntry(consumerId: number, routingKeys?: string[]) {
     this.routingStrategy.addEntry(consumerId, routingKeys);
+    this.queueManager.addConsumerQueue(consumerId);
+  }
+
+  removeRoutingEntry(consumerId: number) {
+    this.routingStrategy.removeEntry(consumerId);
+    this.queueManager.removeConsumerQueue(consumerId);
+  }
+
+  route(meta: MessageMetadata) {
+    const { totalConsumers, activeConsumers } =
+      this.clientManager.getMetadata();
+
+    // no consumers yet
+    if (!totalConsumers) {
+      this.dlqManager.publish(meta, "no_consumers");
+      return 0;
+    }
+
+    // consumers with routingKey get only messages with the same routingKey
+    // consumers without routingKey get all messages
+
+    const [binded, excluded] = this.routingStrategy.getEntries(meta.routingKey);
+
+    // all consumers binded to other routingKeys
+    if (excluded?.size == totalConsumers) {
+      this.dlqManager.publish(meta, "no_consumers");
+      return 0;
+    }
+
+    if (!meta.correlationId) {
+      // just populate to non-excluded queues
+      let consumersCount = 0;
+      for (const consumer of activeConsumers) {
+        if (!excluded?.has(consumer)) {
+          this.queueManager.enqueue(consumer, meta);
+          consumersCount++;
+        }
+      }
+
+      return consumersCount;
+    }
+
+    // need nearest correlated consumer scan
+    const correlations = this.routingStrategy.getCorrelatedEntry(
+      meta.correlationId
+    )!;
+
+    let fallback: number | undefined;
+
+    for (const consumerId of correlations) {
+      // routingKey + correlationId is similar to Consumer Group behaviour by prioritizing binded consumer
+      if (binded.has(consumerId)) {
+        this.queueManager.enqueue(consumerId, meta);
+        return 1;
+        // fallback to first non-excluded
+      } else if (!fallback && !excluded.has(consumerId)) {
+        fallback = consumerId;
+      }
+    }
+
+    if (fallback) {
+      this.queueManager.enqueue(fallback, meta);
+      return 1;
+    } else {
+      // if all correlations non-binded && excluded
+      this.dlqManager.publish(meta, "no_consumers");
+      return 0;
+    }
+  }
+}
+// SRC/TOPIC/QUEUE_MANAGER.TS
+class TopicQueueManager {
+  // TODO: persist
+  private queues = new Map<number, IPriorityQueue<number>>();
+  private totalQueuedMessages: 0;
+
+  addConsumerQueue(consumerId: number) {
+    this.queues.set(consumerId, new HighCapacityBinaryHeapPriorityQueue());
   }
 
   removeConsumerQueue(consumerId: number) {
     this.queues.delete(consumerId);
-    this.ack(consumerId);
-    this.routingStrategy.removeEntry(consumerId);
   }
 
-  enqueue(meta: MessageMetadata, consumerId?: number) {
-    // consumers with routingKey get only messages with the same routingKey
-    // consumers without routingKey get all messages
-
-    // put message to consumer (consumer nack case)
-    if (consumerId) {
-      this.queues.get(consumerId)?.enqueue(meta.id, meta.priority);
-      return;
-    }
-
-    // no consumers yet
-    if (!this.queues.size) {
-      this.dlqManager.publish(meta, "no_consumers");
-      return 0;
-    }
-
-    // consumers binded to other routingKeys
-    const excludedQueues = meta.routingKey
-      ? this.routingStrategy.getExcludedEntries(meta.routingKey)
-      : null;
-
-    // all consumers binded to other routingKeys
-    if (excludedQueues?.size == this.queues.size) {
-      this.dlqManager.publish(meta, "no_consumers");
-      return 0;
-    }
-
-    // need nearest correlated consumer scan
-    if (meta.correlationId) {
-      const correlations = this.routingStrategy.getCorrelatedEntry(
-        meta.correlationId
-      )!;
-
-      for (const correlatedQueue of correlations) {
-        if (!excludedQueues || !excludedQueues.has(correlatedQueue)) {
-          this.queues.get(correlatedQueue)?.enqueue(meta.id, meta.priority);
-          return 1;
-        }
-      }
-      const fallbackQueue = this.queues.keys().next().value;
-      this.queues.get(fallbackQueue)?.enqueue(meta.id, meta.priority);
-    }
-
-    // just populate in non-excluded queues
-    let needAcks = 0;
-    this.queues.forEach((queue, name) => {
-      if (excludedQueues?.has(name)) return;
-      queue.enqueue(meta.id, meta.priority);
-      this.totalQueuedMessages++;
-      needAcks++;
-    });
-
-    return needAcks;
+  enqueue(consumerId: number, meta: MessageMetadata) {
+    this.queues.get(consumerId)?.enqueue(meta.id, meta.priority);
+    this.totalQueuedMessages++;
   }
 
-  dequeue(consumerId: number, autoAck = false) {
+  dequeue(consumerId: number) {
     const messageId = this.queues.get(consumerId)?.dequeue();
-    if (messageId) {
-      this.totalQueuedMessages--;
-      if (!autoAck) {
-        this.pendingMessages.get(consumerId)?.add(messageId);
-      }
-    }
-
+    if (messageId) this.totalQueuedMessages--;
     return messageId;
-  }
-
-  ack(consumerId: number, messageId?: number) {
-    if (messageId) {
-      this.pendingMessages.get(consumerId)?.delete(messageId);
-      return [messageId];
-    }
-    const pendingMessages = this.pendingMessages.get(consumerId)!;
-    this.pendingMessages.set(consumerId, new Set());
-    return Array.from(pendingMessages);
   }
 
   getMetadata() {
@@ -997,21 +1203,17 @@ class TopicQueueManager<Data> {
   }
 }
 // SRC/TOPIC/DELAYED_QUEUE_MANAGER.TS
-class TopicDelayedQueueManager {
+class TopicDelayedQueueManager<Data> {
+  // TODO: persist
   private queue = new HighCapacityBinaryHeapPriorityQueue<[number, number]>();
   private nextTimeout?: number;
   private isProcessing = false;
-  private onReadyHandler?: (messageId: number) => Promise<void>;
 
-  constructor(private logger?: LogCollector) {}
-
-  setOnReadyHandler(handler: (messageId: number) => Promise<void>) {
-    this.onReadyHandler = handler;
-  }
-
-  size(): number {
-    return this.queue.size();
-  }
+  constructor(
+    private messageStorage: IMessageStorage<Data>,
+    private messageRouter: TopicMessageRouter<Data>,
+    private logger?: LogCollector
+  ) {}
 
   publish(meta: MessageMetadata) {
     const readyTs = meta.ts + meta.ttd!;
@@ -1041,7 +1243,11 @@ class TopicDelayedQueueManager {
         if (readyTs > Date.now()) break; // second peak is not ready yet
 
         this.queue.dequeue();
-        await this.onReadyHandler?.(messageId);
+        const meta = await this.messageStorage.readMetadata(messageId);
+        if (!meta) return;
+
+        this.messageRouter.route(meta);
+        this.logger?.log(`Delayed message is routed to ${meta.topic}.`, meta);
       }
     } finally {
       this.isProcessing = false;
@@ -1067,12 +1273,13 @@ interface DLQEntry<Data> {
   meta: MessageMetadata;
 }
 class TopicDLQManager<Data> {
+  // TODO: persist
   private messages = new Map<number, DLQEntry<Data>["reason"]>();
   public totalMessagesProcessed = 0;
 
   constructor(
     private topic: string,
-    private messageLogManager: TopicMessageLogManager<any>,
+    private messageStorage: IMessageStorage<any>,
     private logger?: LogCollector
   ) {}
 
@@ -1088,9 +1295,8 @@ class TopicDLQManager<Data> {
 
   async *createReader(): AsyncGenerator<DLQEntry<Data>, void, unknown> {
     for (const [messageId, reason] of this.messages.entries()) {
-      const meta = await this.messageLogManager.readMetadata(messageId);
-      const message = await this.messageLogManager.readMessage(messageId);
-      if (!meta) continue;
+      const [message, meta] = await this.messageStorage.readAll(messageId);
+      if (!meta || !message) continue;
       yield { message, meta, reason };
     }
   }
@@ -1132,13 +1338,16 @@ class TopicDLQManager<Data> {
 interface ITopicConfig {
   schema?: string; // registered schema` name
   persist?: boolean; // true by def
-  persistThreshold?: number; // persist flush delay, // 100
+  persistThresholdMs?: number; // persist flush delay, // 100
   retentionMs?: number; // 86_400_000 1 day
-  archivalThreshold?: number; // 100_000
+  archivalThresholdMs?: number; // 100_000
   maxSizeBytes?: number;
   maxDeliveryAttempts?: number;
   maxMessageSize?: number;
   ackTimeoutMs?: number; // e.g., 30_000
+  consumerInactivityThresholdMs?: 600_000;
+  consumerProcessingTimeThresholdMs?: number;
+  consumerPendingThresholdMs?: number;
   //   partitions?: number;
 }
 class Topic<Data>
@@ -1147,44 +1356,19 @@ class Topic<Data>
   constructor(
     public readonly name: string,
     private readonly pipeline: MessagePipeline,
-    private readonly messageLogManager: TopicMessageLogManager<Data>,
-    private readonly queueManager: TopicQueueManager<Data>,
+    private readonly messageStorage: IMessageStorage<Data>,
+    private readonly messageRouter: TopicMessageRouter<Data>,
+    private readonly queueManager: TopicQueueManager,
+    private readonly ackManager: TopicAckManager<Data>,
     private readonly dlqManager: TopicDLQManager<Data>,
-    private readonly delayedQueue: TopicDelayedQueueManager,
-    private readonly metrics: TopicMetricsCollector,
-    private readonly clientRegistry: TopicClientRegistry,
+    private readonly delayedQueueManager: TopicDelayedQueueManager<Data>,
+    private readonly clientManager: TopicClientManager,
     private readonly producerFactory: ProducerFactory<Data>,
     private readonly consumerFactory: ConsumerFactory<Data>,
     private readonly dlqConsumerFactory: DLQConsumerFactory<Data>,
+    private readonly metrics: TopicMetricsCollector,
     private readonly logger?: LogCollector
-  ) {
-    delayedQueue.setOnReadyHandler(this.delayedQueuePublish);
-  }
-
-  // utils
-
-  private async delayedQueuePublish(messageId: number) {
-    const meta = await this.messageLogManager.readMetadata(messageId);
-    if (!meta) return;
-
-    this.queueManager.enqueue(meta);
-    this.logger?.log(`Delayed message is routed to ${this.name}.`, meta);
-  }
-
-  private async checkIsConsumed(
-    messageId: number,
-    needAcks: number,
-    ts: number
-  ) {
-    const consumedAt = --needAcks < 1 ? Date.now() : undefined;
-    await this.messageLogManager.updateMetadata(messageId, {
-      needAcks,
-      consumedAt,
-    });
-    if (consumedAt) {
-      this.metrics.recordDequeue(consumedAt - ts);
-    }
-  }
+  ) {}
 
   // core
 
@@ -1193,27 +1377,29 @@ class Topic<Data>
     message: Buffer,
     meta: MessageMetadata
   ): Promise<void> {
-    this.clientRegistry.validate(producerId, "producer");
-    await this.messageLogManager.write(message, meta);
+    this.clientManager.validateClient(producerId, "producer");
+    await this.messageStorage.writeAll(message, meta);
     this.metrics.recordEnqueue(meta.size, Date.now() - meta.ts);
 
     if (this.pipeline.process(meta)) return;
 
-    const needAcks = this.queueManager.enqueue(meta);
-    await this.messageLogManager.updateMetadata(meta.id, { needAcks });
+    const queuesCount = this.messageRouter.route(meta);
+    this.ackManager.setAwaitedAcksCount(meta.id, queuesCount);
     this.logger?.log(`Message is routed to ${this.name}.`, meta);
   }
 
   async consume(consumerId: number, autoAck = false) {
-    this.clientRegistry.validate(consumerId, "consumer");
-    const messageId = this.queueManager.dequeue(consumerId, autoAck);
+    this.clientManager.validateClient(consumerId, "consumer");
+    const messageId = this.queueManager.dequeue(consumerId);
     if (!messageId) return;
-    const meta = await this.messageLogManager.readMetadata(messageId);
-    if (!meta) return;
-    const message = await this.messageLogManager.readMessage(messageId);
+
+    const [message, meta] = await this.messageStorage.readAll(messageId);
+    if (!meta || !message) return;
 
     if (autoAck) {
-      await this.checkIsConsumed(messageId, meta.needAcks, meta.ts);
+      await this.ackManager.decrementAwaitedAcks(messageId);
+    } else {
+      this.ackManager.addPending(consumerId, messageId);
     }
 
     this.logger?.log(`Message is consumed from ${this.name}.`, meta);
@@ -1221,44 +1407,17 @@ class Topic<Data>
   }
 
   async ack(consumerId: number, messageId?: number) {
-    this.clientRegistry.validate(consumerId, "consumer");
-    const messages = this.queueManager.ack(consumerId, messageId);
-
-    for (const messageId of messages) {
-      const meta = await this.messageLogManager.readMetadata(messageId, [
-        "needAcks",
-        "ts",
-      ]);
-      if (!meta) continue;
-      await this.checkIsConsumed(messageId, meta.needAcks, meta.ts);
-    }
-
-    return messages;
+    this.clientManager.validateClient(consumerId, "consumer");
+    return this.ackManager.ack(consumerId, messageId);
   }
 
   async nack(consumerId: number, messageId?: number, requeue = true) {
-    this.clientRegistry.validate(consumerId, "consumer");
-    const messages = this.queueManager.ack(consumerId, messageId);
-
-    for (const messageId of messages) {
-      const meta = await this.messageLogManager.readMetadata(messageId);
-      if (!meta) continue;
-      await this.messageLogManager.updateMetadata(messageId, {
-        attempts: requeue ? meta.attempts + 1 : Infinity,
-        consumedAt: undefined,
-      });
-
-      if (this.pipeline.process(meta)) continue;
-
-      this.queueManager.enqueue(meta, consumerId);
-      this.logger?.log(`Message is nacked to ${this.name}.`, meta);
-    }
-
-    return messages;
+    this.clientManager.validateClient(consumerId, "consumer");
+    return this.ackManager.nack(consumerId, messageId, requeue);
   }
 
   createDlqReader(consumerId: number) {
-    this.clientRegistry.validate(consumerId, "dlq_consumer");
+    this.clientManager.validateClient(consumerId, "dlq_consumer");
     return this.dlqManager.createReader();
   }
 
@@ -1267,7 +1426,7 @@ class Topic<Data>
     handler: (message: Data, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ) {
-    this.clientRegistry.validate(consumerId, "dlq_consumer");
+    this.clientManager.validateClient(consumerId, "dlq_consumer");
     return this.dlqManager.replayMessages(handler, filter);
   }
 
@@ -1275,7 +1434,7 @@ class Topic<Data>
 
   createProducer() {
     const id = uniqueIntGenerator();
-    this.clientRegistry.register("producer", id);
+    this.clientManager.addClient("producer", id);
     this.logger?.log(`producer_created`, {
       topic: this.name,
       clientId: id,
@@ -1291,8 +1450,8 @@ class Topic<Data>
     pollingInterval?: number;
   }) {
     const id = uniqueIntGenerator();
-    this.clientRegistry.register("consumer", id);
-    this.queueManager.addConsumerQueue(id, options?.routingKeys);
+    this.clientManager.addClient("consumer", id);
+    this.messageRouter.addRoutingEntry(id, options?.routingKeys);
     this.logger?.log(`consumer_created`, {
       topic: this.name,
       clientId: id,
@@ -1303,7 +1462,7 @@ class Topic<Data>
 
   createDLQConsumer(options?: { limit?: number; pollingInterval?: number }) {
     const id = uniqueIntGenerator();
-    this.clientRegistry.register("dlq_consumer", id);
+    this.clientManager.addClient("dlq_consumer", id);
     this.logger?.log(`dlq_consumer_created`, {
       topic: this.name,
       clientId: id,
@@ -1313,8 +1472,8 @@ class Topic<Data>
   }
 
   deleteClient(id: number) {
-    this.clientRegistry.unregister(id);
-    this.queueManager.removeConsumerQueue(id);
+    this.clientManager.removeClient(id);
+    this.messageRouter.removeRoutingEntry(id);
     this.logger?.log("client_deleted", {
       topic: this.name,
       clientId: id,
@@ -1323,9 +1482,9 @@ class Topic<Data>
   }
 
   recordClientActivity(
-    ...args: Parameters<typeof this.clientRegistry.recordActivity>
+    ...args: Parameters<typeof this.clientManager.recordActivity>
   ) {
-    this.clientRegistry.recordActivity(...args);
+    this.clientManager.recordActivity(...args);
   }
 
   // metadata
@@ -1334,9 +1493,9 @@ class Topic<Data>
     return {
       ...this.metrics.getMetrics(),
       name: this.name,
-      clients: this.clientRegistry.getMetadata(),
+      clients: this.clientManager.getMetadata(),
       pendingMessages: this.queueManager.getMetadata(),
-      delayedQueue: this.delayedQueue.getMetadata(),
+      delayedQueue: this.delayedQueueManager.getMetadata(),
       dlq: this.dlqManager.getMetadata(),
     };
   }
@@ -1366,41 +1525,56 @@ class TopicFactory {
 
     // Build dependencies
     const metrics = new TopicMetricsCollector();
-    const clientRegistry = new TopicClientRegistry();
+    const clientManager = new TopicClientManager(
+      mergedConfig.consumerInactivityThresholdMs,
+      mergedConfig.consumerProcessingTimeThresholdMs,
+      mergedConfig.consumerPendingThresholdMs
+    );
 
-    const messageLogManager = new TopicMessageLogManager<Data>(
+    const queueManager = new TopicQueueManager();
+    const messageStorage = new LevelDBMessageStorage<Data>(
       name,
       this.codec,
       mergedConfig.retentionMs,
       mergedConfig.persist,
-      mergedConfig.persistThreshold
+      mergedConfig.persistThresholdMs
     );
-
-    const dlqManager = new TopicDLQManager<Data>(
-      name,
-      messageLogManager,
-      logger
-    );
-    const delayedQueueManager = new TopicDelayedQueueManager(logger);
-    const queueManager = new TopicQueueManager<Data>(
+    const dlqManager = new TopicDLQManager<Data>(name, messageStorage, logger);
+    const messageRouter = new TopicMessageRouter<Data>(
+      clientManager,
+      queueManager,
       dlqManager,
       new KeysHashRoutingStrategy(new InMemoryHashRing(new SHA256HashService()))
+    );
+    const delayedQueueManager = new TopicDelayedQueueManager(
+      messageStorage,
+      messageRouter,
+      logger
     );
     const pipeline = new PipelineFactory().create(
       dlqManager,
       delayedQueueManager,
       mergedConfig?.maxDeliveryAttempts
     );
+    const ackManager = new TopicAckManager(
+      pipeline,
+      messageStorage,
+      queueManager,
+      metrics,
+      logger,
+      mergedConfig?.ackTimeoutMs
+    );
 
     return new Topic<Data>(
       name,
       pipeline,
-      messageLogManager,
+      messageStorage,
+      messageRouter,
       queueManager,
+      ackManager,
       dlqManager,
       delayedQueueManager,
-      metrics,
-      clientRegistry,
+      clientManager,
       new ProducerFactory(
         this.codec,
         () => metrics.getMetrics().totalBytes,
@@ -1409,6 +1583,7 @@ class TopicFactory {
       ),
       new ConsumerFactory(),
       new DLQConsumerFactory(),
+      metrics,
       logger
     );
   }
@@ -1511,6 +1686,7 @@ class LogService {
 }
 // SRC/VALIDATION/SCHEMA_REGISTRY.TS
 class SchemaRegistry {
+  // TODO: persist
   private validators = new Map<string, (data: any) => boolean>();
   private ajv: Ajv;
 
@@ -1539,6 +1715,7 @@ class SchemaRegistry {
 // SRC/TOPICS/TOPICREGISTRY.TS
 class TopicRegistry {
   private topicFactory: TopicFactory;
+  // TODO: persist
   private topics = new Map<string, Topic<any>>();
   constructor(
     schemaRegistry: SchemaRegistry,
