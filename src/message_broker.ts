@@ -12,6 +12,120 @@ import { ThreadedBinaryCodec } from "./codec/binary_codec.threaded";
 //
 //
 //
+// HASH_RING *******************************************************
+// SRC/HASHER/
+interface IHashService {
+  hash(key: string): number;
+}
+class SHA256HashService implements IHashService {
+  hash(key: string): number {
+    const hex = crypto.createHash("sha256").update(key).digest("hex");
+    return parseInt(hex.slice(0, 8), 16);
+  }
+}
+// SRC/HASH_RING
+interface IHashRing {
+  addNode(id: number): void;
+  removeNode(id: number): void;
+  getNode(key: string): Generator<number, void, unknown>;
+}
+/** Hash ring.
+ * The system works regardless of how different the key hashes are because the lookup is always relative to the fixed node positions on the ring.
+ * Sorted nodes in a ring: [**100(A)**, _180(user-123 key hash always belong to the B)_, **200(B)**, **300(A)**, **400(B)**, **500(A)**, **600(B)**]
+ */
+class InMemoryHashRing implements IHashRing {
+  private sortedHashes: number[] = [];
+  private hashToNodeMap = new Map<number, number>();
+
+  /**
+   * Create a new instance of HashRing with the given number of virtual nodes.
+   * @param {number} [replicas=3] The number of virtual nodes to create for each node.
+   * The more virtual nodes gives you fewer hotspots, more balanced traffic. However, setting
+   * this number too high can lead to a large memory footprint and slower lookups.
+   */
+  constructor(private hashService: IHashService, private replicas = 3) {}
+
+  addNode(id: number): void {
+    for (let i = 0; i < this.replicas; i++) {
+      const hash = this.hashService.hash(`${id}-${i}`);
+      this.hashToNodeMap.set(hash, id);
+      this.insertHash(hash);
+    }
+  }
+
+  removeNode(id: number): void {
+    // Find and remove all virtual nodes for the given ID
+    const hashesToRemove = Array.from(this.hashToNodeMap.entries())
+      .filter(([_, nodeId]) => nodeId === id)
+      .map(([hash]) => hash);
+
+    for (const hash of hashesToRemove) {
+      this.hashToNodeMap.delete(hash);
+      this.removeHash(hash);
+    }
+  }
+
+  *getNode(key: string): Generator<number, void, unknown> {
+    if (this.sortedHashes.length === 0) {
+      throw new Error("No nodes available in the hash ring");
+    }
+
+    let nodeCount = this.sortedHashes.length;
+    const keyHash = this.hashService.hash(key);
+    let currentIndex = this.findNodeIndex(keyHash);
+
+    while (--nodeCount > 0) {
+      yield this.hashToNodeMap.get(this.sortedHashes[currentIndex])!;
+      currentIndex = (currentIndex + 1) % this.sortedHashes.length;
+    }
+  }
+
+  // --- Inlined search helpers ---
+  private findNodeIndex(keyHash: number): number {
+    let low = 0;
+    let high = this.sortedHashes.length - 1;
+
+    while (low <= high) {
+      const mid = (low + high) >>> 1; // Bitwise floor division
+      if (this.sortedHashes[mid] < keyHash) {
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return low % this.sortedHashes.length; // Wrap around
+  }
+
+  private insertHash(hash: number): void {
+    const index = this.findInsertIndex(hash);
+    this.sortedHashes.splice(index, 0, hash);
+  }
+
+  private removeHash(hash: number): void {
+    const index = this.sortedHashes.indexOf(hash);
+    if (index !== -1) {
+      this.sortedHashes.splice(index, 1);
+    }
+  }
+
+  private findInsertIndex(hash: number): number {
+    let low = 0;
+    let high = this.sortedHashes.length;
+
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (this.sortedHashes[mid] < hash) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    return low;
+  }
+}
+//
+//
+//
 //
 // MESSAGE *********************************************************
 // SRC/MESSAGE/METADATA.TS
@@ -452,174 +566,6 @@ class DLQConsumerFactory<Data> {
 //
 //
 //
-// ROUTING_STRATEGY ************************************************
-// SRC/HASHER/
-interface IHashService {
-  hash(key: string): number;
-}
-class SHA256HashService implements IHashService {
-  hash(key: string): number {
-    const hex = crypto.createHash("sha256").update(key).digest("hex");
-    return parseInt(hex.slice(0, 8), 16);
-  }
-}
-interface IHashRing {
-  addNode(id: number): void;
-  removeNode(id: number): void;
-  getNode(key: string): Generator<number, void, unknown>;
-}
-/** Hash ring.
- * The system works regardless of how different the key hashes are because the lookup is always relative to the fixed node positions on the ring.
- * Sorted nodes in a ring: [**100(A)**, _180(user-123 key hash always belong to the B)_, **200(B)**, **300(A)**, **400(B)**, **500(A)**, **600(B)**]
- */
-class InMemoryHashRing implements IHashRing {
-  private sortedHashes: number[] = [];
-  private hashToNodeMap = new Map<number, number>();
-
-  /**
-   * Create a new instance of HashRing with the given number of virtual nodes.
-   * @param {number} [replicas=3] The number of virtual nodes to create for each node.
-   * The more virtual nodes gives you fewer hotspots, more balanced traffic. However, setting
-   * this number too high can lead to a large memory footprint and slower lookups.
-   */
-  constructor(private hashService: IHashService, private replicas = 3) {}
-
-  addNode(id: number): void {
-    for (let i = 0; i < this.replicas; i++) {
-      const hash = this.hashService.hash(`${id}-${i}`);
-      this.hashToNodeMap.set(hash, id);
-      this.insertHash(hash);
-    }
-  }
-
-  removeNode(id: number): void {
-    // Find and remove all virtual nodes for the given ID
-    const hashesToRemove = Array.from(this.hashToNodeMap.entries())
-      .filter(([_, nodeId]) => nodeId === id)
-      .map(([hash]) => hash);
-
-    for (const hash of hashesToRemove) {
-      this.hashToNodeMap.delete(hash);
-      this.removeHash(hash);
-    }
-  }
-
-  *getNode(key: string): Generator<number, void, unknown> {
-    if (this.sortedHashes.length === 0) {
-      throw new Error("No nodes available in the hash ring");
-    }
-
-    let nodeCount = this.sortedHashes.length;
-    const keyHash = this.hashService.hash(key);
-    let currentIndex = this.findNodeIndex(keyHash);
-
-    while (--nodeCount > 0) {
-      yield this.hashToNodeMap.get(this.sortedHashes[currentIndex])!;
-      currentIndex = (currentIndex + 1) % this.sortedHashes.length;
-    }
-  }
-
-  // --- Inlined search helpers ---
-  private findNodeIndex(keyHash: number): number {
-    let low = 0;
-    let high = this.sortedHashes.length - 1;
-
-    while (low <= high) {
-      const mid = (low + high) >>> 1; // Bitwise floor division
-      if (this.sortedHashes[mid] < keyHash) {
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-    return low % this.sortedHashes.length; // Wrap around
-  }
-
-  private insertHash(hash: number): void {
-    const index = this.findInsertIndex(hash);
-    this.sortedHashes.splice(index, 0, hash);
-  }
-
-  private removeHash(hash: number): void {
-    const index = this.sortedHashes.indexOf(hash);
-    if (index !== -1) {
-      this.sortedHashes.splice(index, 1);
-    }
-  }
-
-  private findInsertIndex(hash: number): number {
-    let low = 0;
-    let high = this.sortedHashes.length;
-
-    while (low < high) {
-      const mid = (low + high) >>> 1;
-      if (this.sortedHashes[mid] < hash) {
-        low = mid + 1;
-      } else {
-        high = mid;
-      }
-    }
-    return low;
-  }
-}
-interface IRoutingStrategy {
-  getCorrelatedEntry(correlationId: string): Generator<number, void, unknown>;
-  addEntry(id: number, routingKeys?: string[]): void;
-  removeEntry(id: number): void;
-}
-class KeysHashRoutingStrategy implements IRoutingStrategy {
-  private subscriptions = new Map<number, Set<string>>();
-  private entriesCache = new Map<
-    string | undefined,
-    [Set<number>, Set<number>]
-  >();
-  constructor(private ring: IHashRing) {}
-
-  getEntries(routingKey?: string) {
-    // use cache to prevent hot spot
-    if (!this.entriesCache.has(routingKey)) {
-      const bindedEntries = new Set<number>();
-      const excludedEntries = new Set<number>();
-      for (const [entry, keys] of this.subscriptions) {
-        if (!routingKey || !keys.has(routingKey)) {
-          excludedEntries.add(entry);
-        } else {
-          bindedEntries.add(entry);
-        }
-      }
-
-      this.entriesCache.set(routingKey, [bindedEntries, excludedEntries]);
-    }
-    return this.entriesCache.get(routingKey)!;
-  }
-
-  getCorrelatedEntry(correlationId: string): Generator<number, void, unknown> {
-    return this.ring.getNode(correlationId);
-  }
-
-  addEntry(consumerId: number, routingKeys?: string[]): void {
-    this.ring.addNode(consumerId);
-
-    if (routingKeys?.length) {
-      this.subscriptions.set(consumerId, new Set(routingKeys));
-
-      // shuffle cache
-      this.entriesCache.clear();
-    }
-  }
-
-  removeEntry(consumerId: number): void {
-    this.ring.removeNode(consumerId);
-    this.subscriptions.delete(consumerId);
-
-    // shuffle cache
-    this.entriesCache.clear();
-  }
-}
-//
-//
-//
-//
 // MESSAGE_STORAGE *************************************************
 interface IMessageStorage<Data> {
   writeAll(message: Buffer, meta: MessageMetadata): Promise<number>;
@@ -851,39 +797,24 @@ interface ITopicClientState {
   processingTime: number;
   avgProcessingTime: number;
   pendingMessages: number;
+  groupId?: string;
 }
 class TopicClientManager {
   // TODO: persist
   private clients = new Map<number, ITopicClientState>();
-  private activeConsumers = new Set<number>();
-  private totalConsumers = 0;
-  private totalProducers = 0;
-  private totalDLQProducers = 0;
-  private timer: number;
+  private consumerGroups = new Map<string | undefined, Set<number>>();
 
   constructor(
     private inactivityThresholdMs = 300_000,
     private processingTimeThresholdMs = 50_000,
     private pendingThresholdMs = 100
+  ) {}
+
+  addClient(
+    type: ITopicClientState["clientType"],
+    id = uniqueIntGenerator(),
+    groupId?: string
   ) {
-    // Check more frequently than inactivityThreshold
-    this.timer = setInterval(
-      this.checkInactiveConsumers,
-      Math.max(1000, this.inactivityThresholdMs / 2)
-    );
-  }
-
-  private checkInactiveConsumers = () => {
-    const now = Date.now();
-    for (let consumerId of this.activeConsumers) {
-      const lastActiveAt = this.clients.get(consumerId)?.lastActiveAt;
-      if (lastActiveAt && now - lastActiveAt < this.inactivityThresholdMs) {
-        this.activeConsumers.delete(consumerId);
-      }
-    }
-  };
-
-  addClient(type: ITopicClientState["clientType"], id = uniqueIntGenerator()) {
     const now = Date.now();
     this.clients.set(id, {
       registeredAt: now,
@@ -894,10 +825,17 @@ class TopicClientManager {
       processingTime: 0,
       avgProcessingTime: 0,
       status: "active",
+      groupId,
       id,
     });
 
-    if (type === "consumer") this.activeConsumers.add(id);
+    if (type === "consumer") {
+      if (!this.consumerGroups.has(groupId)) {
+        this.consumerGroups.set(groupId, new Set());
+      }
+      this.consumerGroups.get(groupId)?.add(id);
+    }
+
     this[`total${type[0].toUpperCase() + type.slice(1)}s`]++;
     return this.clients.get(id);
   }
@@ -906,11 +844,35 @@ class TopicClientManager {
     const client = this.clients.get(id);
     if (!client) return;
     const type = client.clientType;
-    if (type === "consumer") this.activeConsumers.delete(id);
-    this[`total${type[0].toUpperCase() + type.slice(1)}s`]--;
 
+    if (type === "consumer" && client.groupId) {
+      this.consumerGroups.get(client.groupId)?.delete(id);
+      if (!this.consumerGroups.get(client.groupId)?.size) {
+        this.consumerGroups.delete(client.groupId);
+      }
+    }
+
+    this[`total${type[0].toUpperCase() + type.slice(1)}s`]--;
     this.clients.delete(id);
     return this.clients.size;
+  }
+
+  getClients(filter?: (client: ITopicClientState) => boolean) {
+    const states = this.clients.values();
+    if (!filter) states;
+    const results = new Set<ITopicClientState>();
+    for (const state of states) {
+      if (filter?.(state)) results.add(state);
+    }
+    return results;
+  }
+
+  getClient(clientId: number) {
+    return this.clients.get(clientId);
+  }
+
+  getConsumerGroups() {
+    return this.consumerGroups;
   }
 
   validateClient(id: number, expectedType?: ITopicClientState["clientType"]) {
@@ -923,17 +885,19 @@ class TopicClientManager {
     }
   }
 
-  getClient(clientId: number) {
-    return this.clients.get(clientId);
+  isOperable(id: number, now: number) {
+    const client = this.getClient(id);
+    if (!client) return false;
+    if (client.status == "lagging") return false;
+    if (client.avgProcessingTime > this.processingTimeThresholdMs) return false;
+    if (client.pendingMessages > this.pendingThresholdMs) return false;
+    return now - client.lastActiveAt < this.inactivityThresholdMs;
   }
 
-  getClients(filter?: (client: ITopicClientState) => boolean) {
-    if (!filter) return Array.from(this.clients.values());
-    const results: ITopicClientState[] = [];
-    for (const state of this.clients.values()) {
-      if (filter(state)) results.push(state);
-    }
-    return results;
+  isIdle(id: number) {
+    const client = this.getClient(id);
+    if (!client) return false;
+    return client.status === "idle";
   }
 
   recordActivity(clientId: number, activityRecord: Partial<ITopicClientState>) {
@@ -954,25 +918,11 @@ class TopicClientManager {
     }
 
     this.clients.set(clientId, client);
-    if (client.clientType !== "consumer") return;
-
-    // active consumers update
-    this.activeConsumers.add(clientId);
-    if (
-      activityRecord.status == "lagging" ||
-      client.avgProcessingTime > this.processingTimeThresholdMs ||
-      client.pendingMessages > this.pendingThresholdMs
-    ) {
-      this.activeConsumers.delete(clientId);
-    }
   }
 
   getMetadata() {
     return {
-      totalConsumers: this.totalConsumers,
-      activeConsumers: this.activeConsumers,
-      totalProducers: this.totalProducers,
-      totalDLQProducers: this.totalDLQProducers,
+      totalClientsSize: this.clients.size,
     };
   }
 }
@@ -1090,85 +1040,118 @@ class TopicAckManager<Data> {
     return {};
   }
 }
+class TopicSubscriptionManager<
+  Data,
+  Listener = (message: Data) => Promise<void>
+> {
+  private subscriptions = new Map<number, Listener>();
+
+  constructor(
+    private clientManager: TopicClientManager,
+    private queueManager: TopicQueueManager
+  ) {}
+
+  addListener(consumerId: number, listener: Listener) {
+    this.subscriptions.set(consumerId, listener);
+    // drain queue
+  }
+
+  removeListener(consumerId: number) {
+    this.subscriptions.delete(consumerId);
+  }
+
+  getListener(consumerId: number) {
+    return this.subscriptions.get(consumerId);
+  }
+}
 // SRC/TOPIC/ROUTER.ts
 class TopicMessageRouter<Data> {
+  private groupHashRingRegistry = new Map<string | undefined, IHashRing>();
+  private keySubscriptions = new Map<number, Set<string>>();
+
   constructor(
     private clientManager: TopicClientManager,
     private queueManager: TopicQueueManager,
-    private dlqManager: TopicDLQManager<Data>,
-    private routingStrategy: KeysHashRoutingStrategy
+    private dlqManager: TopicDLQManager<Data>
   ) {}
 
-  addRoutingEntry(consumerId: number, routingKeys?: string[]) {
-    this.routingStrategy.addEntry(consumerId, routingKeys);
-    this.queueManager.addConsumerQueue(consumerId);
+  addRoutingEntry(
+    consumerId: number,
+    groupId?: string,
+    routingKeys?: string[]
+  ) {
+    if (routingKeys?.length) {
+      this.keySubscriptions.set(consumerId, new Set(routingKeys));
+    }
+
+    if (!groupId) return;
+    if (!this.groupHashRingRegistry.has(groupId)) {
+      this.groupHashRingRegistry.set(
+        groupId,
+        new InMemoryHashRing(new SHA256HashService())
+      );
+    }
+    this.groupHashRingRegistry.get(groupId)?.addNode(consumerId);
   }
 
   removeRoutingEntry(consumerId: number) {
-    this.routingStrategy.removeEntry(consumerId);
-    this.queueManager.removeConsumerQueue(consumerId);
+    this.keySubscriptions.delete(consumerId);
+
+    const client = this.clientManager.getClient(consumerId);
+    if (!client?.groupId) return;
+    this.groupHashRingRegistry.get(client.groupId)?.removeNode(consumerId);
+    // TODO: if there is no node left remove InMemoryHashRing for group
   }
 
   route(meta: MessageMetadata) {
-    const { totalConsumers, activeConsumers } =
-      this.clientManager.getMetadata();
+    const consumerGroups = this.clientManager.getConsumerGroups();
+    const { routingKey, correlationId, id } = meta;
+    const now = Date.now();
+    let deliveredCount = 0;
 
-    // no consumers yet
-    if (!totalConsumers) {
-      this.dlqManager.publish(meta, "no_consumers");
-      return 0;
-    }
+    // fanout O(n2)
+    for (const [groupId, members] of consumerGroups.entries()) {
+      const isSingleConsumer = groupId || correlationId;
+      let candidates: Iterable<number> = members;
+      let fallbackCandidate: number | null = null;
 
-    // consumers with routingKey get only messages with the same routingKey
-    // consumers without routingKey get all messages
+      if (isSingleConsumer) {
+        // we use traversal operable node lookup (O(n)) instead of constantly removing/adding non-operable ones (O(n2))
+        candidates = this.groupHashRingRegistry
+          .get(groupId)!
+          .getNode(correlationId || id.toString());
+      }
 
-    const [binded, excluded] = this.routingStrategy.getEntries(meta.routingKey);
-
-    // all consumers binded to other routingKeys
-    if (excluded?.size == totalConsumers) {
-      this.dlqManager.publish(meta, "no_consumers");
-      return 0;
-    }
-
-    if (!meta.correlationId) {
-      // just populate to non-excluded queues
-      let consumersCount = 0;
-      for (const consumer of activeConsumers) {
-        if (!excluded?.has(consumer)) {
-          this.queueManager.enqueue(consumer, meta);
-          consumersCount++;
+      for (const candidateId of candidates) {
+        if (!this.clientManager.isOperable(candidateId, now)) continue;
+        const routingKeys = this.keySubscriptions.get(candidateId);
+        // filtered-out
+        if (routingKeys && !routingKeys.has(routingKey!)) continue;
+        // prefer idle consumer for single consumer mode
+        if (isSingleConsumer && !this.clientManager.isIdle(candidateId)) {
+          fallbackCandidate ??= candidateId;
+          continue;
         }
+
+        this.queueManager.enqueue(candidateId, meta);
+        deliveredCount++;
+        fallbackCandidate = null;
+        if (isSingleConsumer) break;
       }
 
-      return consumersCount;
-    }
-
-    // need nearest correlated consumer scan
-    const correlations = this.routingStrategy.getCorrelatedEntry(
-      meta.correlationId
-    )!;
-
-    let fallback: number | undefined;
-
-    for (const consumerId of correlations) {
-      // routingKey + correlationId is similar to Consumer Group behaviour by prioritizing binded consumer
-      if (binded.has(consumerId)) {
-        this.queueManager.enqueue(consumerId, meta);
-        return 1;
-        // fallback to first non-excluded
-      } else if (!fallback && !excluded.has(consumerId)) {
-        fallback = consumerId;
+      // falback for single consumer mode
+      if (fallbackCandidate) {
+        this.queueManager.enqueue(fallbackCandidate, meta);
+        deliveredCount++;
       }
     }
 
-    if (fallback) {
-      this.queueManager.enqueue(fallback, meta);
-      return 1;
-    } else {
-      // if all correlations non-binded && excluded
+    // all consumers are nonOperable or binded to other routingKeys
+    if (!deliveredCount) {
       this.dlqManager.publish(meta, "no_consumers");
-      return 0;
     }
+
+    return deliveredCount;
   }
 }
 // SRC/TOPIC/QUEUE_MANAGER.TS
@@ -1360,6 +1343,7 @@ class Topic<Data>
     private readonly messageRouter: TopicMessageRouter<Data>,
     private readonly queueManager: TopicQueueManager,
     private readonly ackManager: TopicAckManager<Data>,
+    private readonly subscriptionManager: TopicSubscriptionManager<Data>,
     private readonly dlqManager: TopicDLQManager<Data>,
     private readonly delayedQueueManager: TopicDelayedQueueManager<Data>,
     private readonly clientManager: TopicClientManager,
@@ -1383,8 +1367,8 @@ class Topic<Data>
 
     if (this.pipeline.process(meta)) return;
 
-    const queuesCount = this.messageRouter.route(meta);
-    this.ackManager.setAwaitedAcksCount(meta.id, queuesCount);
+    const awaitedAcks = this.messageRouter.route(meta);
+    this.ackManager.setAwaitedAcksCount(meta.id, awaitedAcks);
     this.logger?.log(`Message is routed to ${this.name}.`, meta);
   }
 
@@ -1443,21 +1427,25 @@ class Topic<Data>
     return this.producerFactory.create(this, id);
   }
 
-  createConsumer(options?: {
-    routingKeys?: string[];
-    limit?: number;
-    autoAck?: boolean;
-    pollingInterval?: number;
-  }) {
+  createConsumer(
+    options: {
+      routingKeys?: string[];
+      groupId?: string;
+      limit?: number;
+      autoAck?: boolean;
+      pollingInterval?: number;
+    } = {}
+  ) {
+    const { groupId, routingKeys, ...restOptions } = options;
     const id = uniqueIntGenerator();
-    this.clientManager.addClient("consumer", id);
-    this.messageRouter.addRoutingEntry(id, options?.routingKeys);
+    this.clientManager.addClient("consumer", id, groupId);
+    this.messageRouter.addRoutingEntry(id, groupId, routingKeys);
     this.logger?.log(`consumer_created`, {
       topic: this.name,
       clientId: id,
     });
 
-    return this.consumerFactory.create(this, id, options);
+    return this.consumerFactory.create(this, id, restOptions);
   }
 
   createDLQConsumer(options?: { limit?: number; pollingInterval?: number }) {
@@ -1472,8 +1460,8 @@ class Topic<Data>
   }
 
   deleteClient(id: number) {
-    this.clientManager.removeClient(id);
     this.messageRouter.removeRoutingEntry(id);
+    this.clientManager.removeClient(id);
     this.logger?.log("client_deleted", {
       topic: this.name,
       clientId: id,
@@ -1543,8 +1531,7 @@ class TopicFactory {
     const messageRouter = new TopicMessageRouter<Data>(
       clientManager,
       queueManager,
-      dlqManager,
-      new KeysHashRoutingStrategy(new InMemoryHashRing(new SHA256HashService()))
+      dlqManager
     );
     const delayedQueueManager = new TopicDelayedQueueManager(
       messageStorage,
@@ -1564,6 +1551,10 @@ class TopicFactory {
       logger,
       mergedConfig?.ackTimeoutMs
     );
+    const subscriptionManager = new TopicSubscriptionManager<Data>(
+      clientManager,
+      queueManager
+    );
 
     return new Topic<Data>(
       name,
@@ -1572,6 +1563,7 @@ class TopicFactory {
       messageRouter,
       queueManager,
       ackManager,
+      subscriptionManager,
       dlqManager,
       delayedQueueManager,
       clientManager,
