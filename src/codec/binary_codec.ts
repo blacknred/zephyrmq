@@ -1,5 +1,4 @@
-import Buffer from "node:buffer";
-import { MessageMetadata } from "../25.ts";
+import { MessageMetadata } from "../index";
 
 // SRC/MESSAGE/CODECS/
 export interface ICodec {

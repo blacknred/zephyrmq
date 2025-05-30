@@ -67,7 +67,7 @@ export class HighCapacityBinaryHeapPriorityQueue<Data = any> {
   enqueue(value: Data, priority = 0) {
     let pos;
     if (this.freeSlots.length > 0) {
-      pos = this.freeSlots.pop(); // Reuse empty slot
+      pos = this.freeSlots.pop()!; // Reuse empty slot
     } else {
       if (this.count === this.heap.length) {
         this.grow(); // Expand array if full
@@ -81,7 +81,7 @@ export class HighCapacityBinaryHeapPriorityQueue<Data = any> {
   }
 
   dequeue() {
-    if (this.count === 0) return null;
+    if (this.count === 0) return undefined;
     const root = this.heap[0];
     this.heap[0] = this.heap[--this.count];
     this.freeSlots.push(this.count); // Mark slot as reusable
@@ -90,7 +90,7 @@ export class HighCapacityBinaryHeapPriorityQueue<Data = any> {
   }
 
   peek() {
-    return this.count > 0 ? this.heap[0].value : null;
+    return this.count > 0 ? this.heap[0].value : undefined;
   }
 
   isEmpty() {

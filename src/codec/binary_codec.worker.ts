@@ -1,9 +1,11 @@
+import type { TransferListItem } from "node:worker_threads";
 import { parentPort } from "node:worker_threads";
 import { BinaryCodec } from "./binary_codec";
+import type { WorkerRequest } from "./binary_codec.threaded";
 
 const codec = new BinaryCodec();
 
-parentPort!.on("message", async (msg) => {
+parentPort!.on("message", async (msg: WorkerRequest) => {
   const { id, method, args } = msg;
 
   try {
@@ -11,8 +13,10 @@ parentPort!.on("message", async (msg) => {
 
     if (method === "encode") {
       const [data] = args;
-      const buffer = codec.encode(data); // returns Buffer
-      result = buffer.buffer; // extract ArrayBuffer for transfer
+      const buffer = await codec.encode(data);
+
+      // extract ArrayBuffer for transfer
+      result = buffer.buffer;
     } else if (method === "decode") {
       const [info] = args;
       const { byteOffset, byteLength } = info;
@@ -20,25 +24,29 @@ parentPort!.on("message", async (msg) => {
 
       // Reconstruct Buffer from transferred ArrayBuffer
       const buffer = Buffer.from(arrayBuffer, byteOffset, byteLength);
-      result = codec.decode(buffer);
+      result = await codec.decode(buffer);
     } else if (method === "encodeMetadata") {
       const [meta] = args;
-      const buffer = codec.encodeMetadata(meta); // returns Buffer
-      result = buffer.buffer; // extract ArrayBuffer for transfer
+      const buffer = await codec.encodeMetadata(meta);
+
+      // extract ArrayBuffer for transfer
+      result = buffer.buffer;
     } else if (method === "decodeMetadata") {
       const [info, keys] = args;
       const { byteOffset, byteLength } = info;
       const arrayBuffer = info.arrayBuffer as ArrayBuffer;
 
+      // Reconstruct Buffer from transferred ArrayBuffer
       const buffer = Buffer.from(arrayBuffer, byteOffset, byteLength);
-      result = codec.decodeMetadata(buffer, keys);
+      result = await codec.decodeMetadata(buffer, keys);
     } else if (method === "updateMetadata") {
       const [info, partialMeta] = args;
       const { byteOffset, byteLength } = info;
       const arrayBuffer = info.arrayBuffer as ArrayBuffer;
 
+      // Reconstruct Buffer from transferred ArrayBuffer
       const buffer = Buffer.from(arrayBuffer, byteOffset, byteLength);
-      const updatedBuffer = codec.updateMetadata(buffer, partialMeta);
+      const updatedBuffer = await codec.updateMetadata(buffer, partialMeta);
       result = updatedBuffer.buffer;
     } else {
       throw new Error(`Unknown method: ${method}`);
@@ -69,8 +77,8 @@ function isTransferableObject(obj: any): boolean {
 }
 
 // Helper: Collect all transferable objects
-function collectTransferables(obj: any): Transferable[] {
-  const transferables: Transferable[] = [];
+function collectTransferables(obj: any): TransferListItem[] {
+  const transferables: TransferListItem[] = [];
   function walk(val: any) {
     if (val instanceof ArrayBuffer) {
       transferables.push(val);
@@ -80,6 +88,7 @@ function collectTransferables(obj: any): Transferable[] {
       }
     }
   }
+  
   walk(obj);
   return transferables;
 }

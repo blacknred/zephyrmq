@@ -1,136 +1,15 @@
-import level, { LevelDB } from "level";
-import crypto from "node:crypto";
-import { setImmediate, clearImmediate } from "node:timers";
-import { uniqueIntGenerator } from "./utils";
-import fs from "fs/promises";
-import path from "path";
-import Buffer from "node:buffer";
-import Ajv, { JSONSchemaType } from "ajv";
-import { HighCapacityBinaryHeapPriorityQueue } from "../queues";
-import { ICodec } from "./codec/binary_codec";
+import type { JSONSchemaType } from "ajv";
+import Ajv from "ajv";
+import type { Level } from "level";
+import level from "level";
+import fs from "node:fs/promises";
+import path, { join } from "node:path";
+import { clearImmediate, setImmediate } from "node:timers";
+import * as snappy from "snappy";
+import { HighCapacityBinaryHeapPriorityQueue } from "./binary_heap_priority_queue";
+import type { ICodec } from "./codec/binary_codec";
 import { ThreadedBinaryCodec } from "./codec/binary_codec.threaded";
-//
-//
-//
-// HASH_RING
-interface IHashService {
-  hash(key: string): number;
-}
-class SHA256HashService implements IHashService {
-  hash(key: string): number {
-    const hex = crypto.createHash("sha256").update(key).digest("hex");
-    return parseInt(hex.slice(0, 8), 16);
-  }
-}
-interface IHashRing {
-  addNode(id: number): void;
-  removeNode(id: number): void;
-  getNodeCount(): number;
-  getNode(key: string): Generator<number, void, unknown>;
-}
-/** Hash ring.
- * The system works regardless of how different the key hashes are because the lookup is always relative to the fixed node positions on the ring.
- * Sorted nodes in a ring: [**100(A)**, _180(user-123 key hash always belong to the B)_, **200(B)**, **300(A)**, **400(B)**, **500(A)**, **600(B)**]
- */
-class InMemoryHashRing implements IHashRing {
-  private sortedHashes: number[] = [];
-  private hashToNodeMap = new Map<number, number>();
-  private nodeIds = new Set<number>(); // Tracks unique nodes
-
-  /**
-   * Create a new instance of HashRing with the given number of virtual nodes.
-   * @param {number} [replicas=3] The number of virtual nodes to create for each node.
-   * The more virtual nodes gives you fewer hotspots, more balanced traffic. However, setting
-   * this number too high can lead to a large memory footprint and slower lookups.
-   */
-  constructor(private hashService: IHashService, private replicas = 3) {}
-
-  addNode(id: number): void {
-    if (this.nodeIds.has(id)) return; // Avoid duplicate node addition
-
-    for (let i = 0; i < this.replicas; i++) {
-      const hash = this.hashService.hash(`${id}-${i}`);
-      this.hashToNodeMap.set(hash, id);
-
-      const index = this.findInsertIndex(hash);
-      this.sortedHashes.splice(index, 0, hash);
-    }
-
-    this.nodeIds.add(id);
-  }
-
-  removeNode(id: number): void {
-    const hashesToRemove: number[] = [];
-    this.hashToNodeMap.forEach((nodeId, hash) => {
-      if (nodeId === id) {
-        hashesToRemove.push(hash);
-      }
-    });
-
-    for (const hash of hashesToRemove) {
-      this.hashToNodeMap.delete(hash);
-      const index = this.sortedHashes.indexOf(hash);
-      if (index !== -1) {
-        this.sortedHashes.splice(index, 1);
-      }
-    }
-
-    this.nodeIds.delete(id);
-  }
-
-  getNodeCount(): number {
-    return this.nodeIds.size;
-  }
-
-  *getNode(key: string): Generator<number, void, unknown> {
-    if (this.sortedHashes.length === 0) {
-      throw new Error("No nodes available in the hash ring");
-    }
-
-    const keyHash = this.hashService.hash(key);
-    let currentIndex = this.findNodeIndex(keyHash);
-
-    const total = this.sortedHashes.length;
-    for (let i = 0; i < total; i++) {
-      yield this.hashToNodeMap.get(this.sortedHashes[currentIndex])!;
-      currentIndex = (currentIndex + 1) % total;
-    }
-  }
-
-  // Find node index using binary search
-  private findNodeIndex(keyHash: number): number {
-    let low = 0;
-    let high = this.sortedHashes.length - 1;
-
-    while (low <= high) {
-      const mid = (low + high) >>> 1;
-      if (this.sortedHashes[mid] < keyHash) {
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-
-    return low % this.sortedHashes.length;
-  }
-
-  // Binary search for insertion index
-  private findInsertIndex(hash: number): number {
-    let low = 0;
-    let high = this.sortedHashes.length;
-
-    while (low < high) {
-      const mid = (low + high) >>> 1;
-      if (this.sortedHashes[mid] < hash) {
-        low = mid + 1;
-      } else {
-        high = mid;
-      }
-    }
-
-    return low;
-  }
-}
+import { uniqueIntGenerator } from "./utils";
 //
 //
 //
@@ -257,6 +136,343 @@ class MessageFactory<Data> implements IMessageFactory<Data> {
     );
   }
 }
+//
+//
+//
+// TODO: for n-processes use proper-lockfile
+class Mutex {
+  private _queue: (() => void)[] = [];
+  private _locked = false;
+
+  acquire(): Promise<void> {
+    return new Promise((resolve) => {
+      const run = () => {
+        this._locked = true;
+        resolve();
+      };
+
+      if (!this._locked) {
+        run();
+      } else {
+        this._queue.push(run);
+      }
+    });
+  }
+
+  release(): void {
+    if (this._queue.length > 0) {
+      const next = this._queue.shift();
+      next?.();
+    } else {
+      this._locked = false;
+    }
+  }
+}
+// WAL: message durability, write as fast as possible: setImmediate flush + no snappy
+class WriteAheadLog {
+  private fileHandle: fs.FileHandle;
+  private flushPromise?: Promise<void>;
+  private isFlushing = false;
+  private batch: Buffer[] = [];
+  private batchSize = 0;
+
+  constructor(
+    private filePath: string,
+    private maxBatchSizeBytes = 100 * 1024 * 1024
+  ) {}
+
+  // init
+
+  async initialize() {
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    this.fileHandle = await fs.open(this.filePath, "a+");
+  }
+
+  // api
+
+  async append(data: Buffer): Promise<number> {
+    const { size: offset } = await this.fileHandle.stat();
+    this.batch.push(data);
+    this.batchSize += data.length;
+
+    if (this.batchSize > this.maxBatchSizeBytes) {
+      this.scheduleFlush();
+    }
+
+    return offset;
+  }
+
+  async read(offset: number, length: number): Promise<Buffer> {
+    const buffer = Buffer.alloc(length);
+    await this.fileHandle.read(buffer, 0, length, offset);
+    return buffer;
+  }
+
+  async close() {
+    if (this.batch.length > 0) {
+      await this.scheduleFlush();
+    }
+    await this.fileHandle.close();
+  }
+
+  // misc
+
+  private scheduleFlush(): Promise<void> {
+    if (this.isFlushing) return this.flushPromise!;
+    this.isFlushing = true;
+
+    this.flushPromise = new Promise<void>(async (resolve, reject) => {
+      // batched writes
+      setImmediate(async () => {
+        try {
+          const toWrite = Buffer.concat(this.batch);
+          await this.fileHandle.write(toWrite);
+          this.batch = [];
+          this.batchSize = 0;
+          resolve();
+        } catch (err) {
+          reject(err);
+        } finally {
+          this.isFlushing = false;
+          this.flushPromise = undefined;
+          if (this.batch.length > 0) {
+            this.scheduleFlush();
+          }
+        }
+      });
+    });
+
+    return this.flushPromise;
+  }
+
+  [Symbol.asyncDispose]() {
+    return this.close();
+  }
+}
+// SegmentLog: message persistence, snappy, +fast_read(scan_within_segments), +easy_retention(delete_whole_segment), +compactable(create_new_segments_with_only_actual_data)
+type SegmentInfo = {
+  id: number;
+  filePath: string;
+  baseOffset: number;
+  size: number;
+};
+type SegmentRecord = {
+  segmentId: number;
+  offset: number;
+  length: number;
+};
+class SegmentLog {
+  private segments = new Map<number, SegmentInfo>();
+  private currentSegment?: SegmentInfo;
+  private mutex = new Mutex();
+
+  constructor(
+    private baseDir: string,
+    private maxSegmentSizeBytes = 100 * 1024 * 1024
+  ) {}
+
+  // init
+
+  async initialize() {
+    await fs.mkdir(this.baseDir, { recursive: true });
+    await this.loadExistingSegments();
+    await this.ensureCurrentSegment();
+  }
+
+  private async loadExistingSegments() {
+    const files = await fs.readdir(this.baseDir);
+    for (const file of files.sort()) {
+      if (!file.endsWith(".segment")) continue;
+      const id = parseInt(file.split(".")[0], 10);
+      const { size } = await fs.stat(path.join(this.baseDir, file));
+      this.segments.set(id, {
+        filePath: path.join(this.baseDir, file),
+        baseOffset: 0, // Would need recovery logic
+        size,
+        id,
+      });
+    }
+  }
+
+  private async ensureCurrentSegment() {
+    if (
+      this.currentSegment &&
+      this.currentSegment.size < this.maxSegmentSizeBytes
+    ) {
+      return;
+    }
+
+    let newId = 0;
+    if (this.segments.size > 0) {
+      newId = Math.max(...this.segments.keys()) + 1;
+    }
+
+    const filePath = path.join(this.baseDir, `${newId}.segment`);
+    this.currentSegment = {
+      id: newId,
+      filePath,
+      baseOffset: 0,
+      size: 0,
+    };
+
+    this.segments.set(newId, this.currentSegment);
+  }
+
+  // api
+
+  async append(data: Buffer): Promise<SegmentRecord> {
+    await this.ensureCurrentSegment();
+    await this.mutex.acquire();
+    const segment = this.currentSegment!;
+
+    try {
+      const compressed = await snappy.compress(data);
+      const lengthBuffer = Buffer.alloc(4);
+      lengthBuffer.writeUInt32BE(compressed.length, 0);
+
+      const fileHandle = await fs.open(segment.filePath, "a");
+
+      try {
+        await fileHandle.write(lengthBuffer);
+        await fileHandle.write(compressed);
+
+        return {
+          segmentId: this.currentSegment!.id,
+          offset: this.currentSegment!.size,
+          length: compressed.length,
+        } as SegmentRecord;
+      } finally {
+        await fileHandle.close();
+      }
+    } finally {
+      await this.mutex.release();
+    }
+  }
+
+  async read(pointer: SegmentRecord): Promise<Buffer> {
+    const segment = this.segments.get(pointer.segmentId);
+    if (!segment) throw new Error(`Segment ${pointer.segmentId} not found`);
+
+    const fileHandle = await fs.open(segment.filePath, "r");
+
+    try {
+      const compressed = Buffer.alloc(pointer.length);
+      await fileHandle.read(compressed, 0, pointer.length, pointer.offset);
+      return snappy.uncompress(compressed);
+    } finally {
+      await fileHandle.close();
+    }
+  }
+
+  // cleanup
+
+  async cleanupOldSegments(retentionMs: number) {
+    const cutoff = Date.now() - retentionMs;
+    for (const segment of this.segments.values()) {
+      if (segment.id === this.currentSegment?.id) continue;
+
+      const stats = await fs.stat(segment.filePath);
+      if (stats.mtimeMs < cutoff) {
+        await fs.unlink(segment.filePath);
+        this.segments.delete(segment.id);
+      }
+    }
+  }
+
+  async compact() {
+    const activeMessageIds = new Set<number>();
+
+    // 1. Scan all active messages
+    const metaStream = this.metadataDb.createReadStream({
+      gt: "meta!",
+      lt: "meta!~",
+    });
+
+    for await (const { key, value } of metaStream) {
+      const id = parseInt(key.slice(5), 10);
+      activeMessageIds.add(id);
+    }
+
+    // 2. Create new compacted segments
+    const newSegment = await this.createNewSegment();
+    let newOffset = 0;
+
+    // 3. Copy only active messages
+    for (const segment of this.segments) {
+      const fileHandle = await fs.open(segment.filePath, "r");
+      let offset = 0;
+
+      while (offset < segment.size) {
+        const lengthBuffer = Buffer.alloc(4);
+        await fileHandle.read(lengthBuffer, 0, 4, offset);
+        const length = lengthBuffer.readUInt32BE(0);
+
+        const messageBuffer = Buffer.alloc(length);
+        await fileHandle.read(messageBuffer, 0, length, offset + 4);
+        const meta = await this.codec.decodeMetadata(messageBuffer);
+
+        if (activeMessageIds.has(meta.id)) {
+          // Write to new segment
+          await newSegment.fileHandle.write(lengthBuffer);
+          await newSegment.fileHandle.write(messageBuffer);
+
+          // Update pointer
+          const newPointer: SegmentRecord = {
+            segmentId: newSegment.id,
+            offset: newOffset,
+            length,
+          };
+          await this.pointersDb.put(
+            `ptr!${meta.id}`,
+            JSON.stringify(newPointer)
+          );
+
+          newOffset += 4 + length;
+        }
+
+        offset += 4 + length;
+      }
+
+      await fileHandle.close();
+    }
+
+    // 4. Replace old segments
+    this.segments = [newSegment];
+    this.currentSegment = newSegment;
+  }
+}
+//
+//
+//
+// Storage
+interface IFlushable {
+  flush: () => Promise<void>;
+}
+class FlushManager {
+  private tasks: Array<IFlushable> = [];
+  private timer?: NodeJS.Timeout;
+
+  constructor(private intervalMs: number = 1000) {}
+
+  register(task: IFlushable) {
+    this.tasks.push(task);
+  }
+
+  start() {
+    if (this.intervalMs === Infinity) return;
+    this.timer = setInterval(this.flush, this.intervalMs);
+    process.on("beforeExit", this.flush);
+  }
+
+  stop() {
+    clearInterval(this.timer);
+    this.timer = undefined;
+  }
+
+  private flush = async () => {
+    await Promise.all(this.tasks.map((t) => t.flush()));
+  };
+}
 interface IMessageStorage<Data> {
   writeAll(message: Buffer, meta: MessageMetadata): Promise<number>;
   readAll(
@@ -264,7 +480,7 @@ interface IMessageStorage<Data> {
   ): Promise<
     [
       Awaited<Data> | undefined,
-      Pick<MessageMetadata, keyof MessageMetadata> | undefined
+      Pick<MessageMetadata, keyof MessageMetadata> | undefined,
     ]
   >;
   readMessage(id: number): Promise<Data | undefined>;
@@ -275,80 +491,623 @@ interface IMessageStorage<Data> {
   updateMetadata(id: number, meta: Partial<MessageMetadata>): Promise<void>;
   flush(): Promise<void>;
 }
-class LevelDBMessageStorage<Data> implements IMessageStorage<Data> {
-  // separates metadata/messages buffers since we: 1. need read only data/metadata, 2. need update only metadata, 3. need often read metadata (retention timer)
-  private messages = new Map<number, Buffer<Data>>();
-  private metadatas = new Map<number, Buffer<MessageMetadata>>();
-  private flushId?: number;
+// class LevelDBMessageStorage<Data> implements IMessageStorage<Data> {
+//   // separates metadata/messages buffers since we: 1. need read only data/metadata, 2. need update only metadata, 3. need often read metadata (retention timer)
+//   private messages = new Map<number, Buffer>();
+//   private metadatas = new Map<number, Buffer>();
+//   private flushId?: number;
+
+//   constructor(
+//     private topic: string,
+//     private codec: ICodec,
+//     private retentionMs = 86_400_000, // 1day
+//     private isPersist = true,
+//     private persistThresholdMs = 100,
+//     private chunkSize = 50
+//   ) {
+//     // TODO: timeout retention check meta:
+//     // meta.consumedAt ====> delete
+//     // meta.ts + meta.ttl < now ====> DLQ
+//     // (non-expired & non-consumed) && now - meta.ts >= retentionMs ====> DLQ
+//   }
+
+//   async writeAll(message: Buffer, meta: MessageMetadata): Promise<number> {
+//     const encodedMeta = await this.codec.encodeMetadata(meta);
+//     this.messages.set(meta.id, message);
+//     this.metadatas.set(meta.id, encodedMeta);
+
+//     this.scheduleFlush();
+//     return this.messages.size;
+//   }
+
+//   async readAll(id: number) {
+//     return Promise.all([this.readMessage(id), this.readMetadata(id)]);
+//   }
+
+//   async readMessage(id: number) {
+//     const buffer = this.messages.get(id);
+//     if (!buffer) return;
+//     return this.codec.decode<Data>(buffer);
+//   }
+
+//   async readMetadata<K extends keyof MessageMetadata>(id: number, keys?: K[]) {
+//     const buffer = this.metadatas.get(id);
+//     if (!buffer) return;
+//     return this.codec.decodeMetadata(buffer, keys);
+//   }
+
+//   async updateMetadata(id: number, meta: Partial<MessageMetadata>) {
+//     const buffer = this.metadatas.get(id);
+//     if (!buffer) return;
+//     const newBuffer = this.codec.updateMetadata(buffer, meta);
+//     this.metadatas.set(id, newBuffer);
+//   }
+
+//   private scheduleFlush() {
+//     if (!this.isPersist) return;
+//     this.flushId ??= setImmediate(this.flush, this.persistThresholdMs);
+//   }
+
+//   flush = async () => {
+//     this.flushId = undefined;
+//     let count = 0;
+//     const idIterator = this.metadatas.keys();
+
+//     for (let id of idIterator) {
+//       if (this.chunkSize && count >= this.chunkSize) break;
+//       // leveldb put
+//       this.messages.delete(id);
+//       this.metadatas.delete(id);
+//       count++;
+//     }
+
+//     if (this.metadatas.size > 0) {
+//       this.scheduleFlush();
+//     }
+//   };
+// }
+class MessageStorage<Data> implements IMessageStorage<Data> {
+  private wal: WriteAheadLog;
+  private log: SegmentLog;
+  private metadataDb: Level;
+  private pointersDb: Level;
+  private flushTimer?: NodeJS.Timeout;
+  private retentionTimer?: NodeJS.Timeout;
 
   constructor(
     private topic: string,
     private codec: ICodec,
-    private retentionMs = 86_400_000, // 1day
-    private isPersist = true,
-    private persistThresholdMs = 100,
-    private chunkSize = 50
-  ) {
-    // TODO: timeout retention check meta:
-    // meta.consumedAt ====> delete
-    // meta.ts + meta.ttl < now ====> DLQ
-    // (non-expired & non-consumed) && now - meta.ts >= retentionMs ====> DLQ
+    private baseDir: string,
+    private retentionMs = 86_400_000,
+    private flushIntervalMs = 100
+  ) {}
+
+  // init
+
+  async initialize() {
+    const topicDir = path.join(this.baseDir, this.topic);
+
+    // Initialize components
+    // Pointers are not part of metadata since:
+    // 1. Metadata changes frequently but Message bodies are immutable after writing.
+    // 2. Level performance better with smaller values
+    this.pointersDb = level(path.join(topicDir, "pointers"));
+    this.metadataDb = level(path.join(topicDir, "metadata"));
+    this.wal = new WriteAheadLog(path.join(topicDir, "wal.log"));
+    this.log = new SegmentLog(path.join(topicDir, "segments"));
+
+    await Promise.all([this.wal.initialize(), this.log.initialize()]);
+
+    this.startFlushInterval();
+    this.startRetentionMonitor();
   }
 
-  async writeAll(message: Buffer, meta: MessageMetadata): Promise<number> {
-    const encodedMeta = await this.codec.encodeMetadata(meta);
-    this.messages.set(meta.id, message);
-    this.metadatas.set(meta.id, encodedMeta);
+  private startFlushInterval() {
+    if (this.flushIntervalMs === Infinity) return;
 
-    this.scheduleFlush();
-    return this.messages.size;
+    this.flushTimer = setInterval(async () => {
+      await this.flush();
+    }, this.flushIntervalMs);
+  }
+
+  private startRetentionMonitor() {
+    if (this.retentionMs === Infinity) return;
+
+    this.retentionTimer = setInterval(
+      async () => {
+        await this.cleanupExpired();
+      },
+      Math.min(this.retentionMs, 3600000)
+    ); // Check at most hourly
+  }
+
+  async flush() {
+    await this.wal.scheduleFlush();
+  }
+
+  async cleanupExpired() {
+    const now = Date.now();
+    const cutoff = now - this.retentionMs;
+
+    // Find expired messages by timestamp index
+    const stream = this.metadataDb.createReadStream({
+      gt: `ts!0`,
+      lt: `ts!${cutoff}`,
+    });
+
+    for await (const { key, value: id } of stream) {
+      await this.deleteMessage(parseInt(id, 10));
+    }
+
+    // Cleanup old segments
+    await this.log.cleanupOldSegments(this.retentionMs);
+  }
+
+  // api
+
+  async writeAll(message: Buffer, meta: MessageMetadata): Promise<number> {
+    // 1. Write to WAL first for durability
+    const walOffset = await this.wal.append(message);
+    // 2. Write to log for long-term storage
+    const pointer = await this.log.append(message);
+    // 3. Store metadata, pointers and ts (for retention check) in Level
+    const metaBuffer = await this.codec.encodeMetadata(meta);
+    // TODO: this.codec.encodePointer(pointer)
+    const pointerBuffer = await this.codec.encode(pointer);
+
+    await this.metadataDb.batch([
+      { type: "put", key: `meta!${meta.id}`, value: metaBuffer },
+      { type: "put", key: `ptr!${meta.id}`, value: pointerBuffer },
+      { type: "put", key: `ts!${meta.ts}`, value: meta.id.toString() },
+    ]);
+
+    return meta.id;
   }
 
   async readAll(id: number) {
-    return Promise.all([this.readMessage(id), this.readMetadata(id)]);
-  }
+    const result: [
+      Awaited<Data> | undefined,
+      Pick<MessageMetadata, keyof MessageMetadata> | undefined,
+    ] = [undefined, undefined];
 
-  async readMessage(id: number) {
-    const buffer = this.messages.get(id);
-    if (!buffer) return;
-    return this.codec.decode<Data>(buffer);
-  }
-
-  async readMetadata<K extends keyof MessageMetadata>(id: number, keys?: K[]) {
-    const buffer = this.metadatas.get(id);
-    if (!buffer) return;
-    return this.codec.decodeMetadata(buffer, keys);
-  }
-
-  async updateMetadata(id: number, meta: Partial<MessageMetadata>) {
-    const buffer = this.metadatas.get(id);
-    if (!buffer) return;
-    const newBuffer = this.codec.updateMetadata(buffer, meta);
-    this.metadatas.set(id, newBuffer);
-  }
-
-  private scheduleFlush() {
-    if (!this.isPersist) return;
-    this.flushId ??= setImmediate(this.flush, this.persistThresholdMs);
-  }
-
-  flush = async () => {
-    this.flushId = undefined;
-    let count = 0;
-    const idIterator = this.metadatas.keys();
-
-    for (let id of idIterator) {
-      if (this.chunkSize && count >= this.chunkSize) break;
-      // leveldb put
-      this.messages.delete(id);
-      this.metadatas.delete(id);
-      count++;
+    // 1. Get metadata
+    const metaBuffer = await this.metadataDb.get(`meta!${id}`);
+    if (metaBuffer) {
+      const meta = await this.codec.decodeMetadata(metaBuffer);
+      result[1] = meta;
     }
 
-    if (this.metadatas.size > 0) {
+    // 2. Get pointer from Level
+    const pointerBuffer = await this.pointersDb.get(`ptr!${id}`);
+    if (pointerBuffer) {
+      const pointer = await this.codec.decode<SegmentRecord>(pointerBuffer);
+
+      // 3. Read message from segments
+      const messageBuffer = await this.log.read(pointer);
+      if (messageBuffer) {
+        const message = await this.codec.decode<Data>(messageBuffer);
+        result[0] = message;
+      }
+    }
+
+    return result;
+  }
+
+  async deleteMessage(id: number) {
+    await this.metadataDb.batch([
+      { type: "del", key: `meta!${id}` },
+      { type: "del", key: `ptr!${id}` },
+      // Note: We don't delete the timestamp index here for simplicity
+      // In production you'd need to track the ts->id mapping separately
+    ]);
+  }
+
+  async readMessage(id: number): Promise<Data | undefined> {
+    const pointerBuffer = await this.pointersDb.get(`ptr!${id}`);
+    if (!pointerBuffer) return;
+    const pointer = await this.codec.decode<SegmentRecord>(pointerBuffer);
+
+    const messageBuffer = await this.log.read(pointer);
+    if (messageBuffer) return;
+    return this.codec.decode<Data>(messageBuffer);
+  }
+
+  async readMetadata<K extends keyof MessageMetadata>(
+    id: number,
+    keys?: K[]
+  ): Promise<Pick<MessageMetadata, K> | undefined> {
+    const metaBuffer = await this.metadataDb.get(`meta!${id}`);
+    if (metaBuffer) return;
+    const meta = await this.codec.decodeMetadata(metaBuffer);
+    if (!keys) return meta;
+    const result = {} as Pick<MessageMetadata, K>;
+
+    for (const key of keys) {
+      result[key] = meta[key];
+    }
+
+    return result;
+  }
+
+  async updateMetadata(
+    id: number,
+    meta: Partial<MessageMetadata>
+  ): Promise<void> {
+    const metaBuffer = await this.metadataDb.get(`meta!${id}`);
+    if (metaBuffer) return;
+    const newMetaBuffer = await this.codec.updateMetadata(metaBuffer, meta);
+    await this.metadataDb.batch([
+      { type: "put", key: `meta!${id}`, value: newMetaBuffer },
+    ]);
+  }
+
+  async close() {
+    clearInterval(this.flushTimer);
+    clearInterval(this.retentionTimer);
+    await Promise.all([
+      this.wal.close(),
+      this.metadataDb.close(),
+      this.pointersDb.close(),
+    ]);
+  }
+
+  // Recovery on Startup
+
+  async recover() {
+    // 1. Rebuild from WAL first (most recent messages)
+    await this.recoverFromWal();
+
+    // 2. Rebuild any missing pointers from segments
+    await this.rebuildSegmentIndex();
+
+    // 3. Cleanup any orphaned data
+    await this.cleanupOrphans();
+  }
+
+  private async recoverFromWal() {
+    const walSize = (await this.wal.fileHandle.stat()).size;
+    let position = 0;
+
+    while (position < walSize) {
+      const lengthBuffer = await this.wal.read(position, 4);
+      const length = lengthBuffer.readUInt32BE(0);
+      const messageBuffer = await this.wal.read(position + 4, length);
+
+      // Reprocess the message
+      const meta = await this.codec.decodeMetadata(messageBuffer);
+      const pointer = await this.log.append(messageBuffer);
+
+      await this.metadataDb.batch([
+        { type: "put", key: `meta!${meta.id}`, value: JSON.stringify(meta) },
+        { type: "put", key: `ptr!${meta.id}`, value: JSON.stringify(pointer) },
+      ]);
+
+      position += 4 + length;
+    }
+  }
+
+  private async rebuildSegmentIndex() {
+    for (const segment of this.log.segments) {
+      let offset = 0;
+      const fileHandle = await fs.open(segment.filePath, "r");
+
+      try {
+        while (offset < segment.size) {
+          const lengthBuffer = Buffer.alloc(4);
+          await fileHandle.read(lengthBuffer, 0, 4, offset);
+          const length = lengthBuffer.readUInt32BE(0);
+
+          // Check if we have metadata for this message
+          const messageBuffer = Buffer.alloc(length);
+          await fileHandle.read(messageBuffer, 0, length, offset + 4);
+          const meta = await this.codec.decodeMetadata(messageBuffer);
+
+          if (!(await this.metadataDb.get(`meta!${meta.id}`))) {
+            // Orphaned message - could delete or keep
+          }
+
+          offset += 4 + length;
+        }
+      } finally {
+        await fileHandle.close();
+      }
+    }
+  }
+}
+interface ISerializable<T = unknown, R = unknown> {
+  serialize(data: T): R;
+  deserialize(data: R): T;
+}
+class PersistedMap<K, V> extends Map<K, V> {
+  private dirtyKeys = new Set<K>();
+  private mutex = new Mutex();
+  private isCleared = false;
+
+  constructor(
+    private db: Level,
+    private prefix: string,
+    private codec: ICodec,
+    private serializer?: ISerializable<V>,
+    private maxSize = Infinity
+  ) {
+    super();
+    this.restore();
+  }
+
+  set(key: K, value: V) {
+    if (super.get(key) !== value) {
+      this.dirtyKeys.add(key);
+    }
+
+    this.evictIfFull();
+    return super.set(key, value);
+  }
+
+  delete(key: K) {
+    this.dirtyKeys.add(key);
+    return super.delete(key);
+  }
+
+  clear() {
+    this.isCleared = true;
+    return super.clear();
+  }
+
+  // misc
+  private evictIfFull(): void {
+    // LRU-style eviction (simplified)
+    if (this.size < this.maxSize) return;
+    const firstKey = this.keys().next().value;
+    this.delete(firstKey);
+  }
+
+  async restore() {
+    try {
+      for await (const [key, value] of this.db.iterator({
+        gt: `${this.prefix}!`,
+        lt: `${this.prefix}~`,
+      })) {
+        const restoredValue = await this.codec.decode<V>(value);
+        const restoredKey = key.slice(this.prefix.length + 1) as K;
+        const data = this.serializer?.deserialize(restoredKey) ?? restoredValue;
+        super.set(restoredKey, data);
+      }
+    } catch (e) {
+      console.error(`Failed to restore PersistedMap: ${e}`);
+    }
+  }
+
+  async flush() {
+    if (this.dirtyKeys.size === 0) return;
+
+    await this.mutex.acquire();
+    try {
+      if (this.isCleared) {
+        await this.db.clear({
+          gt: `${this.prefix}!`,
+          lt: `${this.prefix}~`,
+        });
+
+        this.dirtyKeys.clear();
+        this.isCleared = false;
+        return;
+      }
+
+      const batch = this.db.batch();
+      const encodePromises: Promise<void>[] = [];
+
+      for (const key of this.dirtyKeys) {
+        const value = super.get(key);
+
+        if (value !== undefined) {
+          encodePromises.push(
+            this.codec.encode(value).then((encoded) => {
+              const data = this.serializer?.serialize(encoded) ?? encoded;
+              batch.put(`${this.prefix}!${key}`, data);
+            })
+          );
+        } else {
+          batch.del(`${this.prefix}!${key}`);
+        }
+      }
+
+      await Promise.all(encodePromises);
+      await batch.write();
+      this.dirtyKeys.clear();
+    } catch (error) {
+      console.error(`Failed to flush PersistedMap: ${error}`);
+    } finally {
+      this.mutex.release();
+    }
+  }
+}
+class PersisteMapFactory {
+  constructor(
+    private topic: string,
+    private db: Level,
+    private codec: ICodec,
+    private flushManager?: FlushManager
+  ) {}
+
+  create<K, V>(
+    _prefix: string,
+    serializer?: ISerializable<V>,
+    maxSize = Infinity
+  ) {
+    const prefix = `${this.topic}:${_prefix}`;
+    const map = new PersistedMap<K, V>(
+      this.db,
+      prefix,
+      this.codec,
+      serializer,
+      maxSize
+    );
+    this.flushManager?.register(map);
+    return map;
+  }
+}
+class PersistedQueue<T> extends HighCapacityBinaryHeapPriorityQueue {
+  private pendingOps: Array<["enqueue" | "dequeue", T?]> = [];
+
+  constructor(
+    private db: Level,
+    private prefix: string,
+    private codec: ICodec,
+    private maxSize = Infinity,
+    flushManager?: FlushManager
+    // private QueueFactory: new () => IPriorityQueue<T>,
+  ) {
+    super();
+    this.restore();
+    flushManager?.register(this);
+  }
+
+  enqueue(item: T, priority?: number) {
+    this.queue.enqueue(item, priority);
+    this.pendingOps.push(["enqueue", item]);
+  }
+
+  dequeue() {}
+
+  // misc
+
+  async restore() {
+    const serialized = await this.db.get(`${this.prefix}!state`);
+    if (serialized) {
+      this.queue = deserialize(serialized);
+    }
+  }
+
+  async flush() {
+    if (this.pendingOps.length === 0) return;
+
+    await this.db.put(`${this.prefix}!state`, serialize(this.queue));
+    this.pendingOps = [];
+  }
+}
+//
+//
+//
+//
+//
+//
+
+class FlushManagerr {
+  private flushQueue: (() => Promise<void>)[] = [];
+  private pendingFlush = false;
+  private flushTimer?: number;
+
+  constructor(
+    private readonly flushIntervalMs = 500,
+    private readonly maxPendingWrites = 1000
+  ) {}
+
+  enqueue(task: () => Promise<void>): void {
+    this.flushQueue.push(task);
+    if (this.flushQueue.length >= this.maxPendingWrites) {
       this.scheduleFlush();
     }
-  };
+  }
+
+  scheduleFlush(delay = this.flushIntervalMs): void {
+    if (this.pendingFlush || !this.flushIntervalMs) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushNow();
+    }, delay);
+  }
+
+  async flushNow(): Promise<void> {
+    if (this.pendingFlush) return;
+    this.pendingFlush = true;
+
+    const tasks = [...this.flushQueue];
+    this.flushQueue = [];
+
+    await Promise.all(tasks.map((task) => task()));
+    this.pendingFlush = false;
+  }
+
+  stop(): void {
+    clearTimeout(this.flushTimer);
+    this.flushNow();
+  }
+}
+class LogSegment {
+  private fd: number;
+  private offset = 0;
+
+  constructor(private filePath: string) {
+    this.fd = fs.openSync(filePath, "a");
+  }
+
+  static create(basePath: string, segmentId: number): LogSegment {
+    const filename = path.join(basePath, `segment-${segmentId}.log`);
+    return new LogSegment(filename);
+  }
+
+  append(message: Buffer): number {
+    const writeOffset = this.offset;
+    fs.writeSync(this.fd, message);
+    this.offset += message.length;
+    return writeOffset;
+  }
+
+  read(offset: number, length: number): Buffer {
+    const buffer = Buffer.alloc(length);
+    fs.readSync(this.fd, buffer, 0, length, offset);
+    return buffer;
+  }
+
+  close(): void {
+    fs.closeSync(this.fd);
+  }
+}
+interface MessageRecord {
+  id: number;
+  offset: number;
+  size: number;
+}
+class MessageStore {
+  private currentSegment!: LogSegment;
+  private indexDB: Level<string, MessageRecord>;
+  private segmentSizeLimit = 1024 * 1024 * 100; // 100 MB
+  private currentSegmentBytes = 0;
+
+  constructor(private baseDir: string) {
+    this.indexDB = new Level<MessageRecord>(join(baseDir, "index"));
+    this.rollNewSegment();
+  }
+
+  private rollNewSegment() {
+    if (this.currentSegment) this.currentSegment.close();
+    const segmentId = Date.now();
+    this.currentSegment = LogSegment.create(this.baseDir, segmentId);
+    this.currentSegmentBytes = 0;
+  }
+
+  async write(id: number, message: Buffer): Promise<void> {
+    const offset = this.currentSegment.append(message);
+    const record = {
+      id,
+      offset,
+      size: message.length,
+    };
+    await this.indexDB.put(`msg:${id}`, record);
+    this.currentSegmentBytes += message.length;
+    if (this.currentSegmentBytes > this.segmentSizeLimit) {
+      this.rollNewSegment();
+    }
+  }
+
+  async read(id: number): Promise<Buffer | null> {
+    const record = await this.indexDB.get(`msg:${id}`);
+    if (!record) return null;
+    return this.currentSegment.read(record.offset, record.size);
+  }
+
+  flush(): Promise<void> {
+    return this.indexDB.flush();
+  }
 }
 //
 //
@@ -369,7 +1128,10 @@ class ExpirationProcessor<Data> implements IMessageProcessor {
   }
 }
 class AttemptsProcessor<Data> implements IMessageProcessor {
-  constructor(private dlq: IDLQManager<Data>, private maxAttempts: number) {}
+  constructor(
+    private dlq: IDLQManager<Data>,
+    private maxAttempts: number
+  ) {}
   process(meta: MessageMetadata): boolean {
     const shouldDeadLetter = meta.attempts > this.maxAttempts;
     if (shouldDeadLetter) {
@@ -524,26 +1286,33 @@ class DelayedMessageManager<Data> implements IDelayedMessageManager {
   }
 }
 interface IConsumerGroup {
-  addMember(id: number, routingKeys?: string[]): void;
-  removeMember(id: number): void;
+  addMember(id: string, routingKeys?: string[]): void;
+  removeMember(id: string): void;
   hasMembers(): boolean;
   getMembers(
     messageId: number,
     correlationId?: string
-  ): Iterable<number> | undefined;
+  ): Iterable<string> | undefined;
   getName(): string | undefined;
-  getMemberRoutingKeys(id: number): Set<string> | undefined;
+  getMemberRoutingKeys(id: string): Set<string> | undefined;
   getMetadata(): {
     name: string;
     count: number;
   };
 }
 class ConsumerGroup implements IConsumerGroup {
-  // TODO: persist
-  private members = new Map<number, Set<string>>();
-  constructor(private name: string | undefined, private hashRing: IHashRing) {}
+  private members: PersistedMap<string, Array<string>>;
+  constructor(
+    private name: string | undefined,
+    mapFactory: PersisteMapFactory,
+    private hashRing: IHashRing
+  ) {
+    this.members = mapFactory.create<string, Array<string>>(
+      `groups:${name}:members`
+    );
+  }
 
-  addMember(id: number, routingKeys?: string[]) {
+  addMember(id: string, routingKeys?: string[]) {
     const keysSet = new Set(routingKeys);
 
     // for the group with defined groupId we need to enforce homogeneous routingKeys within the members
@@ -563,10 +1332,10 @@ class ConsumerGroup implements IConsumerGroup {
     }
 
     this.hashRing.addNode(id);
-    this.members.set(id, keysSet);
+    this.members.set(id, routingKeys);
   }
 
-  removeMember(id: number) {
+  removeMember(id: string) {
     this.hashRing.removeNode(id);
     this.members.delete(id);
   }
@@ -578,7 +1347,7 @@ class ConsumerGroup implements IConsumerGroup {
   getMembers(
     messageId: number,
     correlationId?: string
-  ): Iterable<number> | undefined {
+  ): Iterable<string> | undefined {
     if (this.name || correlationId) {
       return this.hashRing.getNode(correlationId || messageId.toString());
     }
@@ -589,7 +1358,7 @@ class ConsumerGroup implements IConsumerGroup {
     return this.name;
   }
 
-  getMemberRoutingKeys(id: number) {
+  getMemberRoutingKeys(id: string) {
     return this.members.get(id);
   }
 
@@ -601,12 +1370,8 @@ class ConsumerGroup implements IConsumerGroup {
   }
 }
 interface IMessageRouter {
-  addConsumer(
-    consumerId: number,
-    groupId?: string,
-    routingKeys?: string[]
-  ): void;
-  removeConsumer(consumerId: number): void;
+  addConsumer(id: string, groupId?: string, routingKeys?: string[]): void;
+  removeConsumer(id: string): void;
   route(meta: MessageMetadata): Promise<number>;
   routeBatch(metas: MessageMetadata[]): Promise<number[]>;
   getMetadata(): {
@@ -617,8 +1382,8 @@ interface IMessageRouter {
   };
 }
 class MessageRouter<Data> implements IMessageRouter {
-  // TODO: persist
   private consumerGroups = new Map<string | undefined, IConsumerGroup>();
+  // private groups: PersistedMap<string | undefined, IConsumerGroup>;
 
   constructor(
     private clientManager: IClientManager,
@@ -635,16 +1400,16 @@ class MessageRouter<Data> implements IMessageRouter {
     };
   }
 
-  addConsumer(consumerId: number, groupId?: string, routingKeys?: string[]) {
+  addConsumer(id: string, groupId?: string, routingKeys?: string[]) {
     if (!this.consumerGroups.has(groupId)) {
       const hashRing = new InMemoryHashRing(new SHA256HashService());
       this.consumerGroups.set(groupId, new ConsumerGroup(groupId, hashRing));
     }
 
-    this.consumerGroups.get(groupId)!.addMember(consumerId, routingKeys);
+    this.consumerGroups.get(groupId)!.addMember(id, routingKeys);
   }
 
-  removeConsumer(consumerId: number) {
+  removeConsumer(id: string) {
     for (const [name, group] of this.consumerGroups.entries()) {
       group.removeMember(consumerId);
       if (!group.hasMembers()) {
@@ -745,7 +1510,7 @@ class MessageRouter<Data> implements IMessageRouter {
 }
 interface IPublishingService {
   publish(
-    producerId: number,
+    producerId: string,
     message: Buffer,
     meta: MessageMetadata
   ): Promise<void>;
@@ -774,7 +1539,7 @@ class PublishingService<Data> implements IPublishingService {
   ) {}
 
   async publish(
-    producerId: number,
+    producerId: string,
     message: Buffer,
     meta: MessageMetadata
   ): Promise<void> {
@@ -925,12 +1690,17 @@ interface IPendingAcks {
 }
 class PendingAcks implements IPendingAcks {
   // TODO: persist
-  private pendingAcks = new Map<number, Map<number, number>>();
+  private pendingAcks: PersistedMap<number, Map<number, number>>;
 
   constructor(
+    mapFactory: PersisteMapFactory,
     private clientManager: IClientManager,
     private maxUnackedPerConsumer = 10
-  ) {}
+  ) {
+    this.pendingAcks = mapFactory.create<number, Map<number, number>>(
+      "pending_acks"
+    );
+  }
 
   isReachedMaxUnacked(consumerId: number) {
     return this.getPendings(consumerId)?.size === this.maxUnackedPerConsumer;
@@ -1004,13 +1774,15 @@ interface IDeliveryCounter {
   decrementAwaitedDeliveries(messageId: number): Promise<void>;
 }
 class DeliveryCounter<Data> implements IDeliveryCounter {
-  // TODO: persist
-  private deliveries = new Map<number, number>();
+  private deliveries: PersistedMap<number, number>;
 
   constructor(
+    mapFactory: PersisteMapFactory,
     private messageStorage: IMessageStorage<Data>,
     private metrics: IMetricsCollector
-  ) {}
+  ) {
+    this.deliveries = mapFactory.create<number, number>("deliveries");
+  }
 
   setAwaitedDeliveries(messageid: number, deliveries: number) {
     this.deliveries.set(messageid, deliveries);
@@ -1335,14 +2107,16 @@ interface IDLQManager<Data> {
   };
 }
 class DLQManager<Data> implements IDLQManager<Data> {
-  // TODO: persist
-  private messages = new Map<number, DLQReason>();
+  private messages: PersistedMap<number, DLQReason>;
 
   constructor(
     private topic: string,
+    mapFactory: PersisteMapFactory,
     private messageStorage: IMessageStorage<any>,
     private logger?: ILogCollector
-  ) {}
+  ) {
+    this.messages = mapFactory.create("dlqMessages");
+  }
 
   size() {
     return this.messages.size;
@@ -1450,7 +2224,7 @@ class DLQService<Data> implements IDLQService<Data> {
 // SRC/CLIENT_MANAGEMENT_SERVICE.TS
 type ClientType = "producer" | "consumer" | "dlq_consumer";
 interface IClientState {
-  id: number;
+  id: string;
   clientType: ClientType;
   registeredAt: number;
   lastActiveAt: number;
@@ -1462,26 +2236,27 @@ interface IClientState {
   pendingAcks: number;
 }
 interface IClientManager {
-  addClient(type: ClientType, id?: number): IClientState;
-  removeClient(id: number): number;
+  addClient(type: ClientType, id: string): IClientState;
+  removeClient(id: string): number;
   getClients(filter?: (client: IClientState) => boolean): Set<IClientState>;
-  getClient(clientId: number): IClientState | undefined;
-  validateClient(id: number, expectedType?: ClientType): void;
-  isOperable(id: number, now: number): boolean;
-  isIdle(id: number): boolean;
-  recordActivity(clientId: number, activityRecord: Partial<IClientState>): void;
+  getClient(id: string): IClientState | undefined;
+  throwIfExists(id: string): void;
+  validateClient(id: string, expectedType?: ClientType): void;
+  isOperable(id: string, now: number): boolean;
+  isIdle(id: string): boolean;
+  recordActivity(id: string, activityRecord: Partial<IClientState>): void;
   getMetadata(): {
     count: number;
     producersCount: number;
     consumersCount: number;
     dlqConsumersCount: number;
     operableCount: number;
+    idleCount: number;
     avgProcessingTime: number;
   };
 }
 class ClientManager implements IClientManager {
-  // TODO: persist
-  private clients = new Map<number, IClientState>();
+  private clients = new Map<string, IClientState>();
 
   constructor(
     private inactivityThresholdMs = 300_000,
@@ -1489,7 +2264,7 @@ class ClientManager implements IClientManager {
     private pendingThresholdMs = 100
   ) {}
 
-  addClient(type: ClientType, id = uniqueIntGenerator()) {
+  addClient(type: ClientType, id: string) {
     const now = Date.now();
     this.clients.set(id, {
       registeredAt: now,
@@ -1507,7 +2282,7 @@ class ClientManager implements IClientManager {
     return this.clients.get(id)!;
   }
 
-  removeClient(id: number) {
+  removeClient(id: string) {
     const client = this.clients.get(id);
     if (client) {
       const type = client.clientType;
@@ -1528,11 +2303,17 @@ class ClientManager implements IClientManager {
     return results;
   }
 
-  getClient(clientId: number) {
-    return this.clients.get(clientId);
+  getClient(id: string) {
+    return this.clients.get(id);
   }
 
-  validateClient(id: number, expectedType?: ClientType) {
+  throwIfExists(id: string) {
+    if (this.clients.has(id)) {
+      throw new Error(`Client ID ${id} already exists`);
+    }
+  }
+
+  validateClient(id: string, expectedType?: ClientType) {
     const metadata = this.clients.get(id);
     if (!metadata) {
       throw new Error(`Client with ID ${id} not found`);
@@ -1542,7 +2323,7 @@ class ClientManager implements IClientManager {
     }
   }
 
-  isOperable(id: number, now: number) {
+  isOperable(id: string, now: number) {
     const client = this.getClient(id);
     if (!client) return false;
     if (client.status == "lagging") return false;
@@ -1551,15 +2332,15 @@ class ClientManager implements IClientManager {
     return now - client.lastActiveAt < this.inactivityThresholdMs;
   }
 
-  isIdle(id: number) {
+  isIdle(id: string) {
     const client = this.getClient(id);
     if (!client) return false;
     return client.status === "idle";
   }
 
-  recordActivity(clientId: number, activityRecord: Partial<IClientState>) {
-    if (!this.clients.has(clientId)) return;
-    const client = this.clients.get(clientId)!;
+  recordActivity(id: string, activityRecord: Partial<IClientState>) {
+    if (!this.clients.has(id)) return;
+    const client = this.clients.get(id)!;
     client.lastActiveAt = Date.now();
 
     for (let key in activityRecord) {
@@ -1574,7 +2355,7 @@ class ClientManager implements IClientManager {
       client.avgProcessingTime = client.processingTime / client.messageCount;
     }
 
-    this.clients.set(clientId, client);
+    this.clients.set(id, client);
   }
 
   getMetadata() {
@@ -1583,12 +2364,14 @@ class ClientManager implements IClientManager {
     let consumersCount = 0;
     let dlqConsumersCount = 0;
     let operableCount = 0;
+    let idleCount = 0;
     const now = Date.now();
 
     const clients = this.clients.values();
     for (const client of clients) {
       avgProcessingTime += client.avgProcessingTime;
       if (this.isOperable(client.id, now)) operableCount++;
+      if (this.isIdle(client.id)) idleCount++;
       if ((client.clientType = "producer")) producersCount++;
       else if ((client.clientType = "consumer")) consumersCount++;
       else dlqConsumersCount++;
@@ -1600,6 +2383,7 @@ class ClientManager implements IClientManager {
       consumersCount,
       dlqConsumersCount,
       operableCount,
+      idleCount,
       avgProcessingTime,
     };
   }
@@ -1804,6 +2588,7 @@ interface IClientManagementService<Data> {
     consumersCount: number;
     dlqConsumersCount: number;
     operableCount: number;
+    idleCount: number;
     avgProcessingTime: number;
   };
 }
@@ -1820,17 +2605,20 @@ class ClientManagementService<Data> implements IClientManagementService<Data> {
     private readonly logger?: ILogCollector
   ) {}
 
-  createProducer(): IProducer<Data> {
-    const id = uniqueIntGenerator();
+  createProducer(id = uniqueIntGenerator()): IProducer<Data> {
+    this.clientManager.throwIfExists(id);
     this.clientManager.addClient("producer", id);
     this.logger?.log(`producer_created`, { id });
 
     return this.producerFactory.create(id);
   }
 
-  createConsumer(config: IConsumerConfig = {}): IConsumer<Data> {
+  createConsumer(
+    id = uniqueIntGenerator(),
+    config: IConsumerConfig = {}
+  ): IConsumer<Data> {
+    this.clientManager.throwIfExists(id);
     const { groupId, routingKeys, autoAck, limit } = config;
-    const id = uniqueIntGenerator();
     this.messageRouter.addConsumer(id, groupId, routingKeys);
     this.clientManager.addClient("consumer", id);
     this.queueManager.addQueue(id);
@@ -1847,10 +2635,12 @@ class ClientManagementService<Data> implements IClientManagementService<Data> {
     );
   }
 
-  createDLQConsumer(limit?: number): DLQConsumer<Data> {
-    const id = uniqueIntGenerator();
+  createDLQConsumer(
+    id = uniqueIntGenerator(),
+    limit?: number
+  ): DLQConsumer<Data> {
+    this.clientManager.throwIfExists(id);
     this.clientManager.addClient("dlq_consumer", id);
-
     this.logger?.log(`dlq_consumer_created`, { id });
 
     return new DLQConsumer(this.dlqService, id, limit);
@@ -1926,21 +2716,22 @@ class TopicMetricsCollector implements IMetricsCollector {
 }
 interface ITopicConfig {
   schema?: string; // registered schema` name
-  persistThresholdMs?: number; // persist flush delay, // 100
+  persistThresholdMs?: number; // flush delay, 1000 default, if need ephemeral set Infinity
   retentionMs?: number; // 86_400_000 1 day
-  archivalThresholdMs?: number; // 100_000
   maxSizeBytes?: number;
   maxDeliveryAttempts?: number;
   maxMessageSize?: number;
-  maxUnackedMessagesPerConsumer?: number;
   ackTimeoutMs?: number; // e.g., 30_000
   consumerInactivityThresholdMs?: number; // 600_000;
   consumerProcessingTimeThresholdMs?: number;
   consumerPendingThresholdMs?: number;
-  //   partitions?: number;
-  persist?: boolean; // true by def TODO: dont need
+  // maxUnackedMessagesPerConsumer?: number;
+  // partitions?: number;
+  // archivalThresholdMs?: number; // 100_000
 }
 interface ITopic<Data> {
+  name: string;
+  config: ITopicConfig;
   createProducer(): IProducer<Data>;
   createConsumer(config: IConsumerConfig): IConsumer<Data>;
   createDLQConsumer(limit?: number): DLQConsumer<Data>;
@@ -1988,6 +2779,7 @@ interface ITopic<Data> {
 class Topic<Data> implements ITopic<Data> {
   constructor(
     public readonly name: string,
+    public readonly config: ITopicConfig,
     private readonly publishingService: IPublishingService,
     private readonly consumptionService: IConsumptionService<Data>,
     private readonly subscriptionService: ISubscriptionService<Data>,
@@ -2035,10 +2827,10 @@ class TopicFactory implements ITopicFactory {
   constructor(
     private schemaRegistry: ISchemaRegistry,
     private defaultConfig: ITopicConfig = {
+      persistThresholdMs: 1000,
       retentionMs: 86_400_000, // 1 day
       maxDeliveryAttempts: 5,
       maxUnackedMessagesPerConsumer: 10,
-      persist: true,
     },
     private codecFactory: new () => ICodec = ThreadedBinaryCodec,
     private queueFactory: new () => IPriorityQueue = HighCapacityBinaryHeapPriorityQueue,
@@ -2272,17 +3064,17 @@ class LogService implements ILogService {
     this.topicCollectors.forEach((collector) => collector.flush());
   }
 }
-interface ISchemaRegistry {
+interface ISchemaRegistry extends ISerializable {
   register<Data>(name: string, schema: JSONSchemaType<Data>): string;
   getValidator(schema: string): ((data: any) => boolean) | undefined;
   remove(schema: string): void;
 }
 class SchemaRegistry implements ISchemaRegistry {
   // TODO: persist
-  private validators = new Map<string, Map<number, (data: any) => boolean>>();
+  private validators: PersistedMap<string, Map<number, (data: any) => boolean>>;
   private ajv: Ajv;
 
-  constructor(options?: Ajv.Options) {
+  constructor(mapFactory: PersisteMapFactory, options?: Ajv.Options) {
     this.ajv = new Ajv({
       allErrors: true,
       coerceTypes: false,
@@ -2290,7 +3082,12 @@ class SchemaRegistry implements ISchemaRegistry {
       code: { optimize: true, esm: true },
       ...options,
     });
+    this.validators = mapFactory.create("validators", this);
   }
+
+  serialize(validatorMap: Map<number, (data: any) => boolean>) {}
+
+  desialize() {}
 
   register<Data>(name: string, schema: JSONSchemaType<Data>): string {
     if (!this.validators.has(name)) {
@@ -2314,12 +3111,23 @@ class SchemaRegistry implements ISchemaRegistry {
   }
 }
 class TopicRegistry {
-  // TODO: persist
-  private topics = new Map<string, ITopic<any>>();
+  private topics: PersistedMap<string, ITopic<any>>;
   constructor(
+    mapFactory: PersisteMapFactory,
     private topicFactory: ITopicFactory,
     private logService?: ILogService
-  ) {}
+  ) {
+    this.topics = mapFactory.create("topics", this);
+  }
+
+  serialize(topic: ITopic<any>) {
+    const { name, config } = topic;
+    return { name, config };
+  }
+
+  deserialize(data: { name: string; config: ITopicConfig }) {
+    return this.topicFactory.create(data.name, data.config);
+  }
 
   create<Data>(name: string, config: ITopicConfig): ITopic<Data> {
     if (this.topics.has(name)) {
@@ -2353,3 +3161,185 @@ class TopicRegistry {
     this.logService?.globalCollector.log("Topic deleted", { name });
   }
 }
+
+// make all deletable/disposable
+// custom errs: new ValidationError()
+// project structure
+
+// separation of conserns, ioc(inversify_js), visualize components and flows
+// At-least-once/Exactly-once: Your system already supports At-least-once delivery , which is a prerequisite for Exactly-once. These features ensure that no message is lost, but they do not prevent duplicates.
+// Allow groups to use round-robin, sticky sessions, etc., not just hash rings.
+// switch to Standalone server: you hit >50k msg/sec, cross-service/multi-lang support => need protobuf & lib/sdk per lang
+
+// class ProtobufCodec implements ICodec {
+//   encode<Data>(message: Message<Data>): Buffer {
+//     const protoMsg = ProtoMessage.create({
+//       data: this.serializeData(message.data),
+//       // Convert all numbers to bigint
+//       ts: BigInt(message.ts),
+//       attempts: BigInt(message.attempts),
+//       priority: message.priority ? BigInt(message.priority) : message.priority,
+//       ttl: message.ttl ? BigInt(message.ttl) : message.ttl,
+//       ttd: message.ttd ? BigInt(message.ttd) : message.ttd,
+//       batchIdx: message.batchIdx ? BigInt(message.batchIdx) : message.batchIdx,
+//       batchSize: message.batchSize
+//         ? BigInt(message.batchSize)
+//         : message.batchSize,
+//     });
+//     return ProtoMessage.encode(protoMsg).finish();
+//   }
+
+//   decode<Data>(bytes: Buffer): Message<Data> {
+//     const protoMsg = ProtoMessage.decode(bytes);
+//     return Object.assign(new Message(), {
+//       data: this.deserializeData<Data>(protoMsg.data),
+//       // Convert back to JS numbers
+//       ts: Number(protoMsg.ts),
+//       attempts: Number(protoMsg.attempts),
+//       priority: protoMsg.priority
+//         ? Number(protoMsg.priority)
+//         : protoMsg.priority,
+//       ttl: protoMsg.ttl ? Number(protoMsg.ttl) : protoMsg.ttl,
+//       ttd: protoMsg.ttd ? Number(protoMsg.ttd) : protoMsg.ttd,
+//       batchIdx: protoMsg.batchIdx
+//         ? Number(protoMsg.batchIdx)
+//         : protoMsg.batchIdx,
+//       batchSize: protoMsg.batchSize
+//         ? Number(protoMsg.batchSize)
+//         : protoMsg.batchSize,
+//     });
+//   }
+
+//   private serializeData<T>(data: T): Buffer {
+//     // no data schema fallback - just binary
+//     return Buffer.from(JSON.stringify(data));
+//   }
+
+//   private deserializeData<T>(bytes: Buffer): T {
+//     // no data schema fallback - just binary
+//     return JSON.parse(Buffer.toString(bytes));
+//   }
+// }
+
+// class JSONCodec implements ICodec {
+//   encode<T>(data: T, meta: MessageMetadata) {
+//     try {
+//       // 1. Build the complete object
+//       const message = { "0": data };
+//       meta.keys.forEach((k, i) => {
+//         if (meta[k] !== undefined) message[i + 1] = meta[k];
+//       });
+
+//       // 2. Pre-allocation reduces GC pressure
+//       const jsonString = JSON.stringify(message);
+//       const buffer = Buffer.allocUnsafe(Buffer.byteLength(jsonString));
+
+//       // 3. Single write operation
+//       buffer.write(jsonString, 0, "utf8");
+//       return buffer;
+//     } catch (e) {
+//       throw new Error("Failed to encode message");
+//     }
+//   }
+
+//   decode<T>(buffer: Buffer): [T, MessageMetadata] {
+//     try {
+//       // 1. Fast path for empty/small buffers
+//       if (buffer.length < 2) throw new Error("Invalid message");
+
+//       // 2. Single string conversion
+//       const str =
+//         buffer.length < 4096
+//           ? buffer.toString("utf8") // Small buffers
+//           : Buffer.prototype.toString.call(buffer, "utf8"); // Large buffers avoids prototype lookup
+
+//       // 3. Parse with reviver for direct metadata mapping
+//       const meta = new MessageMetadata();
+//       const data = JSON.parse(str, (k, v: number | string) => {
+//         if (k === "0") return v; // Return payload as-is
+//         const metaIndex = parseInt(k, 10) - 1;
+//         if (!isNaN(metaIndex)) {
+//           const metaKey = meta.keys[metaIndex];
+//           // @ts-ignore
+//           if (metaKey) meta[metaKey] = v;
+//         }
+//         return;
+//       }) as T;
+
+//       return [data, meta];
+//     } catch (e) {
+//       throw new Error("Failed to decode message");
+//     }
+//   }
+// }
+
+// const logger = pino({
+//   level: process.env.LOG_LEVEL || "info",
+//   transport:
+//     process.env.NODE_ENV === "development"
+//       ? { target: "pino-pretty" }
+//       : undefined,
+//   base: { service: "message-broker" },
+// });
+
+//
+// const topicDepth = new Counter({
+//   name: "queue_depth",
+//   help: "Current messages in queue",
+//   labelNames: ["topic"],
+// });
+// const producerMessageCount = new Counter({
+//   name: "producer_messages_total",
+//   help: "Total messages sent by producer",
+//   labelNames: ["topic", "producer_id"],
+// });
+// const consumerLag = new Gauge({
+//   name: "consumer_pending_messages",
+//   help: "Pending messages per consumer",
+//   labelNames: ["topic", "consumer_id"],
+// });
+// class MetricsExporter {
+//   private metricsProviders = new Map<string, () => Record<string, number>>();
+//   register(topicName: string, getMetrics: () => Record<string, number>) {
+//     this.metricsProviders.set(topicName, getMetrics);
+//   }
+//   start() {
+//     setInterval(() => {
+//       this.metricsProviders.forEach((getMetrics, topicName) => {
+//         const lags = getMetrics(); // E.g., { "consumer-1": 5, "consumer-2": 10 }
+//         Object.entries(lags).forEach(([consumerId, lag]) => {
+//           consumerLagGauge.set({ topic: topicName, consumerId }, lag);
+//         });
+//       });
+//     }, 15_000);
+//   }
+// }
+
+//           - leveldb: 300k (space:78mb, w:18s, r:2.8s, d:ok)
+//           - rocksd: 300k (space:100mb, w:15.3s, r:2.9s, d:faster, +ttl, +backups, +mcore, +transaction?, partitions(Column Families allow to group related data together and store it in a separate partition))
+//           - Redis(aof) use more disk space, partialy already has broker capabilities(pubsub, streams) which also in ram so i double ram usage, has many other features which i dont need
+//             redis list[buffer from protobuf] for queues and redis stream for broadcast(eventlog)
+
+// Job queues and eventLog have distinct arch and seems like this lib should be doing one thing eventually.
+// I think i dont want kafka streaming. I just want a scallable message broker which is more like Rabbitmq i guess.
+// RabbitMq analogue: log is an exchange, offsets are binary queues(with messageId if log is map or messageIndex if log is list) binded to exchange but ram effective
+// message marks will be deleted from the offsets on ack, if nack - also offset manipulation
+// but we need both routing and consistency hashing (correlationId) implementation here
+// Here is my proposal for universal Topic:
+// 1. all messages should be stored in kv log (map/leveldb) and deleted only with retention. Can we skip wal if log persisted?
+// 2. we will use virtual offsets per consumer but it will be buffer with messageid(or messageIndex if log is list)
+// on message ack only offset will be deleted, on nack also offset manipulation - message already in log
+
+//        1. AJV for per topic json schema validation (2x faster zod due precompilation and faster than protobuf validation)
+//        2. Custom binary packing codec based on Buffer, fixed structure(metadata), bitflags for optional fields (no redundant data), precomputed Offsets.
+//           Buffer.from is 30% faster TextEncode.encode due the buffer preallocation.
+//           Uses worker_threads(makes 2x slower but offload main thread).
+//           Codec provides max speed, min size/resource_usage within nodejs specific impl.
+//           But for a standalone server its need to be switch to protobuf(encode + compress(indexes vs keys) + schema validation) or message_pack(encode any type + compress)
+//           Metrics
+//             - json: encode(12k m/sec), decode(9k m/sec), size(200b), gc/cpu(high)
+//             - this impl: encode(40k m/sec), decode(50k m/sec), size(60b), gc/cpu(low)
+//             - protobuf: encode(30k m/sec), decode(35k m/sec), size(80b), gc/cpu(medium)
+//             - message_pack: encode(16k m/sec), decode(15k m/sec), size(100b), gc/cpu(medium)
+//        3. leveldb(+snappy)/rocksdb cpp addon
+//           - compressor comparision: gzip(zlib wrapper, 4x but slow)/brotli(+20% zlib, slow) => ZSTD(between gzip & snappy) => snappy(only 2x but fast)

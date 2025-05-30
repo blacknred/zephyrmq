@@ -1,17 +1,17 @@
-import Buffer from "node:buffer";
-import { MessageMetadata } from "../25.ts";
-import { ICodec } from "./binary_codec";
+import type { TransferListItem } from "node:worker_threads";
 import { Worker } from "node:worker_threads";
 import os from "os";
 import { join } from "path";
+import { MessageMetadata } from "../index";
+import type { ICodec } from "./binary_codec";
 
-type WorkerRequest = {
+export type WorkerRequest = {
   id: number;
   method: string;
   args: any[];
 };
 
-type WorkerResponse<T = any> = {
+export type WorkerResponse<T = any> = {
   id: number;
   result?: T;
   error?: string;
@@ -29,6 +29,7 @@ export class ThreadedBinaryCodec implements ICodec {
   constructor(workersCount = os.cpus().length) {
     for (let i = 0; i < workersCount; i++) {
       const worker = new Worker(this.workerPath);
+
       worker.on("message", (response: WorkerResponse) => {
         const handlers = this.pending.get(response.id);
         if (!handlers) return;
@@ -67,12 +68,12 @@ export class ThreadedBinaryCodec implements ICodec {
   private send<T>(
     method: string,
     args: any[],
-    transferables?: Transferable[]
+    transferList?: TransferListItem[]
   ): Promise<T> {
     const id = this.nextId++;
     const worker = this.getNextWorker();
 
-    worker.postMessage<WorkerRequest>({ id, method, args }, transferables);
+    worker.postMessage({ id, method, args } as WorkerRequest, transferList);
 
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -85,7 +86,7 @@ export class ThreadedBinaryCodec implements ICodec {
   }
 
   async decode<T>(buffer: Buffer): Promise<T> {
-    const arrayBuffer = buffer.buffer;
+    const arrayBuffer = buffer.buffer as TransferListItem;
     const byteOffset = buffer.byteOffset;
     const byteLength = buffer.byteLength;
 
@@ -100,7 +101,7 @@ export class ThreadedBinaryCodec implements ICodec {
     buffer: Buffer,
     keys?: K[]
   ): Promise<Pick<MessageMetadata, K>> {
-    const arrayBuffer = buffer.buffer;
+    const arrayBuffer = buffer.buffer as TransferListItem;
     const byteOffset = buffer.byteOffset;
     const byteLength = buffer.byteLength;
 
@@ -115,7 +116,7 @@ export class ThreadedBinaryCodec implements ICodec {
     buffer: Buffer,
     partialMeta: Partial<MessageMetadata>
   ): Promise<Buffer> {
-    const arrayBuffer = buffer.buffer;
+    const arrayBuffer = buffer.buffer as TransferListItem;
     const byteOffset = buffer.byteOffset;
     const byteLength = buffer.byteLength;
 
