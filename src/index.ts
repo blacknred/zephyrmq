@@ -1,4 +1,4 @@
-import type { JSONSchemaType } from "ajv";
+import type { JSONSchemaType, Options as AjvOptions } from "ajv";
 import Ajv from "ajv";
 import type { Level } from "level";
 import level from "level";
@@ -6,10 +6,104 @@ import fs from "node:fs/promises";
 import path, { join } from "node:path";
 import { clearImmediate, setImmediate } from "node:timers";
 import * as snappy from "snappy";
-import { HighCapacityBinaryHeapPriorityQueue } from "./binary_heap_priority_queue";
+import { BinaryHeapPriorityQueue } from "./binary_heap_priority_queue";
 import type { ICodec } from "./codec/binary_codec";
 import { ThreadedBinaryCodec } from "./codec/binary_codec.threaded";
 import { uniqueIntGenerator } from "./utils";
+import {
+  InMemoryHashRing,
+  SHA256HashService,
+  type IHashRing,
+} from "./hash_ring";
+//
+//
+//
+// TODO: for n-processes use proper-lockfile
+class Mutex {
+  private queue: (() => void)[] = [];
+  private isLocked = false;
+
+  acquire(): Promise<void> {
+    return new Promise((resolve) => {
+      const run = () => {
+        this.isLocked = true;
+        resolve();
+      };
+
+      if (!this.isLocked) {
+        run();
+      } else {
+        this.queue.push(run);
+      }
+    });
+  }
+
+  release(): void {
+    if (this.queue.length > 0) {
+      const next = this.queue.shift();
+      next?.();
+    } else {
+      this.isLocked = false;
+    }
+  }
+}
+interface ITimeoutScheduler {
+  schedule(task: () => Promise<void>, delayMS: number): void;
+  size(): number;
+  stop(): void;
+}
+class TimeoutScheduler implements ITimeoutScheduler {
+  private nextTimeout?: NodeJS.Timeout;
+  private isProcessing = false;
+
+  constructor(private queue: IPriorityQueue<[() => Promise<void>, number]>) {}
+
+  schedule(task: () => Promise<void>, delayMS: number) {
+    const readyTs = Date.now() + delayMS;
+    this.queue.enqueue([task, readyTs], readyTs);
+    this.setNextTimeout();
+  }
+
+  size() {
+    return this.queue.size();
+  }
+
+  stop() {
+    clearTimeout(this.nextTimeout);
+  }
+
+  private setNextTimeout(): void {
+    if (this.isProcessing || this.queue.isEmpty()) return;
+
+    const record = this.queue.peek();
+    if (!record) return;
+
+    const delay = Math.max(0, record[1] - Date.now());
+    clearTimeout(this.nextTimeout);
+    this.nextTimeout = setTimeout(this.onTimeoutHandler, delay);
+  }
+
+  private onTimeoutHandler = async () => {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
+    const now = Date.now();
+    const tasks: Array<() => Promise<void>> = [];
+
+    try {
+      while (!this.queue.isEmpty()) {
+        const [task, readyTs] = this.queue.peek()!;
+        if (readyTs > now) break; // second peak is not ready yet
+        this.queue.dequeue();
+        tasks.push(task);
+      }
+
+      await Promise.all(tasks);
+    } finally {
+      this.isProcessing = false;
+      this.setNextTimeout();
+    }
+  };
+}
 //
 //
 //
@@ -139,38 +233,9 @@ class MessageFactory<Data> implements IMessageFactory<Data> {
 //
 //
 //
-// TODO: for n-processes use proper-lockfile
-class Mutex {
-  private _queue: (() => void)[] = [];
-  private _locked = false;
-
-  acquire(): Promise<void> {
-    return new Promise((resolve) => {
-      const run = () => {
-        this._locked = true;
-        resolve();
-      };
-
-      if (!this._locked) {
-        run();
-      } else {
-        this._queue.push(run);
-      }
-    });
-  }
-
-  release(): void {
-    if (this._queue.length > 0) {
-      const next = this._queue.shift();
-      next?.();
-    } else {
-      this._locked = false;
-    }
-  }
-}
 // WAL: message durability, write as fast as possible: setImmediate flush + no snappy
 class WriteAheadLog {
-  private fileHandle: fs.FileHandle;
+  private fileHandle?: fs.FileHandle;
   private flushPromise?: Promise<void>;
   private isFlushing = false;
   private batch: Buffer[] = [];
@@ -179,18 +244,19 @@ class WriteAheadLog {
   constructor(
     private filePath: string,
     private maxBatchSizeBytes = 100 * 1024 * 1024
-  ) {}
+  ) {
+    this.init();
+  }
 
-  // init
-
-  async initialize() {
+  private async init() {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     this.fileHandle = await fs.open(this.filePath, "a+");
   }
 
   // api
 
-  async append(data: Buffer): Promise<number> {
+  async append(data: Buffer): Promise<number | void> {
+    if (!this.fileHandle) return;
     const { size: offset } = await this.fileHandle.stat();
     this.batch.push(data);
     this.batchSize += data.length;
@@ -202,13 +268,15 @@ class WriteAheadLog {
     return offset;
   }
 
-  async read(offset: number, length: number): Promise<Buffer> {
+  async read(offset: number, length: number): Promise<Buffer | void> {
+    if (!this.fileHandle) return;
     const buffer = Buffer.alloc(length);
     await this.fileHandle.read(buffer, 0, length, offset);
     return buffer;
   }
 
   async close() {
+    if (!this.fileHandle) return;
     if (this.batch.length > 0) {
       await this.scheduleFlush();
     }
@@ -217,13 +285,14 @@ class WriteAheadLog {
 
   // misc
 
-  private scheduleFlush(): Promise<void> {
+  private scheduleFlush(): Promise<void> | void {
+    if (!this.fileHandle) return;
     if (this.isFlushing) return this.flushPromise!;
     this.isFlushing = true;
 
     this.flushPromise = new Promise<void>(async (resolve, reject) => {
-      // batched writes
       setImmediate(async () => {
+        if (!this.fileHandle) return;
         try {
           const toWrite = Buffer.concat(this.batch);
           await this.fileHandle.write(toWrite);
@@ -235,6 +304,7 @@ class WriteAheadLog {
         } finally {
           this.isFlushing = false;
           this.flushPromise = undefined;
+
           if (this.batch.length > 0) {
             this.scheduleFlush();
           }
@@ -269,11 +339,11 @@ class SegmentLog {
   constructor(
     private baseDir: string,
     private maxSegmentSizeBytes = 100 * 1024 * 1024
-  ) {}
+  ) {
+    this.init();
+  }
 
-  // init
-
-  async initialize() {
+  private async init() {
     await fs.mkdir(this.baseDir, { recursive: true });
     await this.loadExistingSegments();
     await this.ensureCurrentSegment();
@@ -297,7 +367,7 @@ class SegmentLog {
   private async ensureCurrentSegment() {
     if (
       this.currentSegment &&
-      this.currentSegment.size < this.maxSegmentSizeBytes
+      this.currentSegment?.size < this.maxSegmentSizeBytes
     ) {
       return;
     }
@@ -345,7 +415,7 @@ class SegmentLog {
         await fileHandle.close();
       }
     } finally {
-      await this.mutex.release();
+      this.mutex.release();
     }
   }
 
@@ -356,9 +426,9 @@ class SegmentLog {
     const fileHandle = await fs.open(segment.filePath, "r");
 
     try {
-      const compressed = Buffer.alloc(pointer.length);
-      await fileHandle.read(compressed, 0, pointer.length, pointer.offset);
-      return snappy.uncompress(compressed);
+      const buffer = Buffer.alloc(pointer.length);
+      await fileHandle.read(buffer, 0, pointer.length, pointer.offset);
+      return snappy.uncompress(buffer) as Promise<Buffer>;
     } finally {
       await fileHandle.close();
     }
@@ -368,18 +438,19 @@ class SegmentLog {
 
   async cleanupOldSegments(retentionMs: number) {
     const cutoff = Date.now() - retentionMs;
+
     for (const segment of this.segments.values()) {
       if (segment.id === this.currentSegment?.id) continue;
 
-      const stats = await fs.stat(segment.filePath);
-      if (stats.mtimeMs < cutoff) {
+      const { mtimeMs } = await fs.stat(segment.filePath);
+      if (mtimeMs < cutoff) {
         await fs.unlink(segment.filePath);
         this.segments.delete(segment.id);
       }
     }
   }
 
-  async compact() {
+  async compactSegmentsByRemovingOldMessages() {
     const activeMessageIds = new Set<number>();
 
     // 1. Scan all active messages
@@ -444,35 +515,405 @@ class SegmentLog {
 //
 //
 //
-// Storage
-interface IFlushable {
+// PERSISTENCE
+interface IFlushManager {
+  register(task: () => Promise<void>): void;
+  unregister(task: () => Promise<void>): void;
+  commit(): void;
   flush: () => Promise<void>;
+  size(): number;
+  stop(): void;
 }
-class FlushManager {
-  private tasks: Array<IFlushable> = [];
+class FlushManager implements IFlushManager {
+  private flushes: Array<() => Promise<void>> = [];
+  private pendingUpdateCounter = 0;
   private timer?: NodeJS.Timeout;
 
-  constructor(private intervalMs: number = 1000) {}
-
-  register(task: IFlushable) {
-    this.tasks.push(task);
-  }
-
-  start() {
-    if (this.intervalMs === Infinity) return;
-    this.timer = setInterval(this.flush, this.intervalMs);
-    process.on("beforeExit", this.flush);
+  constructor(
+    private persistThresholdMs = 1000,
+    private maxPendingFlushes = 1000,
+    private memoryPressureThresholdMB = 1024
+  ) {
+    this.init();
   }
 
   stop() {
     clearInterval(this.timer);
     this.timer = undefined;
+    this.flush();
   }
 
-  private flush = async () => {
-    await Promise.all(this.tasks.map((t) => t.flush()));
+  register(task: () => Promise<void>) {
+    this.flushes.push(task);
+  }
+
+  unregister(task: () => Promise<void>): void {
+    const idx = this.flushes.indexOf(task);
+    if (idx === -1) return;
+    this.flushes.splice(idx, 1);
+  }
+
+  commit() {
+    if (++this.pendingUpdateCounter < this.maxPendingFlushes) return;
+    if (!this.isMemoryPressured()) return;
+    this.flush();
+  }
+
+  size() {
+    return this.flushes.length;
+  }
+
+  flush = async () => {
+    if (!this.pendingUpdateCounter) return;
+    this.pendingUpdateCounter = 0;
+    await Promise.all(this.flushes);
   };
+
+  private init() {
+    if (this.persistThresholdMs === Infinity) return;
+    this.timer = setInterval(this.flush, this.persistThresholdMs);
+    process.on("beforeExit", this.stop);
+  }
+  private isMemoryPressured() {
+    const { rss } = process.memoryUsage();
+    const usedMB = Math.round(rss / 1024 / 1024);
+    return usedMB > this.memoryPressureThresholdMB;
+  }
 }
+export interface ISerializable<T = unknown, R = unknown, K = string | number> {
+  serialize(data: T, key: K): R;
+  deserialize(data: R, key: K): T;
+}
+
+
+export interface IPersistedMap<V, K> extends Map<K, V> {
+  flush(): Promise<void>;
+}
+class PersistedMap<V, K extends string | number>
+  extends Map<K, V>
+  implements IPersistedMap<V, K>
+{
+  private dirtyKeys = new Set<K>();
+  private mutex = new Mutex();
+  private isCleared = false;
+
+  constructor(
+    private db: Level<string, Buffer>,
+    private namespace: string,
+    private codec: ICodec,
+    private flushManager?: IFlushManager,
+    private logger?: ILogCollector,
+    private serializer?: ISerializable<V>,
+    private maxSize = Infinity
+  ) {
+    super();
+    this.init();
+  }
+
+  set(key: K, value: V) {
+    // works for primitives, non-primitive will always return true which is also ok
+    if (super.get(key) !== value) {
+      this.dirtyKeys.add(key);
+      this.flushManager?.commit();
+    }
+
+    this.evictIfFull();
+    return super.set(key, value);
+  }
+
+  delete(key: K) {
+    this.dirtyKeys.add(key);
+    this.flushManager?.commit();
+    return super.delete(key);
+  }
+
+  clear() {
+    this.isCleared = true;
+    this.flush();
+    return super.clear();
+  }
+
+  // misc
+
+  private evictIfFull(): void {
+    // LRU-style eviction (simplified)
+    // The order returned by Map.keys() is insertion order (since ES6), but it’s not guaranteed to be least-recently-used unless explicitly managed.
+    if (this.size < this.maxSize) return;
+    const firstKey = this.keys().next().value!;
+    this.delete(firstKey);
+  }
+
+  private async init() {
+    try {
+      for await (const [k, v] of this.db.iterator({
+        gt: `${this.namespace}!`,
+        lt: `${this.namespace}~`,
+      })) {
+        const key = k.slice(this.namespace.length + 1) as K;
+        const value = await this.codec.decode<V>(v);
+        //
+        const data = this.serializer?.deserialize(value, key) ?? value;
+        super.set(key, data);
+        //
+      }
+    } catch (error) {
+      this.logger?.log(
+        `Failed to restore ${this.namespace}`,
+        { error },
+        "error"
+      );
+    }
+  }
+
+  async flush() {
+    if (this.dirtyKeys.size === 0) return;
+    await this.mutex.acquire();
+
+    try {
+      if (this.isCleared) {
+        await this.db.clear({
+          gt: `${this.namespace}!`,
+          lt: `${this.namespace}~`,
+        });
+
+        this.dirtyKeys.clear();
+        this.isCleared = false;
+        return;
+      }
+
+      const batch = this.db.batch();
+      const encodePromises: Promise<void>[] = [];
+
+      for (const key of this.dirtyKeys) {
+        const value = super.get(key)!;
+
+        if (value !== undefined) {
+          const data = this.serializer?.serialize(value, key) ?? value;
+          encodePromises.push(
+            this.codec.encode(data).then((encoded) => {
+              batch.put(`${this.namespace}!${key}`, encoded);
+            })
+          );
+        } else {
+          batch.del(`${this.namespace}!${key}`);
+        }
+      }
+
+      await Promise.all(encodePromises);
+      await batch.write();
+      this.dirtyKeys.clear();
+    } catch (error) {
+      this.logger?.log(`Failed to flush ${this.namespace}`, { error }, "error");
+    } finally {
+      this.mutex.release();
+    }
+  }
+}
+export interface IPersistedMapFactory {
+  create<V, K extends string | number>(
+    _prefix: string,
+    serializer?: ISerializable<V>,
+    maxSize?: number
+  ): PersistedMap<V, K>;
+}
+class PersistedMapFactory implements IPersistedMapFactory {
+  constructor(
+    private topic: string,
+    private db: Level<string, Buffer>,
+    private codec: ICodec,
+    private flushManager: IFlushManager,
+    private logger?: ILogCollector
+  ) {}
+
+  create<V, K extends string | number>(
+    _prefix: string,
+    serializer?: ISerializable<V>,
+    maxSize = Infinity
+  ) {
+    const prefix = `${this.topic}:${_prefix}`;
+    const map = new PersistedMap<V, K>(
+      this.db,
+      prefix,
+      this.codec,
+      this.flushManager,
+      this.logger,
+      serializer,
+      maxSize
+    );
+
+    this.flushManager.register(map.flush);
+    return map;
+  }
+}
+interface IPersistedQueue<T> extends IPriorityQueue<T> {
+  flush(): Promise<void>;
+  clear(): void;
+}
+class PersistedQueue<T, K extends string | number>
+  extends BinaryHeapPriorityQueue<T>
+  implements IPersistedQueue<T>
+{
+  private pendingUpdates = new Map<K, [T, number] | undefined>();
+  private mutex = new Mutex();
+  private isCleared = false;
+
+  constructor(
+    private db: Level<string, Buffer>,
+    private namespace: string,
+    private codec: ICodec,
+    private keyRetriever: (entry: T) => K,
+    private flushManager?: IFlushManager,
+    private logger?: ILogCollector,
+    private serializer?: ISerializable<T>,
+    private maxSize = Infinity
+  ) {
+    super();
+    this.init();
+  }
+
+  enqueue(value: T, priority = 0): void {
+    super.enqueue(value, priority);
+    const key = this.keyRetriever(value);
+    this.pendingUpdates.set(key, [value, priority]);
+    this.flushManager?.commit();
+    this.evictIfFull();
+  }
+
+  dequeue(): T | undefined {
+    const data = super.dequeue();
+    if (data) {
+      const key = this.keyRetriever(data);
+      this.pendingUpdates.set(key, undefined);
+      this.flushManager?.commit();
+    }
+
+    return data;
+  }
+
+  clear() {
+    this.isCleared = true;
+    this.flush();
+  }
+
+  // misc
+
+  private evictIfFull(): void {
+    // LRU-style eviction (simplified)
+    if (this.size() < this.maxSize) return;
+    this.dequeue();
+  }
+
+  private async init() {
+    try {
+      for await (const [k, v] of this.db.iterator({
+        gt: `${this.namespace}!`,
+        lt: `${this.namespace}~`,
+      })) {
+        const key = k.slice(this.namespace.length + 1) as K;
+        const [rawData, priority] = await this.codec.decode<[T, number]>(v);
+        //
+        const data = this.serializer?.deserialize(rawData, key) ?? rawData;
+        super.enqueue(data, priority);
+        //
+      }
+    } catch (error) {
+      this.logger?.log(
+        `Failed to restore ${this.namespace}`,
+        { error },
+        "error"
+      );
+    }
+  }
+
+  async flush() {
+    if (this.pendingUpdates.size === 0) return;
+    await this.mutex.acquire();
+
+    try {
+      if (this.isCleared) {
+        await this.db.clear({
+          gt: `${this.namespace}!`,
+          lt: `${this.namespace}~`,
+        });
+
+        this.pendingUpdates.clear();
+        this.isCleared = false;
+        return;
+      }
+
+      const batch = this.db.batch();
+      const encodePromises: Promise<void>[] = [];
+
+      for (const [key, value] of this.pendingUpdates) {
+        if (value !== undefined) {
+          const [rawData, priority] = value;
+          const data = this.serializer?.serialize(rawData, key) ?? rawData;
+          encodePromises.push(
+            this.codec.encode([data, priority]).then((encoded) => {
+              batch.put(`${this.namespace}!${key}`, encoded);
+            })
+          );
+        } else {
+          batch.del(`${this.namespace}!${key}`);
+        }
+      }
+
+      await Promise.all(encodePromises);
+      await batch.write();
+      this.pendingUpdates.clear();
+    } catch (error) {
+      this.logger?.log(`Failed to flush ${this.namespace}`, { error }, "error");
+    } finally {
+      this.mutex.release();
+    }
+  }
+}
+interface IPersistedQueueFactory {
+  create<T, K extends string | number>(
+    _prefix: string,
+    keyRetriever: (entry: T) => K,
+    serializer?: ISerializable<T>,
+    maxSize?: number
+  ): PersistedQueue<T, K>;
+}
+class PersistedQueueFactory implements IPersistedQueueFactory {
+  constructor(
+    private topic: string,
+    private db: Level<string, Buffer>,
+    private codec: ICodec,
+    private flushManager: IFlushManager,
+    private logger?: ILogCollector
+  ) {}
+
+  create<T, K extends string | number>(
+    _prefix: string,
+    keyRetriever: (entry: T) => K,
+    serializer?: ISerializable<T>,
+    maxSize = Infinity
+  ) {
+    const prefix = `${this.topic}:${_prefix}`;
+    const map = new PersistedQueue<T, K>(
+      this.db,
+      prefix,
+      this.codec,
+      keyRetriever,
+      this.flushManager,
+      this.logger,
+      serializer,
+      maxSize
+    );
+
+    this.flushManager.register(map.flush);
+    return map;
+  }
+}
+
+//
+//
+//
+//
+//
+
 interface IMessageStorage<Data> {
   writeAll(message: Buffer, meta: MessageMetadata): Promise<number>;
   readAll(
@@ -490,6 +931,7 @@ interface IMessageStorage<Data> {
   ): Promise<Pick<MessageMetadata, K> | undefined>;
   updateMetadata(id: number, meta: Partial<MessageMetadata>): Promise<void>;
   flush(): Promise<void>;
+  getMetadata(): {};
 }
 // class LevelDBMessageStorage<Data> implements IMessageStorage<Data> {
 //   // separates metadata/messages buffers since we: 1. need read only data/metadata, 2. need update only metadata, 3. need often read metadata (retention timer)
@@ -741,6 +1183,10 @@ class MessageStorage<Data> implements IMessageStorage<Data> {
     ]);
   }
 
+  getMetadata() {
+    return {};
+  }
+
   async close() {
     clearInterval(this.flushTimer);
     clearInterval(this.retentionTimer);
@@ -814,259 +1260,6 @@ class MessageStorage<Data> implements IMessageStorage<Data> {
     }
   }
 }
-interface ISerializable<T = unknown, R = unknown> {
-  serialize(data: T): R;
-  deserialize(data: R): T;
-}
-class PersistedMap<K, V> extends Map<K, V> {
-  private dirtyKeys = new Set<K>();
-  private mutex = new Mutex();
-  private isCleared = false;
-
-  constructor(
-    private db: Level,
-    private prefix: string,
-    private codec: ICodec,
-    private serializer?: ISerializable<V>,
-    private maxSize = Infinity
-  ) {
-    super();
-    this.restore();
-  }
-
-  set(key: K, value: V) {
-    if (super.get(key) !== value) {
-      this.dirtyKeys.add(key);
-    }
-
-    this.evictIfFull();
-    return super.set(key, value);
-  }
-
-  delete(key: K) {
-    this.dirtyKeys.add(key);
-    return super.delete(key);
-  }
-
-  clear() {
-    this.isCleared = true;
-    return super.clear();
-  }
-
-  // misc
-  private evictIfFull(): void {
-    // LRU-style eviction (simplified)
-    if (this.size < this.maxSize) return;
-    const firstKey = this.keys().next().value;
-    this.delete(firstKey);
-  }
-
-  async restore() {
-    try {
-      for await (const [key, value] of this.db.iterator({
-        gt: `${this.prefix}!`,
-        lt: `${this.prefix}~`,
-      })) {
-        const restoredValue = await this.codec.decode<V>(value);
-        const restoredKey = key.slice(this.prefix.length + 1) as K;
-        const data = this.serializer?.deserialize(restoredKey) ?? restoredValue;
-        super.set(restoredKey, data);
-      }
-    } catch (e) {
-      console.error(`Failed to restore PersistedMap: ${e}`);
-    }
-  }
-
-  async flush() {
-    if (this.dirtyKeys.size === 0) return;
-
-    await this.mutex.acquire();
-    try {
-      if (this.isCleared) {
-        await this.db.clear({
-          gt: `${this.prefix}!`,
-          lt: `${this.prefix}~`,
-        });
-
-        this.dirtyKeys.clear();
-        this.isCleared = false;
-        return;
-      }
-
-      const batch = this.db.batch();
-      const encodePromises: Promise<void>[] = [];
-
-      for (const key of this.dirtyKeys) {
-        const value = super.get(key);
-
-        if (value !== undefined) {
-          encodePromises.push(
-            this.codec.encode(value).then((encoded) => {
-              const data = this.serializer?.serialize(encoded) ?? encoded;
-              batch.put(`${this.prefix}!${key}`, data);
-            })
-          );
-        } else {
-          batch.del(`${this.prefix}!${key}`);
-        }
-      }
-
-      await Promise.all(encodePromises);
-      await batch.write();
-      this.dirtyKeys.clear();
-    } catch (error) {
-      console.error(`Failed to flush PersistedMap: ${error}`);
-    } finally {
-      this.mutex.release();
-    }
-  }
-}
-class PersisteMapFactory {
-  constructor(
-    private topic: string,
-    private db: Level,
-    private codec: ICodec,
-    private flushManager?: FlushManager
-  ) {}
-
-  create<K, V>(
-    _prefix: string,
-    serializer?: ISerializable<V>,
-    maxSize = Infinity
-  ) {
-    const prefix = `${this.topic}:${_prefix}`;
-    const map = new PersistedMap<K, V>(
-      this.db,
-      prefix,
-      this.codec,
-      serializer,
-      maxSize
-    );
-    this.flushManager?.register(map);
-    return map;
-  }
-}
-class PersistedQueue<T> extends HighCapacityBinaryHeapPriorityQueue {
-  private pendingOps: Array<["enqueue" | "dequeue", T?]> = [];
-
-  constructor(
-    private db: Level,
-    private prefix: string,
-    private codec: ICodec,
-    private maxSize = Infinity,
-    flushManager?: FlushManager
-    // private QueueFactory: new () => IPriorityQueue<T>,
-  ) {
-    super();
-    this.restore();
-    flushManager?.register(this);
-  }
-
-  enqueue(item: T, priority?: number) {
-    this.queue.enqueue(item, priority);
-    this.pendingOps.push(["enqueue", item]);
-  }
-
-  dequeue() {}
-
-  // misc
-
-  async restore() {
-    const serialized = await this.db.get(`${this.prefix}!state`);
-    if (serialized) {
-      this.queue = deserialize(serialized);
-    }
-  }
-
-  async flush() {
-    if (this.pendingOps.length === 0) return;
-
-    await this.db.put(`${this.prefix}!state`, serialize(this.queue));
-    this.pendingOps = [];
-  }
-}
-//
-//
-//
-//
-//
-//
-
-class FlushManagerr {
-  private flushQueue: (() => Promise<void>)[] = [];
-  private pendingFlush = false;
-  private flushTimer?: number;
-
-  constructor(
-    private readonly flushIntervalMs = 500,
-    private readonly maxPendingWrites = 1000
-  ) {}
-
-  enqueue(task: () => Promise<void>): void {
-    this.flushQueue.push(task);
-    if (this.flushQueue.length >= this.maxPendingWrites) {
-      this.scheduleFlush();
-    }
-  }
-
-  scheduleFlush(delay = this.flushIntervalMs): void {
-    if (this.pendingFlush || !this.flushIntervalMs) return;
-    this.flushTimer = setTimeout(() => {
-      this.flushNow();
-    }, delay);
-  }
-
-  async flushNow(): Promise<void> {
-    if (this.pendingFlush) return;
-    this.pendingFlush = true;
-
-    const tasks = [...this.flushQueue];
-    this.flushQueue = [];
-
-    await Promise.all(tasks.map((task) => task()));
-    this.pendingFlush = false;
-  }
-
-  stop(): void {
-    clearTimeout(this.flushTimer);
-    this.flushNow();
-  }
-}
-class LogSegment {
-  private fd: number;
-  private offset = 0;
-
-  constructor(private filePath: string) {
-    this.fd = fs.openSync(filePath, "a");
-  }
-
-  static create(basePath: string, segmentId: number): LogSegment {
-    const filename = path.join(basePath, `segment-${segmentId}.log`);
-    return new LogSegment(filename);
-  }
-
-  append(message: Buffer): number {
-    const writeOffset = this.offset;
-    fs.writeSync(this.fd, message);
-    this.offset += message.length;
-    return writeOffset;
-  }
-
-  read(offset: number, length: number): Buffer {
-    const buffer = Buffer.alloc(length);
-    fs.readSync(this.fd, buffer, 0, length, offset);
-    return buffer;
-  }
-
-  close(): void {
-    fs.closeSync(this.fd);
-  }
-}
-interface MessageRecord {
-  id: number;
-  offset: number;
-  size: number;
-}
 class MessageStore {
   private currentSegment!: LogSegment;
   private indexDB: Level<string, MessageRecord>;
@@ -1109,6 +1302,11 @@ class MessageStore {
     return this.indexDB.flush();
   }
 }
+//
+//
+//
+//
+//
 //
 //
 //
@@ -1188,15 +1386,15 @@ class PipelineFactory<Data> implements IPipelineFactory<Data> {
     return pipeline;
   }
 }
-interface IDelayScheduler<Data> {
+interface IDelayMonitor<Data> {
   setReadyCallback(onReadyHandler: (data: Data) => Promise<void>): void;
   schedule(data: Data, readyTs: number): void;
   pendingsCount(): number;
   cleanup(): void;
 }
-class DelayScheduler<Data> implements IDelayScheduler<Data> {
-  private onReadyCallback: (data: Data) => Promise<void>;
-  private nextTimeout?: number;
+class DelayMonitor<Data> implements IDelayMonitor<Data> {
+  private onReadyCallback?: (data: Data) => Promise<void>;
+  private nextTimeout?: NodeJS.Timeout;
   private isProcessing = false;
 
   constructor(private queue: IPriorityQueue<[Data, number]>) {}
@@ -1231,7 +1429,7 @@ class DelayScheduler<Data> implements IDelayScheduler<Data> {
         const [data, readyTs] = this.queue.peek()!;
         if (readyTs > now) break; // second peak is not ready yet
         this.queue.dequeue();
-        this.onReadyCallback(data);
+        this.onReadyCallback?.(data);
       }
     } finally {
       this.isProcessing = false;
@@ -1255,18 +1453,18 @@ interface IDelayedMessageManager {
 }
 class DelayedMessageManager<Data> implements IDelayedMessageManager {
   constructor(
-    private messageScheduler: IDelayScheduler<number>,
+    private delayMonitor: IDelayMonitor<number>,
     private messageStorage: IMessageStorage<Data>,
     private messageRouter: IMessageRouter,
     private deliveryCounter: IDeliveryCounter,
     private logger?: ILogCollector
   ) {
-    messageScheduler.setReadyCallback(this.dequeue);
+    delayMonitor.setReadyCallback(this.dequeue);
   }
 
   enqueue(meta: MessageMetadata) {
     if (!meta.ttd) return;
-    this.messageScheduler.schedule(meta.id, meta.ts + meta.ttd);
+    this.delayMonitor.schedule(meta.id, meta.ts + meta.ttd);
   }
 
   private dequeue = async (messageId: number) => {
@@ -1281,48 +1479,45 @@ class DelayedMessageManager<Data> implements IDelayedMessageManager {
 
   getMetadata() {
     return {
-      count: this.messageScheduler.pendingsCount(),
+      count: this.delayMonitor.pendingsCount(),
     };
   }
 }
 interface IConsumerGroup {
-  addMember(id: string, routingKeys?: string[]): void;
-  removeMember(id: string): void;
+  name: string;
+  addMember(id: number, routingKeys?: string[]): void;
+  removeMember(id: number): void;
   hasMembers(): boolean;
   getMembers(
     messageId: number,
     correlationId?: string
-  ): Iterable<string> | undefined;
+  ): Iterable<number> | undefined;
   getName(): string | undefined;
-  getMemberRoutingKeys(id: string): Set<string> | undefined;
+  getMemberRoutingKeys(id: number): Array<string> | undefined;
   getMetadata(): {
     name: string;
     count: number;
   };
 }
 class ConsumerGroup implements IConsumerGroup {
-  private members: PersistedMap<string, Array<string>>;
+  private members: IPersistedMap<number, Array<string>>;
   constructor(
-    private name: string | undefined,
-    mapFactory: PersisteMapFactory,
+    public name: string = "non-grouped",
+    mapFactory: IPersistedMapFactory,
     private hashRing: IHashRing
   ) {
-    this.members = mapFactory.create<string, Array<string>>(
-      `groups:${name}:members`
-    );
+    this.members = mapFactory.create<number, Array<string>>(`members:${name}`);
   }
 
-  addMember(id: string, routingKeys?: string[]) {
-    const keysSet = new Set(routingKeys);
-
+  addMember(id: number, routingKeys?: string[]) {
     // for the group with defined groupId we need to enforce homogeneous routingKeys within the members
     if (this.name && this.members.size > 0) {
       const expectedKeys = this.members.values().next().value as
-        | Set<string>
+        | Array<string>
         | undefined;
       const isValid =
-        expectedKeys?.size === keysSet.size &&
-        [...keysSet].every((k) => expectedKeys.has(k));
+        expectedKeys?.length === routingKeys?.length &&
+        routingKeys?.every((k) => expectedKeys?.includes(k));
 
       if (!isValid) {
         throw new Error(
@@ -1332,10 +1527,10 @@ class ConsumerGroup implements IConsumerGroup {
     }
 
     this.hashRing.addNode(id);
-    this.members.set(id, routingKeys);
+    this.members.set(id, routingKeys || []);
   }
 
-  removeMember(id: string) {
+  removeMember(id: number) {
     this.hashRing.removeNode(id);
     this.members.delete(id);
   }
@@ -1347,7 +1542,7 @@ class ConsumerGroup implements IConsumerGroup {
   getMembers(
     messageId: number,
     correlationId?: string
-  ): Iterable<string> | undefined {
+  ): Iterable<number> | undefined {
     if (this.name || correlationId) {
       return this.hashRing.getNode(correlationId || messageId.toString());
     }
@@ -1358,20 +1553,20 @@ class ConsumerGroup implements IConsumerGroup {
     return this.name;
   }
 
-  getMemberRoutingKeys(id: string) {
+  getMemberRoutingKeys(id: number) {
     return this.members.get(id);
   }
 
   getMetadata() {
     return {
-      name: this.name || "non-grouped",
+      name: this.name,
       count: this.members.size,
     };
   }
 }
 interface IMessageRouter {
-  addConsumer(id: string, groupId?: string, routingKeys?: string[]): void;
-  removeConsumer(id: string): void;
+  addConsumer(id: number, groupId?: string, routingKeys?: string[]): void;
+  removeConsumer(id: number): void;
   route(meta: MessageMetadata): Promise<number>;
   routeBatch(metas: MessageMetadata[]): Promise<number[]>;
   getMetadata(): {
@@ -1382,15 +1577,29 @@ interface IMessageRouter {
   };
 }
 class MessageRouter<Data> implements IMessageRouter {
-  private consumerGroups = new Map<string | undefined, IConsumerGroup>();
-  // private groups: PersistedMap<string | undefined, IConsumerGroup>;
+  private consumerGroups: IPersistedMap<string, IConsumerGroup>;
 
   constructor(
+    private mapFactory: IPersistedMapFactory,
     private clientManager: IClientManager,
     private queueManager: IQueueManager,
     private subscriptionManager: ISubscriptionManager<Data>,
     private dlqManager: IDLQManager<Data>
-  ) {}
+  ) {
+    this.consumerGroups = mapFactory.create<string, IConsumerGroup>(`groups`, {
+      serialize: (group: IConsumerGroup) => group.name,
+      deserialize: (groupId: string) =>
+        new ConsumerGroup(
+          groupId,
+          this.mapFactory,
+          new InMemoryHashRing(
+            new SHA256HashService(),
+            this.mapFactory,
+            groupId
+          )
+        ),
+    });
+  }
 
   getMetadata() {
     return {
@@ -1400,19 +1609,27 @@ class MessageRouter<Data> implements IMessageRouter {
     };
   }
 
-  addConsumer(id: string, groupId?: string, routingKeys?: string[]) {
+  addConsumer(id: number, groupId = "no_group", routingKeys?: string[]) {
     if (!this.consumerGroups.has(groupId)) {
-      const hashRing = new InMemoryHashRing(new SHA256HashService());
-      this.consumerGroups.set(groupId, new ConsumerGroup(groupId, hashRing));
+      const hashRing = new InMemoryHashRing(
+        new SHA256HashService(),
+        this.mapFactory,
+        groupId
+      );
+      this.consumerGroups.set(
+        groupId,
+        new ConsumerGroup(groupId, this.mapFactory, hashRing)
+      );
     }
 
     this.consumerGroups.get(groupId)!.addMember(id, routingKeys);
   }
 
-  removeConsumer(id: string) {
+  removeConsumer(id: number) {
     for (const [name, group] of this.consumerGroups.entries()) {
-      group.removeMember(consumerId);
+      group.removeMember(id);
       if (!group.hasMembers()) {
+        group;
         this.consumerGroups.delete(name);
       }
     }
@@ -1505,12 +1722,12 @@ class MessageRouter<Data> implements IMessageRouter {
 
     // filtered-out
     const expectedKeys = group.getMemberRoutingKeys(consumerId);
-    return !expectedKeys?.size || expectedKeys.has(routingKey!);
+    return !expectedKeys?.length || expectedKeys.indexOf(routingKey!) !== -1;
   }
 }
 interface IPublishingService {
   publish(
-    producerId: string,
+    producerId: number,
     message: Buffer,
     meta: MessageMetadata
   ): Promise<void>;
@@ -1539,7 +1756,7 @@ class PublishingService<Data> implements IPublishingService {
   ) {}
 
   async publish(
-    producerId: string,
+    producerId: number,
     message: Buffer,
     meta: MessageMetadata
   ): Promise<void> {
@@ -1564,7 +1781,7 @@ class PublishingService<Data> implements IPublishingService {
     return {
       router: this.messageRouter.getMetadata(),
       delayedMessages: this.delayedManager.getMetadata(),
-      // metadata from messageStorage
+      storage: this.messageStorage.getMetadata(),
     };
   }
 }
@@ -1589,18 +1806,35 @@ interface IQueueManager {
   };
 }
 class QueueManager implements IQueueManager {
-  // TODO: persist
-  private queues = new Map<number, IPriorityQueue<number>>();
-  private totalQueuedMessages: 0;
+  private queues: IPersistedMap<number, IPersistedQueue<number>>;
+  private totalQueuedMessages = 0;
 
-  constructor(private queueFactory: new () => IPriorityQueue<number>) {}
+  constructor(
+    mapFactory: IPersistedMapFactory,
+    private queueFactory: IPersistedQueueFactory
+  ) {
+    this.queues = mapFactory.create<number, IPersistedQueue<number>>(`queues`, {
+      serialize: (_: unknown, key: string) => key,
+      deserialize: (data: string) =>
+        this.queueFactory.create(`queue:${data}`, (entry: number) => entry),
+    });
+  }
 
   addQueue(id: number) {
-    this.queues.set(id, new this.queueFactory());
+    const queue = this.queueFactory.create(
+      `queue:${id}`,
+      (entry: number) => entry
+    );
+    this.queues.set(id, queue);
   }
 
   removeQueue(id: number) {
-    this.queues.delete(id);
+    const queue = this.queues.get(id);
+    if (!queue) return;
+    queue.clear();
+    queue.flush().then(() => {
+      this.queues.delete(id);
+    });
   }
 
   enqueue(id: number, meta: MessageMetadata) {
@@ -1678,7 +1912,7 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
 //
 //
 // SRC/ACK_SERVICE.TS
-interface IPendingAcks {
+interface IPendingAcks extends ISerializable {
   addPending(consumerId: number, messageId: number): void;
   getPendings(consumerId: number): Map<number, number> | undefined;
   getAllPendings(): Map<number, Map<number, number>>;
@@ -1689,17 +1923,25 @@ interface IPendingAcks {
   };
 }
 class PendingAcks implements IPendingAcks {
-  // TODO: persist
   private pendingAcks: PersistedMap<number, Map<number, number>>;
 
   constructor(
-    mapFactory: PersisteMapFactory,
+    mapFactory: IPersistedMapFactory,
     private clientManager: IClientManager,
     private maxUnackedPerConsumer = 10
   ) {
     this.pendingAcks = mapFactory.create<number, Map<number, number>>(
-      "pending_acks"
+      "pending_acks",
+      this
     );
+  }
+
+  serialize(data: Map<number, number>): [number, number][] {
+    return Array.from(data);
+  }
+
+  deserialize(data: [number, number][]): Map<number, number> {
+    return new Map(data);
   }
 
   isReachedMaxUnacked(consumerId: number) {
@@ -1777,7 +2019,7 @@ class DeliveryCounter<Data> implements IDeliveryCounter {
   private deliveries: PersistedMap<number, number>;
 
   constructor(
-    mapFactory: PersisteMapFactory,
+    mapFactory: IPersistedMapFactory,
     private messageStorage: IMessageStorage<Data>,
     private metrics: IMetricsCollector
   ) {
@@ -1810,8 +2052,8 @@ interface IAckMonitor {
   stop(): void;
 }
 class AckMonitor implements IAckMonitor {
-  private onTimeoutCallback: AckTimeoutHandler;
-  private timer?: number;
+  private onTimeoutCallback?: AckTimeoutHandler;
+  private timer?: NodeJS.Timeout;
 
   constructor(
     private pendingAcks: IPendingAcks,
@@ -2111,7 +2353,7 @@ class DLQManager<Data> implements IDLQManager<Data> {
 
   constructor(
     private topic: string,
-    mapFactory: PersisteMapFactory,
+    mapFactory: IPersistedMapFactory,
     private messageStorage: IMessageStorage<any>,
     private logger?: ILogCollector
   ) {
@@ -2224,7 +2466,7 @@ class DLQService<Data> implements IDLQService<Data> {
 // SRC/CLIENT_MANAGEMENT_SERVICE.TS
 type ClientType = "producer" | "consumer" | "dlq_consumer";
 interface IClientState {
-  id: string;
+  id: number;
   clientType: ClientType;
   registeredAt: number;
   lastActiveAt: number;
@@ -2235,16 +2477,16 @@ interface IClientState {
   avgProcessingTime: number;
   pendingAcks: number;
 }
-interface IClientManager {
-  addClient(type: ClientType, id: string): IClientState;
-  removeClient(id: string): number;
+interface IClientManager extends ISerializable {
+  addClient(type: ClientType, id: number): IClientState | undefined;
+  removeClient(id: number): number;
   getClients(filter?: (client: IClientState) => boolean): Set<IClientState>;
-  getClient(id: string): IClientState | undefined;
-  throwIfExists(id: string): void;
-  validateClient(id: string, expectedType?: ClientType): void;
-  isOperable(id: string, now: number): boolean;
-  isIdle(id: string): boolean;
-  recordActivity(id: string, activityRecord: Partial<IClientState>): void;
+  getClient(id: number): IClientState | undefined;
+  throwIfExists(id: number): void;
+  validateClient(id: number, expectedType?: ClientType): void;
+  isOperable(id: number, now: number): boolean;
+  isIdle(id: number): boolean;
+  recordActivity(id: number, activityRecord: Partial<IClientState>): void;
   getMetadata(): {
     count: number;
     producersCount: number;
@@ -2256,16 +2498,38 @@ interface IClientManager {
   };
 }
 class ClientManager implements IClientManager {
-  private clients = new Map<string, IClientState>();
+  private clients: IPersistedMap<number, IClientState>;
 
   constructor(
+    mapFactory: IPersistedMapFactory,
     private inactivityThresholdMs = 300_000,
     private processingTimeThresholdMs = 50_000,
     private pendingThresholdMs = 100
-  ) {}
+  ) {
+    this.clients = mapFactory.create<number, IClientState>("clients", this);
+  }
 
-  addClient(type: ClientType, id: string) {
+  serialize(state: IClientState): Partial<IClientState> {
+    const { lastActiveAt, ...rest } = state;
+    return rest;
+  }
+
+  deserialize(state: Omit<IClientState, "lastActiveAt">): IClientState {
+    return { ...state, lastActiveAt: Date.now() };
+  }
+
+  addClient(type: ClientType, id: number) {
     const now = Date.now();
+    const client = this.getClient(id);
+
+    if (client) {
+      this.recordActivity(id, {
+        status: "active",
+      });
+
+      return;
+    }
+
     this.clients.set(id, {
       registeredAt: now,
       lastActiveAt: now,
@@ -2278,18 +2542,12 @@ class ClientManager implements IClientManager {
       id,
     });
 
-    this[`total${type[0].toUpperCase() + type.slice(1)}s`]++;
     return this.clients.get(id)!;
   }
 
-  removeClient(id: string) {
+  removeClient(id: number) {
     const client = this.clients.get(id);
-    if (client) {
-      const type = client.clientType;
-
-      this[`total${type[0].toUpperCase() + type.slice(1)}s`]--;
-      this.clients.delete(id);
-    }
+    if (client) this.clients.delete(id);
     return this.clients.size;
   }
 
@@ -2303,17 +2561,17 @@ class ClientManager implements IClientManager {
     return results;
   }
 
-  getClient(id: string) {
+  getClient(id: number) {
     return this.clients.get(id);
   }
 
-  throwIfExists(id: string) {
+  throwIfExists(id: number) {
     if (this.clients.has(id)) {
       throw new Error(`Client ID ${id} already exists`);
     }
   }
 
-  validateClient(id: string, expectedType?: ClientType) {
+  validateClient(id: number, expectedType?: ClientType) {
     const metadata = this.clients.get(id);
     if (!metadata) {
       throw new Error(`Client with ID ${id} not found`);
@@ -2323,31 +2581,36 @@ class ClientManager implements IClientManager {
     }
   }
 
-  isOperable(id: string, now: number) {
+  isOperable(id: number, now: number) {
     const client = this.getClient(id);
     if (!client) return false;
     if (client.status == "lagging") return false;
-    if (client.avgProcessingTime > this.processingTimeThresholdMs) return false;
+    if (client.avgProcessingTime > this.processingTimeThresholdMs) {
+      return false;
+    }
     if (client.pendingAcks > this.pendingThresholdMs) return false;
     return now - client.lastActiveAt < this.inactivityThresholdMs;
   }
 
-  isIdle(id: string) {
+  isIdle(id: number) {
     const client = this.getClient(id);
     if (!client) return false;
     return client.status === "idle";
   }
 
-  recordActivity(id: string, activityRecord: Partial<IClientState>) {
+  recordActivity(id: number, activityRecord: Partial<IClientState>) {
     if (!this.clients.has(id)) return;
     const client = this.clients.get(id)!;
     client.lastActiveAt = Date.now();
 
-    for (let key in activityRecord) {
-      if (typeof client[key] != "number") {
-        client[key] = activityRecord[key];
-      } else {
-        client[key] = client[key] + activityRecord[key];
+    for (const k in activityRecord) {
+      const key = k as keyof IClientState;
+      const value = activityRecord[key];
+
+      if (typeof client[key] === "number" && typeof value === "number") {
+        (client[key] as number) = client[key] + value;
+      } else if (typeof client[key] === "string" && typeof value === "string") {
+        (client[key] as string) = value;
       }
     }
 
@@ -2395,6 +2658,7 @@ interface IPublishResult {
   error?: string;
 }
 interface IProducer<Data> {
+  id: number;
   publish(batch: Data[], metadata?: MetadataInput): Promise<IPublishResult[]>;
 }
 class Producer<Data> implements IProducer<Data> {
@@ -2402,7 +2666,7 @@ class Producer<Data> implements IProducer<Data> {
     private readonly publishingService: IPublishingService,
     private readonly messageFactory: IMessageFactory<Data>,
     private readonly topicName: string,
-    private readonly id: number
+    public readonly id: number
   ) {}
 
   async publish(batch: Data[], metadata: MetadataInput = {}) {
@@ -2424,7 +2688,7 @@ class Producer<Data> implements IProducer<Data> {
       }
 
       try {
-        await this.publishingService.publish(this.id, message, meta);
+        await this.publishingService.publish(this.id, message!, meta);
         results.push({ id, ts, status: "success" });
       } catch (err) {
         const error = err instanceof Error ? err.message : "Unknown error";
@@ -2480,6 +2744,7 @@ interface IConsumerConfig {
   autoAck?: boolean;
 }
 interface IConsumer<Data> {
+  id: number;
   consume(): Promise<Data[]>;
   ack(messageId?: number): Promise<number[]>;
   nack(messageId?: number, requeue?: boolean): Promise<number>;
@@ -2492,7 +2757,7 @@ class Consumer<Data> implements IConsumer<Data> {
     private readonly consumptionService: IConsumptionService<Data>,
     private readonly ackService: IAckService,
     private readonly subscriptionService: ISubscriptionService<Data>,
-    private readonly id: number,
+    public readonly id: number,
     private readonly autoAck = false,
     limit?: number
   ) {
@@ -2531,6 +2796,7 @@ class Consumer<Data> implements IConsumer<Data> {
   }
 }
 interface IDLQConsumer<Data> {
+  id: number;
   consume(): Promise<IDLQEntry<Data>[]>;
   replayDlq(
     handler: (message: Data, meta: MessageMetadata) => Promise<void>,
@@ -2542,7 +2808,7 @@ class DLQConsumer<Data> implements IDLQConsumer<Data> {
   private reader: AsyncGenerator<IDLQEntry<Data>, void, unknown>;
   constructor(
     private readonly dlqService: IDLQService<Data>,
-    private readonly id: number,
+    public readonly id: number,
     limit?: number
   ) {
     this.limit = Math.max(1, limit!);
@@ -2579,7 +2845,7 @@ class DLQConsumer<Data> implements IDLQConsumer<Data> {
 }
 interface IClientManagementService<Data> {
   createProducer(): IProducer<Data>;
-  createConsumer(config?: IConsumerConfig): IConsumer<Data>;
+  createConsumer(config?: IConsumerConfig, id?: number): IConsumer<Data>;
   createDLQConsumer(limit?: number): DLQConsumer<Data>;
   deleteClient(id: number): void;
   getMetadata(): {
@@ -2614,8 +2880,8 @@ class ClientManagementService<Data> implements IClientManagementService<Data> {
   }
 
   createConsumer(
-    id = uniqueIntGenerator(),
-    config: IConsumerConfig = {}
+    config: IConsumerConfig = {},
+    id = uniqueIntGenerator()
   ): IConsumer<Data> {
     this.clientManager.throwIfExists(id);
     const { groupId, routingKeys, autoAck, limit } = config;
@@ -2725,7 +2991,6 @@ interface ITopicConfig {
   consumerInactivityThresholdMs?: number; // 600_000;
   consumerProcessingTimeThresholdMs?: number;
   consumerPendingThresholdMs?: number;
-  // maxUnackedMessagesPerConsumer?: number;
   // partitions?: number;
   // archivalThresholdMs?: number; // 100_000
 }
@@ -2830,10 +3095,10 @@ class TopicFactory implements ITopicFactory {
       persistThresholdMs: 1000,
       retentionMs: 86_400_000, // 1 day
       maxDeliveryAttempts: 5,
-      maxUnackedMessagesPerConsumer: 10,
+      consumerPendingThresholdMs: 10,
     },
     private codecFactory: new () => ICodec = ThreadedBinaryCodec,
-    private queueFactory: new () => IPriorityQueue = HighCapacityBinaryHeapPriorityQueue,
+    private queueFactory: new () => IPriorityQueue = BinaryHeapPriorityQueue,
     private storageFactory: new (
       ...args
     ) => IMessageStorage<unknown> = LevelDBMessageStorage,
@@ -2867,7 +3132,7 @@ class TopicFactory implements ITopicFactory {
 
     const pendingAcks = new PendingAcks(
       clientManager,
-      mergedConfig.maxUnackedMessagesPerConsumer
+      mergedConfig.consumerPendingThresholdMs
     );
     const subscriptionManager = new SubscriptionManager<Data>(
       clientManager,
@@ -2885,7 +3150,7 @@ class TopicFactory implements ITopicFactory {
       dlqManager
     );
     const delayedManager = new DelayedMessageManager<Data>(
-      new DelayScheduler<number>(new this.queueFactory()),
+      new TimeoutScheduler<number>(new this.queueFactory()),
       messageStorage,
       messageRouter,
       deliveryCounter,
@@ -3065,16 +3330,21 @@ class LogService implements ILogService {
   }
 }
 interface ISchemaRegistry extends ISerializable {
-  register<Data>(name: string, schema: JSONSchemaType<Data>): string;
-  getValidator(schema: string): ((data: any) => boolean) | undefined;
-  remove(schema: string): void;
+  register(name: string, schema: JSONSchemaType<any>): string;
+  getValidator(schemaRef: string): ((data: any) => boolean) | undefined;
+  getSchema<Data>(schemaRef: string): JSONSchemaType<Data> | undefined;
+  remove(schemaRef: string): void;
+  listSchemas(): string[];
 }
 class SchemaRegistry implements ISchemaRegistry {
-  // TODO: persist
-  private validators: PersistedMap<string, Map<number, (data: any) => boolean>>;
+  private schemas: PersistedMap<string, Map<number, JSONSchemaType<any>>>;
+  private validatorCache = new Map<
+    string,
+    Map<number, (data: any) => boolean>
+  >();
   private ajv: Ajv;
 
-  constructor(mapFactory: PersisteMapFactory, options?: Ajv.Options) {
+  constructor(mapFactory: IPersistedMapFactory, options?: AjvOptions) {
     this.ajv = new Ajv({
       allErrors: true,
       coerceTypes: false,
@@ -3082,38 +3352,86 @@ class SchemaRegistry implements ISchemaRegistry {
       code: { optimize: true, esm: true },
       ...options,
     });
-    this.validators = mapFactory.create("validators", this);
+
+    this.schemas = mapFactory.create("schemas", this);
   }
 
-  serialize(validatorMap: Map<number, (data: any) => boolean>) {}
+  serialize(
+    schemaMap: Map<number, JSONSchemaType<any>>
+  ): [number, JSONSchemaType<any>][] {
+    return Array.from(schemaMap.entries());
+  }
 
-  desialize() {}
-
-  register<Data>(name: string, schema: JSONSchemaType<Data>): string {
-    if (!this.validators.has(name)) {
-      this.validators.set(name, new Map());
+  deserialize(
+    data: [number, JSONSchemaType<any>][],
+    schema: string
+  ): Map<number, JSONSchemaType<any>> {
+    const map = new Map();
+    for (const [k, v] of data) {
+      map.set(k, v);
+      this.validatorCache.get(schema)!.set(k, this.ajv.compile(v));
     }
-    const validators = this.validators.get(name)!;
-    const version = validators.size + 1;
-    validators.set(version, this.ajv.compile(schema));
+    return map;
+  }
+
+  register(name: string, schema: JSONSchemaType<any>): string {
+    if (!this.schemas.has(name)) {
+      this.schemas.set(name, new Map());
+    }
+
+    const schemaVersions = this.schemas.get(name)!;
+    const version = schemaVersions.size + 1;
+    schemaVersions.set(version, schema);
+
+    // Add to validator cache
+    if (!this.validatorCache.has(name)) {
+      this.validatorCache.set(name, new Map());
+    }
+    this.validatorCache.get(name)!.set(version, this.ajv.compile(schema));
+
     return `${name}:${version}`;
   }
 
-  getValidator(schema: string): ((data: any) => boolean) | undefined {
-    let version = +schema.split(":")[1];
-    if (Number.isNaN(version) || version === 0) version = 1;
+  getValidator(schemaRef: string): ((data: any) => boolean) | undefined {
+    const [name, versionStr] = schemaRef.split(":");
+    const version = parseInt(versionStr, 10);
 
-    return this.validators.get(schema)?.get(version);
+    if (Number.isNaN(version) || version <= 0) return undefined;
+
+    return this.validatorCache.get(name)?.get(version);
   }
 
-  remove(schema: string): void {
-    this.validators.delete(schema);
+  getSchema<Data>(schemaRef: string): JSONSchemaType<Data> | undefined {
+    const [name, versionStr] = schemaRef.split(":");
+    const version = parseInt(versionStr, 10);
+
+    if (Number.isNaN(version) || version <= 0) return undefined;
+
+    const schemaMap = this.schemas.get(name);
+    return schemaMap?.get(version) as JSONSchemaType<Data>;
+  }
+
+  remove(schemaRef: string): void {
+    const [name] = schemaRef.split(":");
+    this.schemas.delete(name);
+    this.validatorCache.delete(name);
+  }
+
+  listSchemas(): string[] {
+    return Array.from(this.schemas.keys()).map((name) => `${name}:latest`);
   }
 }
-class TopicRegistry {
+interface ITopicRegistry extends ISerializable {
+  create<Data>(name: string, config: ITopicConfig): ITopic<Data>;
+  get(name: string): ITopic<any> | undefined;
+  delete(name: string): void;
+  list(): MapIterator<string>;
+}
+class TopicRegistry implements ITopicRegistry {
   private topics: PersistedMap<string, ITopic<any>>;
+
   constructor(
-    mapFactory: PersisteMapFactory,
+    mapFactory: IPersistedMapFactory,
     private topicFactory: ITopicFactory,
     private logService?: ILogService
   ) {
@@ -3162,6 +3480,7 @@ class TopicRegistry {
   }
 }
 
+// go to lmdb or rocksdb
 // make all deletable/disposable
 // custom errs: new ValidationError()
 // project structure

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import type { IPersistedMap, IPersistedMapFactory, ISerializable } from ".";
 
 export interface IHashService {
   hash(key: string): number;
@@ -11,11 +12,11 @@ export class SHA256HashService implements IHashService {
   }
 }
 
-export interface IHashRing {
-  addNode(id: string): void;
-  removeNode(id: string): void;
+export interface IHashRing extends ISerializable {
+  addNode(id: number): void;
+  removeNode(id: number): void;
   getNodeCount(): number;
-  getNode(key: string): Generator<string, void, unknown>;
+  getNode(key: string): Generator<number, void, unknown>;
 }
 
 /** Hash ring.
@@ -23,17 +24,34 @@ export interface IHashRing {
  * Sorted nodes in a ring: [**100(A)**, _180(user-123 key hash always belong to the B)_, **200(B)**, **300(A)**, **400(B)**, **500(A)**, **600(B)**]
  */
 export class InMemoryHashRing implements IHashRing {
-  private sortedHashes: number[] = [];
-  private hashToNodeMap = new Map<number, string>(); // Changed from number to string
-  private nodeIds = new Set<string>(); // Changed from number to string
+  private hashToNodeMap: IPersistedMap<number, number>;
+  private sortedHashes: number[] = []; // must be array
+  private nodeIds = new Set<number>();
 
   constructor(
     private hashService: IHashService,
+    mapFactory: IPersistedMapFactory,
+    label: string,
     private replicas = 3
-  ) {}
+  ) {
+    this.hashToNodeMap = mapFactory.create<number, number>(
+      `hashToNodeMap:${label}`,
+      this
+    );
+  }
 
-  addNode(id: string): void {
-    // Changed from number to string
+  serialize(node: number): number {
+    return node;
+  }
+
+  deserialize(node: number, hash: number): number {
+    this.nodeIds.add(node);
+    this.sortedHashes.push(hash);
+    this.sortedHashes.sort((a, b) => a - b);
+    return node;
+  }
+
+  addNode(id: number): void {
     if (this.nodeIds.has(id)) return;
 
     for (let i = 0; i < this.replicas; i++) {
@@ -47,8 +65,7 @@ export class InMemoryHashRing implements IHashRing {
     this.nodeIds.add(id);
   }
 
-  removeNode(id: string): void {
-    // Changed from number to string
+  removeNode(id: number): void {
     const hashesToRemove: number[] = [];
     this.hashToNodeMap.forEach((nodeId, hash) => {
       if (nodeId === id) {
@@ -71,8 +88,7 @@ export class InMemoryHashRing implements IHashRing {
     return this.nodeIds.size;
   }
 
-  *getNode(key: string): Generator<string, void, unknown> {
-    // Changed return type to string
+  *getNode(key: string): Generator<number, void, unknown> {
     if (this.sortedHashes.length === 0) {
       throw new Error("No nodes available in the hash ring");
     }
