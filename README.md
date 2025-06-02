@@ -16,7 +16,8 @@ Designed for high scalability and reliability within a Nodejs monolith/msa.
 - `Consumption`: Consumers pull or subscribe (push) to messages from topics.
 - `Routing`: Based on consumer groups, correlation IDs, and routing keys (semantic routing).
 - `Queue fanout`: uses queue per consumer for message distribution. In contrary with virtual offsets it allows message priority, delay and other features.
-- `Delivery guaranties`: At-most-once (autoAck), At-least-once (manual ack)
+- `Delivery guaranties`: At-most-once (noAck) and At-least-once(manual ack) as RabbitMQ, AWS AQS, Azure Service Bus, Google Pub/Sub, NATS JetStream.
+- `Vs Kafka`: Besides being a message broker and Kafka being an high-perfomance event stream, they also differ in that: Kafka is Exactly-Once (idempotent processing, transactional writes, deduplication), Kafka has no message priority, no delayed delivery, and no DLQ.
 - `Acknowledgment`(ACK/NACK): Ensures reliable message processing in autoAck=false mode.
 - `Dead Letter Queue` (DLQ): For failed or expired messages, support replay
 - `Delayed Message`(Time To Delay) Delivery: Messages can be scheduled to become available after a delay.

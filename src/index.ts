@@ -16,6 +16,7 @@ import {
 } from "./hash_ring";
 import { uniqueIntGenerator } from "./utils";
 import { Mutex } from "./mutex";
+import { validateSchema } from "json-schema-compatibility";
 //
 //
 //
@@ -208,7 +209,7 @@ class PersistedMap<K extends string | number, V>
     codec: ICodec,
     flushManager?: IFlushManager,
     logger?: ILogCollector,
-    private serializer?: ISerializable<V>,
+    private valueSerializer?: ISerializable<V>,
     private maxSize = Infinity
   ) {
     super(db, namespace, codec, flushManager, logger);
@@ -270,9 +271,10 @@ class PersistedMap<K extends string | number, V>
 
   override async restoreItem(key: K, value: Buffer): Promise<void> {
     const decoded = await this.codec.decode<V>(value);
-    const deserialized =
-      this.serializer?.deserialize(decoded, key as K) ?? decoded;
-    this.map.set(key, deserialized);
+    this.map.set(
+      key,
+      this.valueSerializer?.deserialize(decoded, key as K) ?? decoded
+    );
   }
 
   override isFlushSkipped(): boolean {
@@ -289,8 +291,10 @@ class PersistedMap<K extends string | number, V>
       if (value == undefined) {
         yield [key, undefined] as const;
       } else {
-        const serialized = this.serializer?.serialize(value, key) ?? value;
-        yield [key, serialized] as const;
+        yield [
+          key,
+          this.valueSerializer?.serialize(value, key) ?? value,
+        ] as const;
       }
     }
   }
@@ -298,7 +302,7 @@ class PersistedMap<K extends string | number, V>
 export interface IPersistedMapFactory {
   create<K extends string | number, V>(
     name: string,
-    serializer?: ISerializable<V>
+    valueSerializer?: ISerializable<V>
   ): PersistedMap<K, V>;
 }
 class PersistedMapFactory implements IPersistedMapFactory {
@@ -312,7 +316,7 @@ class PersistedMapFactory implements IPersistedMapFactory {
 
   create<K extends string | number, V>(
     name: string,
-    serializer?: ISerializable<V>
+    valueSerializer?: ISerializable<V>
   ) {
     return new PersistedMap<K, V>(
       this.db,
@@ -320,7 +324,7 @@ class PersistedMapFactory implements IPersistedMapFactory {
       this.codec,
       this.flushManager,
       this.logger,
-      serializer,
+      valueSerializer,
       this.maxSize
     );
   }
@@ -337,13 +341,13 @@ class PersistedQueue<T, K extends string | number>
 
   constructor(
     db: Level<string, Buffer>,
-    namespace: string,
+    public namespace: string,
     codec: ICodec,
     private queue: IPriorityQueue<T>,
     private keyRetriever: (entry: T) => K,
     flushManager?: IFlushManager,
     logger?: ILogCollector,
-    private serializer?: ISerializable<T>,
+    private valueSerializer?: ISerializable<T>,
     private maxSize = Infinity
   ) {
     super(db, namespace, codec, flushManager, logger);
@@ -393,8 +397,10 @@ class PersistedQueue<T, K extends string | number>
 
   override async restoreItem(key: K, value: Buffer): Promise<void> {
     const [rawData, priority] = await this.codec.decode<[T, number]>(value);
-    const data = this.serializer?.deserialize(rawData, key) ?? rawData;
-    this.queue.enqueue(data, priority);
+    this.queue.enqueue(
+      this.valueSerializer?.deserialize(rawData, key) ?? rawData,
+      priority
+    );
   }
 
   override isFlushSkipped(): boolean {
@@ -411,8 +417,10 @@ class PersistedQueue<T, K extends string | number>
         yield [key, undefined] as const;
       } else {
         const [data, priority] = value;
-        const serialized = this.serializer?.serialize(data, key) ?? data;
-        yield [key, [serialized, priority]] as const;
+        yield [
+          key,
+          [this.valueSerializer?.serialize(data, key) ?? data, priority],
+        ] as const;
       }
     }
   }
@@ -421,7 +429,7 @@ interface IPersistedQueueFactory {
   create<T, K extends string | number>(
     name: string,
     keyRetriever: (entry: T) => K,
-    serializer?: ISerializable<T>
+    valueSerializer?: ISerializable<T>
   ): PersistedQueue<T, K>;
 }
 class PersistedQueueFactory implements IPersistedQueueFactory {
@@ -437,7 +445,7 @@ class PersistedQueueFactory implements IPersistedQueueFactory {
   create<T, K extends string | number>(
     name: string,
     keyRetriever: (entry: T) => K,
-    serializer?: ISerializable<T>
+    valueSerializer?: ISerializable<T>
   ) {
     return new PersistedQueue<T, K>(
       this.db,
@@ -447,9 +455,21 @@ class PersistedQueueFactory implements IPersistedQueueFactory {
       keyRetriever,
       this.flushManager,
       this.logger,
-      serializer,
+      valueSerializer,
       this.maxSize
     );
+  }
+}
+class PersistedQueueSerializer<T> implements ISerializable {
+  constructor(
+    private queueFactory: IPersistedQueueFactory,
+    private keyRetriever: (entry: T) => string | number
+  ) {}
+  serialize(_: unknown, key: string) {
+    return key;
+  }
+  deserialize(name: string) {
+    return this.queueFactory.create(`queue!${name}`, this.keyRetriever);
   }
 }
 //
@@ -589,7 +609,7 @@ interface IWriteAheadLog {
   read(offset: number, length: number): Promise<Buffer | void>;
   truncate(upToOffset: number): Promise<void>;
   close(): Promise<void>;
-  getMetadata(): Promise<{
+  getMetrics(): Promise<{
     fileSize: number | undefined;
     batchSize: number;
     batchCount: number;
@@ -708,7 +728,7 @@ class WriteAheadLog implements IWriteAheadLog {
     await this.fileHandle.close();
   }
 
-  async getMetadata() {
+  async getMetrics() {
     const stats = await this.fileHandle?.stat();
     return {
       fileSize: stats?.size,
@@ -1183,7 +1203,7 @@ interface IMessageLog {
     pointers: ISegmentRecord[]
   ): Promise<void>;
   close(): Promise<void>;
-  getMetadata(): Promise<{
+  getMetrics(): Promise<{
     totalSize: number;
     messageCount: number;
     currentSegmentId: number | undefined;
@@ -1236,7 +1256,7 @@ class MessageLog implements IMessageLog {
     await this.segmentManager.close();
   }
 
-  async getMetadata() {
+  async getMetrics() {
     const segments = this.segmentManager.getAllSegments();
     const currentSegmentId = this.segmentManager.getCurrentSegment()?.id;
     const [totalSize, messageCount] = segments.reduce(
@@ -1256,7 +1276,7 @@ class MessageLog implements IMessageLog {
     };
   }
 }
-// message_storage
+// message_store
 interface IWALReplayer {
   replay(): Promise<void>;
 }
@@ -1298,7 +1318,7 @@ class WALReplayer implements IWALReplayer {
         const pointer = await this.log.append(messageBuffer);
         if (!pointer) break;
 
-        const pointerBuffer = await this.codec.encode(pointer);
+        const pointerBuffer = await this.codec.encodePointer(pointer);
         await this.db.batch([
           { type: "put", key: `meta!${meta.id}`, value: metaBuffer },
           { type: "put", key: `ptr!${meta.id}`, value: pointerBuffer },
@@ -1329,7 +1349,8 @@ class MessageWriter implements IMessageWriter {
     private log: IMessageLog,
     private db: Level<string, Buffer>,
     private codec: ICodec,
-    private logger?: ILogCollector
+    private logger?: ILogCollector,
+    private maxMessageTTLMs = 3_600_000_000
   ) {}
 
   async write(
@@ -1362,14 +1383,19 @@ class MessageWriter implements IMessageWriter {
       const pointer = await this.log.append(message);
       if (!pointer) throw new Error("Failed writing to MessageLog");
 
-      // 3. Store metadata & pointers in db.
+      // 3. Store metadata, pointers and ttl in db.
       // Why pointers are not part of metadata: metadata is often changed, with smaller values Level is faster
       // TODO: this.codec.encodePointer(pointer)
-      const pointerBuffer = await this.codec.encode(pointer);
+      const pointerBuffer = await this.codec.encodePointer(pointer);
+      const ttl = meta.ts + (meta.ttl || this.maxMessageTTLMs);
       await this.db.batch([
         { type: "put", key: `meta!${meta.id}`, value: metaBuffer },
         { type: "put", key: `ptr!${meta.id}`, value: pointerBuffer },
-        { type: "put", key: `attempts!${meta.id}`, value: Buffer.from("1") },
+        {
+          type: "put",
+          key: `ttl!${ttl}:${meta.id}`,
+          value: 1,
+        },
       ]);
 
       // Update last_wal_offset immediately
@@ -1414,7 +1440,8 @@ class MessageReader<Data> implements IMessageReader<Data> {
     try {
       const pointerBuffer = await this.db.get(`ptr!${id}`);
       if (!pointerBuffer) return;
-      const pointer = await this.codec.decode<ISegmentRecord>(pointerBuffer);
+      const pointer =
+        await this.codec.decodePointer<ISegmentRecord>(pointerBuffer);
       const messageBuffer = await this.log.read(pointer);
       if (!messageBuffer) return;
       return this.codec.decode<Data>(messageBuffer);
@@ -1436,35 +1463,13 @@ class MessageReader<Data> implements IMessageReader<Data> {
     }
   }
 }
-interface IMetadataUpdater {
-  updateMetadata(id: number, meta: Partial<MessageMetadata>): Promise<void>;
-}
-class MetadataUpdater implements IMetadataUpdater {
-  constructor(
-    private db: Level<string, Buffer>,
-    private codec: ICodec,
-    private logger?: ILogCollector
-  ) {}
-
-  async updateMetadata(
-    id: number,
-    meta: Partial<MessageMetadata>
-  ): Promise<void> {
-    try {
-      const metaBuffer = await this.db.get(`meta!${id}`);
-      if (metaBuffer) return;
-      const newMetaBuffer = await this.codec.updateMetadata(metaBuffer, meta);
-      await this.db.put(`meta!${id}`, newMetaBuffer);
-    } catch (error) {
-      this.logger?.log("Failed metadata update", { id, error }, "error");
-    }
-  }
-}
-interface IRetentionManager {
+interface IMessageRetentionManager {
   start(): void;
   stop(): void;
+  markDeletable(id: number): Promise<void>;
+  unmarkDeletable(id: number): Promise<void>;
 }
-class RetentionManager implements IRetentionManager {
+class MessageRetentionManager implements IMessageRetentionManager {
   private retentionTimer?: NodeJS.Timeout;
 
   constructor(
@@ -1474,8 +1479,7 @@ class RetentionManager implements IRetentionManager {
     private dlqManager: IDLQManager<any>,
     private codec: ICodec,
     private logger?: ILogCollector,
-    private retentionMs = 3_600_000,
-    private maxMessageTTLMs = 3_600_000_000
+    private retentionMs = 3_600_000
   ) {}
 
   start(): void {
@@ -1490,59 +1494,94 @@ class RetentionManager implements IRetentionManager {
     clearInterval(this.retentionTimer);
   }
 
-  private retain = async () => {
+  async markDeletable(id: number): Promise<void> {
+    return this.db.put(`del!${id}`, Buffer.from("1"));
+  }
+
+  async unmarkDeletable(id: number): Promise<void> {
+    return this.db.del(`del!${id}`);
+  }
+
+  private async clearDeletable() {
     const pointersToDelete: ISegmentRecord[] = [];
-    const now = Date.now();
+    const batch = this.db.batch();
 
-    for await (const [id, metaBuffer] of this.db.iterator({
-      gt: `meta!`,
-      lt: `meta~`,
+    for await (const [key] of this.db.iterator({
+      gt: `del!`,
+      lt: `del~`,
     })) {
+      const id = key.slice(4);
+
       try {
-        const meta = await this.codec.decodeMetadata(metaBuffer);
-        const consumedAt = await this.db.get(`consumedAt!${meta.id}`);
-
-        // consumed messages should be deleted
-        if (consumedAt) {
-          const pointerBuffer = await this.db.get(`ptr!${id}`);
-
-          if (pointerBuffer) {
-            const pointer =
-              await this.codec.decode<ISegmentRecord>(pointerBuffer);
-            pointersToDelete.push(pointer);
-          }
-
-          await this.db.batch([
-            { type: "del", key: `meta!${id}` },
-            { type: "del", key: `ptr!${id}` },
-          ]);
-
-          continue;
+        const pointerBuffer = await this.db.get(`ptr!${id}`);
+        if (pointerBuffer) {
+          const pointer = await this.codec.decodePointer(pointerBuffer);
+          pointersToDelete.push(pointer);
         }
 
-        // expired messages should go dlq
-        if (
-          (meta.ttl && meta.ts + meta.ttl < now) ||
-          now - meta.ts >= this.maxMessageTTLMs
-        ) {
-          this.dlqManager.enqueue(meta, "expired");
-        }
-      } catch (error) {}
+        batch.del(`meta!${id}`);
+        batch.del(`ptr!${id}`);
+        batch.del(`del!${id}`);
+      } catch (error) {
+        this.logger?.log(
+          `MessageStore cannot delete ${id}`,
+          { error, id },
+          "error"
+        );
+      }
     }
 
-    // delete from log
+    // 1. db batch
+    await batch.write();
+
+    // 2. delete from log
     if (pointersToDelete.length) {
       await this.log.compactSegmentsByRemovingOldMessages(pointersToDelete);
     }
 
-    // truncate the wal
+    // 3. truncate the wal
     const offsetBuffer = await this.db.get("last_wal_offset");
     await this.wal.truncate(+offsetBuffer.toSorted());
 
-    this.logger?.log("MessageStorage retention", { pointersToDelete });
+    return pointersToDelete.length;
+  }
+
+  private async processTtl() {
+    for await (const [key] of this.db.iterator({
+      lt: `ts!${Date.now() + this.retentionMs}`,
+    })) {
+      const id = key.split(":")[1];
+
+      try {
+        const metaBuffer = await this.db.get(`meta!${id}`);
+        const meta = await this.codec.decodeMetadata(metaBuffer);
+
+        await this.db.del(key);
+        this.dlqManager.enqueue(meta, "expired");
+      } catch (error) {
+        this.logger?.log(
+          `MessageStore cannot send to dlq ${id}`,
+          { error, id },
+          "error"
+        );
+      }
+    }
+  }
+
+  private retain = async () => {
+    try {
+      const [deletedCount] = await Promise.all([
+        this.clearDeletable(),
+        this.processTtl(),
+      ]);
+
+      this.logger?.log("MessageStore retention succeed", { deletedCount });
+    } catch (error) {
+      this.logger?.log("MessageStore retention failed", { error }, "error");
+    }
   };
 }
-interface IMessageStorage<Data> {
+interface IMessageStore<Data> {
   write(message: Buffer, meta: MessageMetadata): Promise<number | undefined>;
   read(
     id: number
@@ -1557,8 +1596,10 @@ interface IMessageStorage<Data> {
     id: number,
     keys?: K[]
   ): Promise<Pick<MessageMetadata, K> | undefined>;
-  updateMetadata(id: number, meta: Partial<MessageMetadata>): Promise<void>;
-  getMetadata(): Promise<{
+  markDeletable(id: number): Promise<void>;
+  unmarkDeletable(id: number): Promise<void>;
+  close(): Promise<void>;
+  getMetrics(): Promise<{
     wal: {
       fileSize: number | undefined;
       batchSize: number;
@@ -1575,13 +1616,12 @@ interface IMessageStorage<Data> {
     ram: NodeJS.MemoryUsage;
   }>;
 }
-class MessageStorageService<Data> implements IMessageStorage<Data> {
+class MessageStoreService<Data> implements IMessageStore<Data> {
   constructor(
     private replayer: IWALReplayer,
     private writer: IMessageWriter,
     private reader: IMessageReader<Data>,
-    private metadataUpdater: IMetadataUpdater,
-    private retentionManager: IRetentionManager,
+    private retentionManager: IMessageRetentionManager,
     private db: Level<string, Buffer>,
     private wal: IWriteAheadLog,
     private log: IMessageLog
@@ -1616,11 +1656,12 @@ class MessageStorageService<Data> implements IMessageStorage<Data> {
     return this.reader.readMetadata(id, keys);
   }
 
-  async updateMetadata(
-    id: number,
-    meta: Partial<MessageMetadata>
-  ): Promise<void> {
-    return this.metadataUpdater.updateMetadata(id, meta);
+  async markDeletable(id: number): Promise<void> {
+    return this.retentionManager.markDeletable(id);
+  }
+
+  async unmarkDeletable(id: number): Promise<void> {
+    return this.retentionManager.markDeletable(id);
   }
 
   async close() {
@@ -1628,10 +1669,10 @@ class MessageStorageService<Data> implements IMessageStorage<Data> {
     await Promise.all([this.wal.close(), this.db.close()]);
   }
 
-  async getMetadata() {
+  async getMetrics() {
     const [walStats, logStats] = await Promise.all([
-      this.wal.getMetadata(),
-      this.log.getMetadata(),
+      this.wal.getMetrics(),
+      this.log.getMetrics(),
     ]);
 
     return {
@@ -1649,7 +1690,7 @@ class MessageStorageService<Data> implements IMessageStorage<Data> {
 //
 // SRC/PUBLISHING_SERVICE.TS
 interface IMessageProcessor {
-  process(meta: MessageMetadata, attempts: number): boolean;
+  process(meta: MessageMetadata): boolean;
 }
 class ExpirationProcessor<Data> implements IMessageProcessor {
   constructor(private dlq: IDLQManager<Data>) {}
@@ -1664,11 +1705,12 @@ class ExpirationProcessor<Data> implements IMessageProcessor {
 }
 class AttemptsProcessor<Data> implements IMessageProcessor {
   constructor(
-    private dlq: IDLQManager<Data>,
-    private maxAttempts: number
+    private deliveryTracker: IDeliveryTracker,
+    private dlq: IDLQManager<Data>
   ) {}
-  process(meta: MessageMetadata, attempts: number): boolean {
-    const shouldDeadLetter = attempts > this.maxAttempts;
+  process(meta: MessageMetadata): boolean {
+    const attempts = this.deliveryTracker.decrementDeliveryAttempts(meta.id);
+    const shouldDeadLetter = attempts === 0;
     if (shouldDeadLetter) {
       this.dlq.enqueue(meta, "max_attempts");
     }
@@ -1686,16 +1728,16 @@ class DelayProcessor implements IMessageProcessor {
 }
 interface IMessagePipeline {
   addProcessor(processor: IMessageProcessor): void;
-  process(meta: MessageMetadata, attempts: number): boolean;
+  process(meta: MessageMetadata): boolean;
 }
 class MessagePipeline implements IMessagePipeline {
   private processors: IMessageProcessor[] = [];
   addProcessor(processor: IMessageProcessor): void {
     this.processors.push(processor);
   }
-  process(meta: MessageMetadata, attempts: number): boolean {
+  process(meta: MessageMetadata): boolean {
     for (const processor of this.processors) {
-      if (processor.process(meta, attempts)) return true;
+      if (processor.process(meta)) return true;
     }
     return false;
   }
@@ -1703,22 +1745,20 @@ class MessagePipeline implements IMessagePipeline {
 interface IPipelineFactory<Data> {
   create(
     dlqManager: IDLQManager<Data>,
-    delayedMessageManager: DelayedMessageManager<Data>,
-    maxAttempts?: number
+    deliveryTracker: IDeliveryTracker,
+    delayedMessageManager: DelayedMessageManager<Data>
   ): IMessagePipeline;
 }
 class PipelineFactory<Data> implements IPipelineFactory<Data> {
   create(
     dlqManager: IDLQManager<Data>,
-    delayedMessageManager: IDelayedMessageManager,
-    maxAttempts?: number
+    deliveryTracker: IDeliveryTracker,
+    delayedMessageManager: IDelayedMessageManager
   ) {
     const pipeline = new MessagePipeline();
     pipeline.addProcessor(new ExpirationProcessor(dlqManager));
     pipeline.addProcessor(new DelayProcessor(delayedMessageManager));
-    if (maxAttempts !== undefined) {
-      pipeline.addProcessor(new AttemptsProcessor(dlqManager, maxAttempts));
-    }
+    pipeline.addProcessor(new AttemptsProcessor(deliveryTracker, dlqManager));
 
     return pipeline;
   }
@@ -1783,38 +1823,47 @@ class DelayMonitor<Data> implements IDelayMonitor<Data> {
   }
 }
 interface IDelayedMessageManager {
-  enqueue(meta: MessageMetadata): void;
-  getMetadata(): {
+  enqueue(meta: MessageMetadata, consumerId?: number): void;
+  getMetrics(): {
     count: number;
   };
 }
 class DelayedMessageManager<Data> implements IDelayedMessageManager {
   constructor(
-    private delayMonitor: IDelayMonitor<number>,
-    private messageStorage: IMessageStorage<Data>,
+    private delayMonitor: IDelayMonitor<[number, number | undefined]>,
+    private messageStore: IMessageStore<Data>,
     private messageRouter: IMessageRouter,
-    private deliveryCounter: IDeliveryCounter,
+    private deliveryTracker: IDeliveryTracker,
+    private queueManager: IQueueManager,
     private logger?: ILogCollector
   ) {
     delayMonitor.setReadyCallback(this.dequeue);
   }
 
-  enqueue(meta: MessageMetadata) {
+  enqueue(meta: MessageMetadata, consumerId?: number) {
     if (!meta.ttd) return;
-    this.delayMonitor.schedule(meta.id, meta.ts + meta.ttd);
+    const delay = meta.ts + meta.ttd;
+    this.delayMonitor.schedule([meta.id, consumerId], delay);
+    this.logger?.log(`Message is delayed until ${delay}.`, meta);
   }
 
-  private dequeue = async (messageId: number) => {
-    const meta = await this.messageStorage.readMetadata(messageId);
+  private dequeue = async (data: [number, number | undefined]) => {
+    const [messageId, consumerId] = data;
+    const meta = await this.messageStore.readMetadata(messageId);
     if (!meta) return;
 
-    const deliveryCount = await this.messageRouter.route(meta);
-    this.deliveryCounter.setAwaitedDeliveries(meta.id, deliveryCount);
+    if (consumerId) {
+      this.queueManager.enqueue(consumerId, meta);
+      this.logger?.log(`Message is requeued to ${consumerId}.`, meta);
+      return;
+    }
 
+    const deliveryCount = await this.messageRouter.route(meta, excludes);
+    this.deliveryTracker.setAwaitedDeliveries(meta.id, deliveryCount);
     this.logger?.log(`Message is routed to ${meta.topic}.`, meta);
   };
 
-  getMetadata() {
+  getMetrics() {
     return {
       count: this.delayMonitor.pendingsCount(),
     };
@@ -1829,17 +1878,19 @@ interface IConsumerGroup {
     messageId: number,
     correlationId?: string
   ): Iterable<number> | undefined;
-  getName(): string | undefined;
+  isDefaultGroup(): boolean;
   getMemberRoutingKeys(id: number): Array<string> | undefined;
-  getMetadata(): {
+  getMetrics(): {
     name: string;
     count: number;
   };
 }
 class ConsumerGroup implements IConsumerGroup {
-  private members: IPersistedMap<number, Array<string>>;
+  static defaultName = "non-grouped";
+  private members: IPersistedMap<number, string[]>;
+
   constructor(
-    public name: string = "non-grouped",
+    public name: string = ConsumerGroup.defaultName,
     mapFactory: IPersistedMapFactory,
     private hashRing: IHashRing
   ) {
@@ -1886,19 +1937,32 @@ class ConsumerGroup implements IConsumerGroup {
     return this.members.keys();
   }
 
-  getName() {
-    return this.name;
+  isDefaultGroup() {
+    return this.name === ConsumerGroup.defaultName;
   }
 
   getMemberRoutingKeys(id: number) {
     return this.members.get(id);
   }
 
-  getMetadata() {
+  getMetrics() {
     return {
       name: this.name,
       count: this.members.size,
     };
+  }
+}
+class ConsumerGroupSerializer implements ISerializable {
+  constructor(private mapFactory: IPersistedMapFactory) {}
+  serialize(group: IConsumerGroup) {
+    return group.name;
+  }
+  deserialize(groupId: string) {
+    return new ConsumerGroup(
+      groupId,
+      this.mapFactory,
+      new InMemoryHashRing(new SHA256HashService(), this.mapFactory, groupId)
+    );
   }
 }
 interface IMessageRouter {
@@ -1906,7 +1970,7 @@ interface IMessageRouter {
   removeConsumer(id: number): void;
   route(meta: MessageMetadata): Promise<number>;
   routeBatch(metas: MessageMetadata[]): Promise<number[]>;
-  getMetadata(): {
+  getMetrics(): {
     consumerGroups: {
       name: string;
       count: number;
@@ -1923,30 +1987,25 @@ class MessageRouter<Data> implements IMessageRouter {
     private subscriptionManager: ISubscriptionManager<Data>,
     private dlqManager: IDLQManager<Data>
   ) {
-    this.consumerGroups = mapFactory.create<string, IConsumerGroup>(`groups`, {
-      serialize: (group: IConsumerGroup) => group.name,
-      deserialize: (groupId: string) =>
-        new ConsumerGroup(
-          groupId,
-          this.mapFactory,
-          new InMemoryHashRing(
-            new SHA256HashService(),
-            this.mapFactory,
-            groupId
-          )
-        ),
-    });
+    this.consumerGroups = mapFactory.create<string, IConsumerGroup>(
+      `groups`,
+      new ConsumerGroupSerializer(mapFactory)
+    );
   }
 
-  getMetadata() {
+  getMetrics() {
     return {
       consumerGroups: Array.from(this.consumerGroups.values()).map((group) =>
-        group.getMetadata()
+        group.getMetrics()
       ),
     };
   }
 
-  addConsumer(id: number, groupId = "no_group", routingKeys?: string[]) {
+  addConsumer(
+    id: number,
+    groupId = ConsumerGroup.defaultName,
+    routingKeys?: string[]
+  ) {
     if (!this.consumerGroups.has(groupId)) {
       const hashRing = new InMemoryHashRing(
         new SHA256HashService(),
@@ -2002,7 +2061,7 @@ class MessageRouter<Data> implements IMessageRouter {
 
   private async groupRoute(group: IConsumerGroup, meta: MessageMetadata) {
     const { routingKey, correlationId, id } = meta;
-    const isSingleConsumer = group.getName() || correlationId;
+    const isSingleConsumer = !group.isDefaultGroup() || correlationId;
     const candidates = group.getMembers(id, correlationId);
     if (!candidates) return;
 
@@ -2068,7 +2127,7 @@ interface IPublishingService {
     message: Buffer,
     meta: MessageMetadata
   ): Promise<void>;
-  getMetadata(): {
+  getMetrics(): {
     router: {
       consumerGroups: {
         name: string;
@@ -2082,10 +2141,10 @@ interface IPublishingService {
 }
 class PublishingService<Data> implements IPublishingService {
   constructor(
-    private readonly messageStorage: IMessageStorage<Data>,
+    private readonly messageStore: IMessageStore<Data>,
     private readonly pipeline: IMessagePipeline,
     private readonly messageRouter: IMessageRouter,
-    private readonly deliveryCounter: IDeliveryCounter,
+    private readonly deliveryTracker: IDeliveryTracker,
     private readonly clientManager: IClientManager,
     private readonly delayedManager: IDelayedMessageManager,
     private readonly metrics: IMetricsCollector,
@@ -2097,7 +2156,7 @@ class PublishingService<Data> implements IPublishingService {
     message: Buffer,
     meta: MessageMetadata
   ): Promise<void> {
-    await this.messageStorage.write(message, meta);
+    await this.messageStore.write(message, meta);
 
     const processingTime = Date.now() - meta.ts;
     this.metrics.recordEnqueue(message.length, processingTime);
@@ -2107,18 +2166,18 @@ class PublishingService<Data> implements IPublishingService {
       status: "idle",
     });
 
-    if (this.pipeline.process(meta, 1)) return;
+    if (this.pipeline.process(meta)) return;
     const deliveryCount = await this.messageRouter.route(meta);
-    this.deliveryCounter.setAwaitedDeliveries(meta.id, deliveryCount);
+    this.deliveryTracker.setAwaitedDeliveries(meta.id, deliveryCount);
 
     this.logger?.log(`Message is routed to ${meta.topic}.`, meta);
   }
 
-  getMetadata() {
+  getMetrics() {
     return {
-      router: this.messageRouter.getMetadata(),
-      delayedMessages: this.delayedManager.getMetadata(),
-      storage: this.messageStorage.getMetadata(),
+      router: this.messageRouter.getMetrics(),
+      delayedMessages: this.delayedManager.getMetrics(),
+      storage: this.messageStore.getMetrics(),
     };
   }
 }
@@ -2138,7 +2197,7 @@ interface IQueueManager {
   removeQueue(id: number): void;
   enqueue(id: number, meta: MessageMetadata): number | undefined;
   dequeue(id: number): number | undefined;
-  getMetadata(): {
+  getMetrics(): {
     size: number;
   };
 }
@@ -2150,18 +2209,14 @@ class QueueManager implements IQueueManager {
     mapFactory: IPersistedMapFactory,
     private queueFactory: IPersistedQueueFactory
   ) {
-    this.queues = mapFactory.create<number, IPersistedQueue<number>>(`queues`, {
-      serialize: (_: unknown, key: string) => key,
-      deserialize: (name: string) =>
-        this.queueFactory.create(`queue!${name}`, (entry: number) => entry),
-    });
+    this.queues = mapFactory.create<number, IPersistedQueue<number>>(
+      `queues`,
+      new PersistedQueueSerializer(queueFactory, (n: number) => n)
+    );
   }
 
   addQueue(id: number) {
-    const queue = this.queueFactory.create(
-      `queue!${id}`,
-      (entry: number) => entry
-    );
+    const queue = this.queueFactory.create(`queue!${id}`, (n: number) => n);
     this.queues.set(id, queue);
   }
 
@@ -2186,15 +2241,15 @@ class QueueManager implements IQueueManager {
     return messageId;
   }
 
-  getMetadata() {
+  getMetrics() {
     return {
       size: this.totalQueuedMessages,
     };
   }
 }
 interface IConsumptionService<Data> {
-  consume(consumerId: number, autoAck?: boolean): Promise<Data | undefined>;
-  getMetadata(): {
+  consume(consumerId: number, noAck?: boolean): Promise<Data | undefined>;
+  getMetrics(): {
     queuedMessages: {
       size: number;
     };
@@ -2203,26 +2258,23 @@ interface IConsumptionService<Data> {
 class ConsumptionService<Data> implements IConsumptionService<Data> {
   constructor(
     private readonly queueManager: IQueueManager,
-    private readonly messageStorage: IMessageStorage<Data>,
+    private readonly messageStore: IMessageStore<Data>,
     private readonly pendingAcks: IPendingAcks,
-    private readonly deliveryCounter: IDeliveryCounter,
+    private readonly deliveryTracker: IDeliveryTracker,
     private readonly clientManager: IClientManager,
     private readonly logger?: ILogCollector
   ) {}
 
-  async consume(
-    consumerId: number,
-    autoAck = false
-  ): Promise<Data | undefined> {
+  async consume(consumerId: number, noAck = false): Promise<Data | undefined> {
     if (this.pendingAcks.isReachedMaxUnacked(consumerId)) return;
 
     const messageId = this.queueManager.dequeue(consumerId);
     if (!messageId) return;
 
-    const [message, meta] = await this.messageStorage.read(messageId);
+    const [message, meta] = await this.messageStore.read(messageId);
     if (!meta || !message) return;
 
-    if (!autoAck) {
+    if (!noAck) {
       this.pendingAcks.addPending(consumerId, messageId);
     } else {
       this.clientManager.recordActivity(consumerId, {
@@ -2232,16 +2284,16 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
         status: "idle",
       });
 
-      await this.deliveryCounter.decrementAwaitedDeliveries(messageId);
+      await this.deliveryTracker.decrementAwaitedDeliveries(messageId);
     }
 
     this.logger?.log(`Message is consumed from ${meta.topic}.`, meta);
     return message;
   }
 
-  getMetadata() {
+  getMetrics() {
     return {
-      queuedMessages: this.queueManager.getMetadata(),
+      queuedMessages: this.queueManager.getMetrics(),
     };
   }
 }
@@ -2249,30 +2301,36 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
 //
 //
 // SRC/ACK_SERVICE.TS
+class PendingAcksEntry extends Map<number, number> {} // {messageId:ts}
+class PendingAcksEntrySerializer implements ISerializable {
+  serialize(entry: PendingAcksEntry) {
+    return Array.from(entry);
+  }
+  deserialize(data: [number, number][]) {
+    return new PendingAcksEntry(data);
+  }
+}
 interface IPendingAcks {
   addPending(consumerId: number, messageId: number): void;
   getPendings(consumerId: number): Map<number, number> | undefined;
   getAllPendings(): IPersistedMap<number, Map<number, number>>;
   removePending(consumerId: number, messageId?: number): void;
   isReachedMaxUnacked(consumerId: number): boolean;
-  getMetadata(): {
+  getMetrics(): {
     count: number;
   };
 }
 class PendingAcks implements IPendingAcks {
-  private pendingAcks: IPersistedMap<number, Map<number, number>>;
+  private pendingAcks: IPersistedMap<number, PendingAcksEntry>;
 
   constructor(
     mapFactory: IPersistedMapFactory,
     private clientManager: IClientManager,
     private maxUnackedPerConsumer = 10
   ) {
-    this.pendingAcks = mapFactory.create<number, Map<number, number>>(
+    this.pendingAcks = mapFactory.create<number, PendingAcksEntry>(
       "pending_acks",
-      {
-        serialize: (data: Map<number, number>) => Array.from(data),
-        deserialize: (data: [number, number][]) => new Map(data),
-      }
+      new PendingAcksEntrySerializer()
     );
   }
 
@@ -2280,7 +2338,7 @@ class PendingAcks implements IPendingAcks {
     return this.getPendings(consumerId)?.size === this.maxUnackedPerConsumer;
   }
 
-  getMetadata() {
+  getMetrics() {
     let count = 0;
     const consumerAcks = this.pendingAcks.values();
     for (const acks of consumerAcks) {
@@ -2343,36 +2401,77 @@ class PendingAcks implements IPendingAcks {
     }
   }
 }
-interface IDeliveryCounter {
+interface IDeliveryTracker {
   setAwaitedDeliveries(messageid: number, deliveries: number): void;
   decrementAwaitedDeliveries(messageId: number): Promise<void>;
+  decrementDeliveryAttempts(messageId: number): number;
+  getDeliveryRetryBackoff(messageId: number): number;
 }
-class DeliveryCounter<Data> implements IDeliveryCounter {
-  private deliveries: IPersistedMap<number, number>;
+class DeliveryEntry {
+  constructor(
+    public neededAcks: number,
+    public attempts: number
+  ) {}
+}
+class DeliveryTracker<Data> implements IDeliveryTracker {
+  private deliveries: IPersistedMap<number, DeliveryEntry>;
 
   constructor(
     mapFactory: IPersistedMapFactory,
-    private messageStorage: IMessageStorage<Data>,
-    private metrics: IMetricsCollector
+    private messageStore: IMessageStore<Data>,
+    private metrics: IMetricsCollector,
+    private readonly maxAttempts = 1,
+    private readonly initialBackoffMs = 1000,
+    private readonly maxBackoffMs = 30_000
   ) {
-    this.deliveries = mapFactory.create<number, number>("deliveries");
+    this.deliveries = mapFactory.create<number, DeliveryEntry>("deliveries");
+  }
+
+  private getOrCreateEntry(messageid: number) {
+    const entry = this.deliveries.get(messageid);
+    return entry ?? new DeliveryEntry(0, Math.max(1, this.maxAttempts));
   }
 
   setAwaitedDeliveries(messageid: number, deliveries: number) {
-    this.deliveries.set(messageid, deliveries);
+    const entry = this.getOrCreateEntry(messageid);
+    entry.neededAcks = deliveries;
+    this.deliveries.set(messageid, entry);
   }
 
   async decrementAwaitedDeliveries(messageId: number) {
-    let deliveries = this.deliveries.get(messageId);
-    if (!deliveries) return;
-    this.deliveries.set(messageId, --deliveries);
-    if (deliveries > 0) return;
+    let entry = this.deliveries.get(messageId);
+    if (!entry) return;
+    if (--entry.neededAcks > 0) {
+      this.deliveries.set(messageId, entry);
+      return;
+    }
 
+    this.deliveries.delete(messageId);
     // if there is no deliveries needed mark message as consumed
-    const meta = await this.messageStorage.readMetadata(messageId, ["ts"]);
-    if (!meta) return;
-    await this.messageStorage.makeConsumed(messageId);
-    this.metrics.recordDequeue(Date.now() - meta.ts);
+    await this.messageStore.markDeletable(messageId);
+
+    const meta = await this.messageStore.readMetadata(messageId, ["ts"]);
+    if (meta) this.metrics.recordDequeue(Date.now() - meta.ts);
+  }
+
+  decrementDeliveryAttempts(messageId: number): number {
+    const entry = this.getOrCreateEntry(messageId);
+    if (--entry.attempts == 0) {
+      this.deliveries.delete(messageId);
+    } else {
+      this.deliveries.set(messageId, entry);
+    }
+
+    return entry.attempts;
+  }
+
+  getDeliveryRetryBackoff(messageId: number) {
+    const attempts = this.deliveries.get(messageId)?.attempts;
+    if (!attempts) return 0;
+    return Math.min(
+      this.maxBackoffMs ?? 30_000,
+      this.initialBackoffMs * Math.pow(2, attempts - 1)
+    );
   }
 }
 interface AckTimeoutHandler {
@@ -2411,7 +2510,7 @@ class AckMonitor implements IAckMonitor {
     for (const [consumerId, messages] of pendings.entries()) {
       for (const [messageId, consumedAt] of messages.entries()) {
         if (now - consumedAt > this.ackTimeoutMs) {
-          await this.onTimeoutCallback?.(consumerId, messageId, true);
+          await this.onTimeoutCallback?.(consumerId, messageId, false);
         }
       }
     }
@@ -2424,7 +2523,7 @@ interface IAckService {
     messageId?: number,
     requeue?: boolean
   ) => Promise<number>;
-  getMetadata(): {
+  getMetrics(): {
     pendingAcks: {
       count: number;
     };
@@ -2433,12 +2532,12 @@ interface IAckService {
 class AckService<Data> implements IAckService {
   constructor(
     private readonly pendingAcks: IPendingAcks,
-    private readonly deliveryCounter: IDeliveryCounter,
+    private readonly deliveryTracker: IDeliveryTracker,
     private readonly ackMonitor: IAckMonitor,
-    private readonly messageStorage: IMessageStorage<Data>,
+    private readonly messageStore: IMessageStore<Data>,
     private readonly pipeline: IMessagePipeline,
-    private readonly queueManager: IQueueManager,
     private readonly subscriptionManager: ISubscriptionManager<Data>,
+    private readonly delayedMessageManager: IDelayedMessageManager,
     private readonly logger?: ILogCollector
   ) {
     this.ackMonitor.setTimeoutCallback(this.nack);
@@ -2457,7 +2556,7 @@ class AckService<Data> implements IAckService {
     }
 
     for (const messageId of pendingAcks) {
-      await this.deliveryCounter.decrementAwaitedDeliveries(messageId);
+      await this.deliveryTracker.decrementAwaitedDeliveries(messageId);
     }
 
     // try to drainQueue if push mode is available
@@ -2472,22 +2571,22 @@ class AckService<Data> implements IAckService {
     const messages = await this.ack(consumerId, messageId);
 
     for (const messageId of messages) {
-      const meta = await this.messageStorage.readMetadata(messageId);
+      const meta = await this.messageStore.readMetadata(messageId);
       if (!meta) continue;
 
-      // await this.messageStorage.updateMetadata(messageId, {
-      //   attempts: requeue ? meta.attempts + 1 : Infinity,
-      //   consumedAt: undefined,
-      // });
+      await this.messageStore.unmarkDeletable(messageId);
+      if (this.pipeline.process(meta)) continue;
 
-      const attempts = await this.messageStorage.incrementAttempts(messageId);
-      await this.messageStorage.makeUnConsumed(messageId);
+      // A message is only considered fully processed when all consumers have ACKed it
+      const delay = this.deliveryTracker.getDeliveryRetryBackoff(messageId);
+      meta.ttd = Date.now() - meta.ts + delay;
+      this.delayedMessageManager.enqueue(
+        meta,
+        requeue ? consumerId : undefined
+      );
 
-      if (this.pipeline.process(meta, attempts)) continue;
-
-      this.queueManager.enqueue(consumerId, meta);
       this.logger?.log(
-        `Message is nacked to ${requeue ? "queue" : "DLQ"}.`,
+        `Message is nacked to ${requeue ? consumerId : meta.topic}.`,
         meta,
         "warn"
       );
@@ -2496,9 +2595,9 @@ class AckService<Data> implements IAckService {
     return messages.length;
   };
 
-  getMetadata() {
+  getMetrics() {
     return {
-      pendingAcks: this.pendingAcks.getMetadata(),
+      pendingAcks: this.pendingAcks.getMetrics(),
     };
   }
 }
@@ -2511,7 +2610,7 @@ interface ISubscriptionManager<Data> {
   addListener(
     consumerId: number,
     listener: ISubscriptionListener<Data>,
-    autoAck?: boolean
+    noAck?: boolean
   ): void;
   removeListener(consumerId: number): void;
   hasListener(consumerId: number): boolean;
@@ -2520,68 +2619,66 @@ interface ISubscriptionManager<Data> {
     meta: MessageMetadata
   ): Promise<boolean | undefined>;
   drainQueue(consumerId: number): Promise<void>;
-  getMetadata(): {
+  getMetrics(): {
     count: number;
   };
 }
 class SubscriptionManager<Data> implements ISubscriptionManager<Data> {
-  private subscriptions = new Map<
-    number,
-    [ISubscriptionListener<Data>, boolean]
-  >();
+  private listeners = new Map<number, ISubscriptionListener<Data>>();
+  private fanouts = new Set<number>();
 
   constructor(
     private clientManager: ClientManager,
     private queueManager: QueueManager,
-    private messageStorage: IMessageStorage<Data>,
+    private messageStore: IMessageStore<Data>,
     private pendingAcks: PendingAcks,
-    private deliveryCounter: DeliveryCounter<Data>,
+    private deliveryTracker: DeliveryTracker<Data>,
     private logger?: ILogCollector
   ) {}
 
-  getMetadata() {
+  getMetrics() {
     return {
-      count: this.subscriptions.size,
+      count: this.listeners.size,
     };
   }
 
   addListener(
     consumerId: number,
     listener: ISubscriptionListener<Data>,
-    autoAck = false
+    noAck = false
   ) {
-    this.subscriptions.set(consumerId, [listener, autoAck]);
+    this.listeners.set(consumerId, listener);
+    if (noAck) this.fanouts.add(consumerId);
     this.drainQueue(consumerId);
   }
 
   removeListener(consumerId: number) {
-    this.subscriptions.delete(consumerId);
+    this.listeners.delete(consumerId);
   }
 
   hasListener(consumerId: number) {
-    return this.subscriptions.has(consumerId);
+    return this.listeners.has(consumerId);
   }
 
   async pushTo(consumerId: number, meta: MessageMetadata) {
-    const subscription = this.subscriptions.get(consumerId);
-    if (!subscription) return;
-    const [listener, autoAck] = subscription;
+    const listener = this.listeners.get(consumerId);
+    if (!listener) return;
 
     if (this.pendingAcks.isReachedMaxUnacked(consumerId)) return;
 
-    const message = await this.messageStorage.readMessage(meta.id);
+    const message = await this.messageStore.readMessage(meta.id);
     if (!message) return;
 
     listener(message);
 
-    setImmediate(() => {
-      this.logger?.log(`Message is consumed from ${meta.topic}.`, meta);
-    });
-
-    if (!autoAck) {
+    if (!this.fanouts.has(consumerId)) {
       this.pendingAcks.addPending(consumerId, meta.id);
       return true;
     }
+
+    setImmediate(() => {
+      this.logger?.log(`Message is consumed from ${meta.topic}.`, meta);
+    });
 
     this.clientManager.recordActivity(consumerId, {
       messageCount: 1,
@@ -2600,13 +2697,13 @@ class SubscriptionManager<Data> implements ISubscriptionManager<Data> {
     const messageId = this.queueManager.dequeue(consumerId);
     if (!messageId) return;
 
-    const meta = await this.messageStorage.readMetadata(messageId);
+    const meta = await this.messageStore.readMetadata(messageId);
     if (!meta) return;
 
     const needAck = await this.pushTo(consumerId, meta);
 
     if (!needAck) {
-      await this.deliveryCounter.decrementAwaitedDeliveries(messageId);
+      await this.deliveryTracker.decrementAwaitedDeliveries(messageId);
     }
 
     // schedule the next drain
@@ -2617,10 +2714,10 @@ interface ISubscriptionService<Data> {
   subscribe(
     consumerId: number,
     listener: ISubscriptionListener<Data>,
-    autoAck?: boolean
+    noAck?: boolean
   ): void;
   unsubscribe(consumerId: number): void;
-  getMetadata(): {
+  getMetrics(): {
     count: number;
   };
 }
@@ -2634,13 +2731,13 @@ class SubscriptionService<Data> implements ISubscriptionService<Data> {
   subscribe(
     consumerId: number,
     listener: ISubscriptionListener<Data>,
-    autoAck?: boolean
+    noAck?: boolean
   ): void {
-    this.subscriptionManager.addListener(consumerId, listener, autoAck);
+    this.subscriptionManager.addListener(consumerId, listener, noAck);
 
     this.logger?.log(`${consumerId} is subscribed to ${this.topicName}.`, {
       consumerId,
-      autoAck,
+      noAck,
     });
   }
 
@@ -2652,8 +2749,8 @@ class SubscriptionService<Data> implements ISubscriptionService<Data> {
     });
   }
 
-  getMetadata() {
-    return this.subscriptionManager.getMetadata();
+  getMetrics() {
+    return this.subscriptionManager.getMetrics();
   }
 }
 //
@@ -2678,7 +2775,7 @@ interface IDLQManager<Data> {
     handler: (message: Data, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ): Promise<number>;
-  getMetadata(): {
+  getMetrics(): {
     size: number;
   };
 }
@@ -2688,10 +2785,10 @@ class DLQManager<Data> implements IDLQManager<Data> {
   constructor(
     private topic: string,
     mapFactory: IPersistedMapFactory,
-    private messageStorage: IMessageStorage<any>,
+    private messageStore: IMessageStore<any>,
     private logger?: ILogCollector
   ) {
-    this.messages = mapFactory.create("dlqMessages");
+    this.messages = mapFactory.create("dlq");
   }
 
   size() {
@@ -2709,7 +2806,7 @@ class DLQManager<Data> implements IDLQManager<Data> {
 
   async *createReader(): AsyncGenerator<IDLQEntry<Data>, void, unknown> {
     for (const [messageId, reason] of this.messages.entries()) {
-      const [message, meta] = await this.messageStorage.readAll(messageId);
+      const [message, meta] = await this.messageStore.read(messageId);
       if (!meta || !message) continue;
       yield { message, meta, reason };
     }
@@ -2741,7 +2838,7 @@ class DLQManager<Data> implements IDLQManager<Data> {
     return count;
   }
 
-  getMetadata() {
+  getMetrics() {
     return {
       size: this.messages.size,
     };
@@ -2754,15 +2851,14 @@ interface IDLQService<Data> {
     handler: (message: Data, meta: MessageMetadata) => Promise<void>,
     filter?: (meta: MessageMetadata) => boolean
   ): Promise<number>;
-  getMetadata(): {
+  getMetrics(): {
     size: number;
   };
 }
 class DLQService<Data> implements IDLQService<Data> {
   constructor(
     private readonly dlqManager: IDLQManager<Data>,
-    private readonly clientManager: IClientManager,
-    private readonly logger?: ILogCollector
+    private readonly clientManager: IClientManager
   ) {}
 
   createDlqReader() {
@@ -2790,8 +2886,8 @@ class DLQService<Data> implements IDLQService<Data> {
     return replayedCount;
   }
 
-  getMetadata() {
-    return this.dlqManager.getMetadata();
+  getMetrics() {
+    return this.dlqManager.getMetrics();
   }
 }
 //
@@ -2799,19 +2895,43 @@ class DLQService<Data> implements IDLQService<Data> {
 //
 // SRC/CLIENT_MANAGEMENT_SERVICE.TS
 type ClientType = "producer" | "consumer" | "dlq_consumer";
+type ClientStatus = "active" | "idle" | "lagging";
 interface IClientState {
   id: number;
   clientType: ClientType;
   registeredAt: number;
   lastActiveAt: number;
   // Metrics
-  status: "active" | "idle" | "lagging";
+  status: ClientStatus;
   messageCount: number;
   processingTime: number;
   avgProcessingTime: number;
   pendingAcks: number;
 }
-interface IClientManager extends ISerializable {
+class ClientState implements IClientState {
+  public id!: number;
+  public clientType!: ClientType;
+  public registeredAt!: number;
+  public lastActiveAt!: number;
+  public status!: ClientStatus;
+  public messageCount!: number;
+  public processingTime!: number;
+  public avgProcessingTime!: number;
+  public pendingAcks!: number;
+  constructor(state: IClientState) {
+    Object.assign(this, state);
+  }
+}
+class ClientStateSerializer {
+  serialize(state: IClientState): Partial<IClientState> {
+    const { lastActiveAt, ...rest } = state;
+    return rest;
+  }
+  deserialize(state: Omit<IClientState, "lastActiveAt">): IClientState {
+    return new ClientState({ ...state, lastActiveAt: Date.now() });
+  }
+}
+interface IClientManager {
   addClient(type: ClientType, id: number): IClientState | undefined;
   removeClient(id: number): number;
   getClients(filter?: (client: IClientState) => boolean): Set<IClientState>;
@@ -2821,7 +2941,7 @@ interface IClientManager extends ISerializable {
   isOperable(id: number, now: number): boolean;
   isIdle(id: number): boolean;
   recordActivity(id: number, activityRecord: Partial<IClientState>): void;
-  getMetadata(): {
+  getMetrics(): {
     count: number;
     producersCount: number;
     consumersCount: number;
@@ -2840,16 +2960,10 @@ class ClientManager implements IClientManager {
     private processingTimeThresholdMs = 50_000,
     private pendingThresholdMs = 100
   ) {
-    this.clients = mapFactory.create<number, IClientState>("clients", this);
-  }
-
-  serialize(state: IClientState): Partial<IClientState> {
-    const { lastActiveAt, ...rest } = state;
-    return rest;
-  }
-
-  deserialize(state: Omit<IClientState, "lastActiveAt">): IClientState {
-    return { ...state, lastActiveAt: Date.now() };
+    this.clients = mapFactory.create<number, IClientState>(
+      "clients",
+      new ClientStateSerializer()
+    );
   }
 
   addClient(type: ClientType, id: number) {
@@ -2864,7 +2978,7 @@ class ClientManager implements IClientManager {
       return;
     }
 
-    this.clients.set(id, {
+    const state = new ClientState({
       registeredAt: now,
       lastActiveAt: now,
       clientType: type,
@@ -2876,7 +2990,8 @@ class ClientManager implements IClientManager {
       id,
     });
 
-    return this.clients.get(id)!;
+    this.clients.set(id, state);
+    return state;
   }
 
   removeClient(id: number) {
@@ -2955,7 +3070,7 @@ class ClientManager implements IClientManager {
     this.clients.set(id, client);
   }
 
-  getMetadata() {
+  getMetrics() {
     let avgProcessingTime = 0;
     let producersCount = 0;
     let consumersCount = 0;
@@ -3075,7 +3190,7 @@ interface IConsumerConfig {
   routingKeys?: string[];
   groupId?: string;
   limit?: number;
-  autoAck?: boolean;
+  noAck?: boolean;
 }
 interface IConsumer<Data> {
   id: number;
@@ -3092,7 +3207,7 @@ class Consumer<Data> implements IConsumer<Data> {
     private readonly ackService: IAckService,
     private readonly subscriptionService: ISubscriptionService<Data>,
     public readonly id: number,
-    private readonly autoAck = false,
+    private readonly noAck = false,
     limit?: number
   ) {
     this.limit = Math.max(1, limit!);
@@ -3104,7 +3219,7 @@ class Consumer<Data> implements IConsumer<Data> {
     for (let i = 0; i < this.limit; i++) {
       const message = await this.consumptionService.consume(
         this.id,
-        this.autoAck
+        this.noAck
       );
       if (!message) break;
       messages.push(message);
@@ -3122,7 +3237,7 @@ class Consumer<Data> implements IConsumer<Data> {
   }
 
   subscribe(listener: ISubscriptionListener<Data>): void {
-    this.subscriptionService.subscribe(this.id, listener, this.autoAck);
+    this.subscriptionService.subscribe(this.id, listener, this.noAck);
   }
 
   unsubscribe(): void {
@@ -3168,21 +3283,13 @@ class DLQConsumer<Data> implements IDLQConsumer<Data> {
   ) {
     return this.dlqService.replayDlq(this.id, handler, filter);
   }
-
-  // subscribe(listener: (message: IDLQEntry<Data>) => Promise<void>): void {
-  //   this.topic.subscribe<IDLQEntry<Data>>(this.id, listener);
-  // }
-
-  // unsubscribe(): void {
-  //   this.topic.unsubscribe(this.id);
-  // }
 }
 interface IClientManagementService<Data> {
   createProducer(): IProducer<Data>;
   createConsumer(config?: IConsumerConfig, id?: number): IConsumer<Data>;
   createDLQConsumer(limit?: number): DLQConsumer<Data>;
   deleteClient(id: number): void;
-  getMetadata(): {
+  getMetrics(): {
     count: number;
     producersCount: number;
     consumersCount: number;
@@ -3218,7 +3325,7 @@ class ClientManagementService<Data> implements IClientManagementService<Data> {
     id = uniqueIntGenerator()
   ): IConsumer<Data> {
     this.clientManager.throwIfExists(id);
-    const { groupId, routingKeys, autoAck, limit } = config;
+    const { groupId, routingKeys, noAck, limit } = config;
     this.messageRouter.addConsumer(id, groupId, routingKeys);
     this.clientManager.addClient("consumer", id);
     this.queueManager.addQueue(id);
@@ -3230,7 +3337,7 @@ class ClientManagementService<Data> implements IClientManagementService<Data> {
       this.ackService,
       this.subscriptionService,
       id,
-      autoAck,
+      noAck,
       limit
     );
   }
@@ -3254,66 +3361,14 @@ class ClientManagementService<Data> implements IClientManagementService<Data> {
     this.logger?.log("client_deleted", { id });
   }
 
-  getMetadata() {
-    return this.clientManager.getMetadata();
+  getMetrics() {
+    return this.clientManager.getMetrics();
   }
 }
 //
 //
 //
 // SRC/TOPIC.TS
-interface IMetricsCollector {
-  recordEnqueue(byteSize: number, latencyMs: number): void;
-  recordDequeue(latencyMs: number): void;
-  getMetrics(): {
-    ts: number;
-    totalMessagesPublished: number;
-    totalBytes: number;
-    depth: number;
-    enqueueRate: number;
-    dequeueRate: number;
-    avgLatencyMs: number;
-  };
-}
-class TopicMetricsCollector implements IMetricsCollector {
-  private totalMessagesPublished = 0;
-  private totalBytes = 0;
-  private ts = Date.now();
-  private depth = 0;
-  private enqueueRate = 0;
-  private dequeueRate = 0;
-  private avgLatencyMs = 0; // Time in queue
-
-  recordEnqueue(byteSize: number, latencyMs: number): void {
-    this.totalMessagesPublished++;
-    this.totalBytes += byteSize;
-    this.depth += 1;
-    this.enqueueRate += 1;
-    this.updateAvgLatency(latencyMs);
-  }
-
-  recordDequeue(latencyMs: number): void {
-    this.depth -= 1;
-    this.dequeueRate += 1;
-    this.updateAvgLatency(latencyMs);
-  }
-
-  private updateAvgLatency(latencyMs: number) {
-    this.avgLatencyMs = this.avgLatencyMs * 0.9 + latencyMs * 0.1; // Exponential moving average
-  }
-
-  getMetrics() {
-    return {
-      ts: this.ts,
-      totalMessagesPublished: this.totalMessagesPublished,
-      totalBytes: this.totalBytes,
-      depth: this.depth,
-      enqueueRate: this.enqueueRate,
-      dequeueRate: this.dequeueRate,
-      avgLatencyMs: this.avgLatencyMs,
-    };
-  }
-}
 interface ITopicConfig {
   schema?: string; // registered schema` name
   persistThresholdMs?: number; // flush delay, 1000 default, if need ephemeral set Infinity
@@ -3326,6 +3381,8 @@ interface ITopicConfig {
   consumerInactivityThresholdMs?: number; // 600_000;
   consumerProcessingTimeThresholdMs?: number;
   consumerPendingThresholdMs?: number;
+  initialBackoffMs?: number; // e.g., 1000 ms
+  maxBackoffMs?: number; // e.g., 30_000 ms
   // partitions?: number;
   // archivalThresholdMs?: number; // 100_000
 }
@@ -3336,7 +3393,7 @@ interface ITopic<Data> {
   createConsumer(config: IConsumerConfig): IConsumer<Data>;
   createDLQConsumer(limit?: number): DLQConsumer<Data>;
   deleteClient(id: number): void;
-  getMetadata(): Promise<{
+  getMetrics(): Promise<{
     name: string;
     ts: number;
     totalMessagesPublished: number;
@@ -3392,6 +3449,15 @@ interface ITopic<Data> {
     };
   }>;
 }
+class TopicSerializer implements ISerializable {
+  constructor(private topicFactory: ITopicFactory) {}
+  serialize({ name, config }: ITopic<any>) {
+    return { name, config };
+  }
+  deserialize(data: { name: string; config: ITopicConfig }) {
+    return this.topicFactory.create(data.name, data.config);
+  }
+}
 class Topic<Data> implements ITopic<Data> {
   constructor(
     public readonly name: string,
@@ -3402,20 +3468,20 @@ class Topic<Data> implements ITopic<Data> {
     private readonly ackService: IAckService,
     private readonly dlqService: IDLQService<Data>,
     private readonly clientService: IClientManagementService<Data>,
-    private readonly storageService: IMessageStorage<Data>,
+    private readonly storageService: IMessageStore<Data>,
     private readonly metrics: IMetricsCollector
   ) {}
 
-  async getMetadata() {
+  async getMetrics() {
     return {
       name: this.name,
-      subscriptions: this.subscriptionService.getMetadata(),
-      clients: this.clientService.getMetadata(),
-      dlq: this.dlqService.getMetadata(),
-      storage: await this.storageService.getMetadata(),
-      ...this.ackService.getMetadata(),
-      ...this.publishingService.getMetadata(),
-      ...this.consumptionService.getMetadata(),
+      subscriptions: this.subscriptionService.getMetrics(),
+      clients: this.clientService.getMetrics(),
+      dlq: this.dlqService.getMetrics(),
+      storage: await this.storageService.getMetrics(),
+      ...this.ackService.getMetrics(),
+      ...this.publishingService.getMetrics(),
+      ...this.consumptionService.getMetrics(),
       ...this.metrics.getMetrics(),
     };
   }
@@ -3454,7 +3520,7 @@ class TopicFactory implements ITopicFactory {
     private queueFactory: new () => IPriorityQueue = BinaryHeapPriorityQueue,
     private storageFactory: new (
       ...args
-    ) => IMessageStorage<unknown> = LevelDBMessageStorage,
+    ) => IMessageStore<unknown> = LevelDBMessageStorage,
     private logService?: LogService
   ) {}
 
@@ -3473,7 +3539,7 @@ class TopicFactory implements ITopicFactory {
     const logger = this.logService?.forTopic(name);
 
     // Build modules
-    const messageStorage = new this.storageFactory(
+    const messageStore = new this.storageFactory(
       name,
       codec,
       mergedConfig.retentionMs,
@@ -3487,8 +3553,8 @@ class TopicFactory implements ITopicFactory {
       mergedConfig.consumerPendingThresholdMs
     );
     const queueManager = new QueueManager(this.queueFactory);
-    const dlqManager = new DLQManager<Data>(name, messageStorage, logger);
-    const deliveryCounter = new DeliveryCounter(messageStorage, metrics);
+    const dlqManager = new DLQManager<Data>(name, messageStore, logger);
+    const deliveryTracker = new DeliveryTracker(messageStore, metrics);
 
     const pendingAcks = new PendingAcks(
       clientManager,
@@ -3497,9 +3563,9 @@ class TopicFactory implements ITopicFactory {
     const subscriptionManager = new SubscriptionManager<Data>(
       clientManager,
       queueManager,
-      messageStorage,
+      messageStore,
       pendingAcks,
-      deliveryCounter,
+      deliveryTracker,
       logger
     );
 
@@ -3511,9 +3577,9 @@ class TopicFactory implements ITopicFactory {
     );
     const delayedManager = new DelayedMessageManager<Data>(
       new TimeoutScheduler<number>(new this.queueFactory()),
-      messageStorage,
+      messageStore,
       messageRouter,
-      deliveryCounter,
+      deliveryTracker,
       logger
     );
     const pipeline = new PipelineFactory<Data>().create(
@@ -3525,10 +3591,10 @@ class TopicFactory implements ITopicFactory {
 
     // Build services
     const publishingService = new PublishingService(
-      messageStorage,
+      messageStore,
       pipeline,
       messageRouter,
-      deliveryCounter,
+      deliveryTracker,
       clientManager,
       delayedManager,
       metrics,
@@ -3536,17 +3602,17 @@ class TopicFactory implements ITopicFactory {
     );
     const consumptionService = new ConsumptionService(
       queueManager,
-      messageStorage,
+      messageStore,
       pendingAcks,
-      deliveryCounter,
+      deliveryTracker,
       clientManager,
       logger
     );
     const ackService = new AckService(
       pendingAcks,
-      deliveryCounter,
+      deliveryTracker,
       ackMonitor,
-      messageStorage,
+      messageStore,
       pipeline,
       queueManager,
       subscriptionManager,
@@ -3598,6 +3664,58 @@ class TopicFactory implements ITopicFactory {
         "Invalid topic name. Use alphanumeric, underscore and hyphen characters."
       );
     }
+  }
+}
+type ITopicMetricType =
+  | "totalMessagesPublished"
+  | "totalBytes"
+  | "ts"
+  | "depth"
+  | "enqueueRate"
+  | "dequeueRate"
+  | "avgLatencyMs"; // Time in queue
+interface IMetricsCollector {
+  recordEnqueue(byteSize: number, latencyMs: number): void;
+  recordDequeue(latencyMs: number): void;
+  getMetrics(): Record<ITopicMetricType, number>;
+}
+class TopicMetricsCollector implements IMetricsCollector {
+  private metrics: IPersistedMap<ITopicMetricType, number>;
+
+  constructor(mapFactory: IPersistedMapFactory) {
+    this.metrics = mapFactory.create<ITopicMetricType, number>("metrics");
+  }
+
+  recordEnqueue(byteSize: number, latencyMs: number): void {
+    const totalMessages = this.metrics.get("totalMessagesPublished") ?? 0;
+    const totalBytes = this.metrics.get("totalBytes") ?? 0;
+    const depth = this.metrics.get("depth") ?? 0;
+    const enqueueRate = this.metrics.get("enqueueRate") ?? 0;
+    this.metrics.set("totalMessagesPublished", totalMessages + 1);
+    this.metrics.set("totalBytes", totalBytes + byteSize);
+    this.metrics.set("depth", depth + 1);
+    this.metrics.set("enqueueRate", enqueueRate + 1);
+    this.updateAvgLatency(latencyMs);
+  }
+
+  recordDequeue(latencyMs: number): void {
+    const depth = this.metrics.get("depth") ?? 0;
+    const dequeueRate = this.metrics.get("dequeueRate") ?? 0;
+    this.metrics.set("depth", depth - 1);
+    this.metrics.set("dequeueRate", dequeueRate + 1);
+    this.updateAvgLatency(latencyMs);
+  }
+
+  private updateAvgLatency(latencyMs: number) {
+    const avgLatencyMs = this.metrics.get("avgLatencyMs") ?? 0;
+    this.metrics.set("avgLatencyMs", avgLatencyMs * 0.9 + latencyMs * 0.1); // Exponential moving average
+  }
+
+  getMetrics() {
+    return Object.fromEntries(this.metrics.entries()) as Record<
+      ITopicMetricType,
+      number
+    >;
   }
 }
 //
@@ -3689,22 +3807,37 @@ class LogService implements ILogService {
     this.topicCollectors.forEach((collector) => collector.flush());
   }
 }
-interface ISchemaRegistry extends ISerializable {
-  register(name: string, schema: JSONSchemaType<any>): string;
-  getValidator(schemaRef: string): ((data: any) => boolean) | undefined;
-  getSchema<Data>(schemaRef: string): JSONSchemaType<Data> | undefined;
-  remove(schemaRef: string): void;
-  listSchemas(): string[];
+interface ISchemaValidator {
+  (data: any): boolean;
 }
-class SchemaRegistry implements ISchemaRegistry {
-  private schemas: PersistedMap<string, Map<number, JSONSchemaType<any>>>;
-  private validatorCache = new Map<
-    string,
-    Map<number, (data: any) => boolean>
-  >();
+class SchemaStore {
+  private schemas: PersistedMap<string, JSONSchemaType<any>>;
+
+  constructor(mapFactory: IPersistedMapFactory) {
+    this.schemas = mapFactory.create("schemas");
+  }
+
+  get<Data>(schemaId: string): JSONSchemaType<Data> | undefined {
+    return this.schemas.get(schemaId) as JSONSchemaType<Data>;
+  }
+
+  set(schemaId: string, schema: JSONSchemaType<any>): void {
+    this.schemas.set(schemaId, schema);
+  }
+
+  delete(schemaId: string): void {
+    this.schemas.delete(schemaId);
+  }
+
+  list(): string[] {
+    return Array.from(this.schemas.keys());
+  }
+}
+class ValidatorCache {
+  private validatorCache = new Map<string, ISchemaValidator>();
   private ajv: Ajv;
 
-  constructor(mapFactory: IPersistedMapFactory, options?: AjvOptions) {
+  constructor(options?: AjvOptions) {
     this.ajv = new Ajv({
       allErrors: true,
       coerceTypes: false,
@@ -3712,76 +3845,141 @@ class SchemaRegistry implements ISchemaRegistry {
       code: { optimize: true, esm: true },
       ...options,
     });
-
-    this.schemas = mapFactory.create("schemas", this);
   }
 
-  serialize(
-    schemaMap: Map<number, JSONSchemaType<any>>
-  ): [number, JSONSchemaType<any>][] {
-    return Array.from(schemaMap.entries());
+  getValidator(
+    schemaId: string,
+    schema: JSONSchemaType<any>
+  ): ISchemaValidator {
+    const cached = this.validatorCache.get(schemaId);
+    if (cached) return cached;
+
+    const validator = this.ajv.compile(schema);
+    this.validatorCache.set(schemaId, validator);
+    return validator;
   }
 
-  deserialize(
-    data: [number, JSONSchemaType<any>][],
-    schema: string
-  ): Map<number, JSONSchemaType<any>> {
-    const map = new Map();
-    for (const [k, v] of data) {
-      map.set(k, v);
-      this.validatorCache.get(schema)!.set(k, this.ajv.compile(v));
+  removeValidator(schemaId: string): void {
+    this.validatorCache.delete(schemaId);
+  }
+
+  clear(): void {
+    this.validatorCache.clear();
+  }
+}
+class SchemaVersionManager {
+  constructor(
+    private store: SchemaStore,
+    private compatibilityMode: "none" | "forward" | "backward" | "full"
+  ) {}
+
+  register(name: string, schema: JSONSchemaType<any>): string {
+    const latestKey = this.findLatestSchemaKey(name);
+
+    if (latestKey && this.compatibilityMode !== "none") {
+      const latestSchema = this.store.get(latestKey)!;
+
+      if (!validateSchema(latestSchema, schema, this.compatibilityMode)) {
+        throw new Error(
+          `Schema ${name} is not compatible in ${this.compatibilityMode} mode`
+        );
+      }
     }
-    return map;
+
+    const version = latestKey ? parseInt(latestKey.split(":")[1]) + 1 : 1;
+    const schemaId = `${name}:${version}`;
+    this.store.set(schemaId, schema);
+    return schemaId;
+  }
+
+  findLatestSchemaKey(name: string): string | undefined {
+    const candidates = this.store
+      .list()
+      .reduce<{ key: string; version: number }[]>((acc, key) => {
+        if (!key.startsWith(name + ":")) return acc;
+        return acc.concat({ key, version: parseInt(key.split(":")[1]) });
+      }, [])
+      .sort((a, b) => b.version - a.version);
+
+    return candidates[0]?.key;
+  }
+}
+class SchemaRegistry implements ISchemaRegistry {
+  private store: SchemaStore;
+  private validatorCache: ValidatorCache;
+  private versionManager: SchemaVersionManager;
+
+  constructor(
+    mapFactory: IPersistedMapFactory,
+    options?: AjvOptions,
+    compatibilityMode: "none" | "forward" | "backward" | "full" = "backward"
+  ) {
+    this.store = new SchemaStore(mapFactory);
+    this.validatorCache = new ValidatorCache(options);
+    this.versionManager = new SchemaVersionManager(
+      this.store,
+      compatibilityMode
+    );
   }
 
   register(name: string, schema: JSONSchemaType<any>): string {
-    if (!this.schemas.has(name)) {
-      this.schemas.set(name, new Map());
+    return this.versionManager.register(name, schema);
+  }
+
+  getValidator(schemaId: string): ISchemaValidator | undefined {
+    const [name, versionStr] = schemaId.split(":");
+    const version = parseInt(versionStr || "1");
+
+    const storedSchema = this.store.get<unknown>(`${name}:${version}`);
+    if (!storedSchema) return undefined;
+
+    return this.validatorCache.getValidator(schemaId, storedSchema);
+  }
+
+  getSchema<Data>(schemaId: string): JSONSchemaType<Data> | undefined {
+    const [name, versionStr] = schemaId.split(":");
+    const version = versionStr ? parseInt(versionStr) : undefined;
+
+    if (version) {
+      return this.store.get(`${name}:${version}`);
+    } else {
+      const latestKey = this.versionManager.findLatestSchemaKey(name);
+      return latestKey ? this.store.get(latestKey) : undefined;
     }
+  }
 
-    const schemaVersions = this.schemas.get(name)!;
-    const version = schemaVersions.size + 1;
-    schemaVersions.set(version, schema);
+  remove(schemaId: string): void {
+    const [name, versionStr] = schemaId.split(":");
+    const version = versionStr ? parseInt(versionStr) : undefined;
 
-    // Add to validator cache
-    if (!this.validatorCache.has(name)) {
-      this.validatorCache.set(name, new Map());
+    if (version) {
+      this.store.delete(`${name}:${version}`);
+      this.validatorCache.removeValidator(`${name}:${version}`);
+    } else {
+      // Remove all versions
+      for (const key of this.store.list()) {
+        if (key.startsWith(`${name}:`)) {
+          this.store.delete(key);
+          this.validatorCache.removeValidator(key);
+        }
+      }
     }
-    this.validatorCache.get(name)!.set(version, this.ajv.compile(schema));
-
-    return `${name}:${version}`;
-  }
-
-  getValidator(schemaRef: string): ((data: any) => boolean) | undefined {
-    const [name, versionStr] = schemaRef.split(":");
-    const version = parseInt(versionStr, 10);
-
-    if (Number.isNaN(version) || version <= 0) return undefined;
-
-    return this.validatorCache.get(name)?.get(version);
-  }
-
-  getSchema<Data>(schemaRef: string): JSONSchemaType<Data> | undefined {
-    const [name, versionStr] = schemaRef.split(":");
-    const version = parseInt(versionStr, 10);
-
-    if (Number.isNaN(version) || version <= 0) return undefined;
-
-    const schemaMap = this.schemas.get(name);
-    return schemaMap?.get(version) as JSONSchemaType<Data>;
-  }
-
-  remove(schemaRef: string): void {
-    const [name] = schemaRef.split(":");
-    this.schemas.delete(name);
-    this.validatorCache.delete(name);
   }
 
   listSchemas(): string[] {
-    return Array.from(this.schemas.keys()).map((name) => `${name}:latest`);
+    return Array.from(
+      new Set(this.store.list().map((key) => key.split(":")[0]))
+    ).map((name) => `${name}:latest`);
   }
 }
-interface ITopicRegistry extends ISerializable {
+interface ISchemaRegistry {
+  register(name: string, schema: JSONSchemaType<any>): string;
+  getValidator(schemaId: string): ISchemaValidator | undefined;
+  getSchema<Data>(schemaId: string): JSONSchemaType<Data> | undefined;
+  remove(schemaId: string): void;
+  listSchemas(): string[];
+}
+interface ITopicRegistry {
   create<Data>(name: string, config: ITopicConfig): ITopic<Data>;
   get(name: string): ITopic<any> | undefined;
   delete(name: string): void;
@@ -3795,16 +3993,10 @@ class TopicRegistry implements ITopicRegistry {
     private topicFactory: ITopicFactory,
     private logService?: ILogService
   ) {
-    this.topics = mapFactory.create("topics", this);
-  }
-
-  serialize(topic: ITopic<any>) {
-    const { name, config } = topic;
-    return { name, config };
-  }
-
-  deserialize(data: { name: string; config: ITopicConfig }) {
-    return this.topicFactory.create(data.name, data.config);
+    this.topics = mapFactory.create(
+      "topics",
+      new TopicSerializer(topicFactory)
+    );
   }
 
   create<Data>(name: string, config: ITopicConfig): ITopic<Data> {
@@ -3828,7 +4020,9 @@ class TopicRegistry implements ITopicRegistry {
   }
 
   get(name: string): ITopic<any> | undefined {
-    if (!this.topics.has(name)) throw new Error("Topic not found");
+    if (!this.topics.has(name)) {
+      throw new Error("Topic not found");
+    }
     return this.topics.get(name);
   }
 
@@ -3840,13 +4034,14 @@ class TopicRegistry implements ITopicRegistry {
   }
 }
 
+// delay before re-queuing (exponential backoff)
 // delete meta keys + encode/decode pointer
 // make all deletable/disposable
-// project structure
 // separation of conserns, ioc(inversify_js), visualize components and flows
-// At-least-once/Exactly-once: Your system already supports At-least-once delivery , which is a prerequisite for Exactly-once. These features ensure that no message is lost, but they do not prevent duplicates.
+// project structure (save snapshot before)
 
 // go to lmdb or redb
+// optional Exactly-Once: dedupId in MessageMetadata, Transactional Writes(Ensure state changes happen atomically), Consumer-side state tracking(Track processed IDs), Broker-side state coordination(Coordinate with external systems)
 // switch to Standalone server: you hit >50k msg/sec, cross-service/multi-lang support => need protobuf & lib/sdk per lang; for n-processes use proper-lockfile instead of custom Mutex
 
 // class ProtobufCodec implements ICodec {

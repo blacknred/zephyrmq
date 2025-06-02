@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { IPersistedMap, IPersistedMapFactory, ISerializable } from ".";
+import type { IPersistedMap, IPersistedMapFactory } from ".";
 
 export interface IHashService {
   hash(key: string): number;
@@ -12,7 +12,7 @@ export class SHA256HashService implements IHashService {
   }
 }
 
-export interface IHashRing extends ISerializable {
+export interface IHashRing {
   addNode(id: number): void;
   removeNode(id: number): void;
   getNodeCount(): number;
@@ -36,19 +36,16 @@ export class InMemoryHashRing implements IHashRing {
   ) {
     this.hashToNodeMap = mapFactory.create<number, number>(
       `hashToNodeMap:${label}`,
-      this
+      {
+        serialize: (node: number) => node,
+        deserialize: (node: number, hash: number): number => {
+          this.nodeIds.add(node);
+          this.sortedHashes.push(hash);
+          this.sortedHashes.sort((a, b) => a - b);
+          return node;
+        },
+      }
     );
-  }
-
-  serialize(node: number): number {
-    return node;
-  }
-
-  deserialize(node: number, hash: number): number {
-    this.nodeIds.add(node);
-    this.sortedHashes.push(hash);
-    this.sortedHashes.sort((a, b) => a - b);
-    return node;
   }
 
   addNode(id: number): void {
@@ -66,14 +63,8 @@ export class InMemoryHashRing implements IHashRing {
   }
 
   removeNode(id: number): void {
-    const hashesToRemove: number[] = [];
-    this.hashToNodeMap.forEach((nodeId, hash) => {
-      if (nodeId === id) {
-        hashesToRemove.push(hash);
-      }
-    });
-
-    for (const hash of hashesToRemove) {
+    for (const [nodeId, hash] of this.hashToNodeMap.entries()) {
+      if (nodeId !== id) continue;
       this.hashToNodeMap.delete(hash);
       const index = this.sortedHashes.indexOf(hash);
       if (index !== -1) {
