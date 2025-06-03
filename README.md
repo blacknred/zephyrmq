@@ -16,10 +16,9 @@ Designed for high scalability and reliability within a Nodejs monolith/msa.
 - `Consumption`: Consumers pull or subscribe (push) to messages from topics.
 - `Routing`: Based on consumer groups, correlation IDs, and routing keys (semantic routing).
 - `Queue fanout`: uses queue per consumer for message distribution. In contrary with virtual offsets it allows message priority, delay and other features.
-- `Delivery guaranties`: At-most-once (noAck) and At-least-once(manual ack) as RabbitMQ, AWS AQS, Azure Service Bus, Google Pub/Sub, NATS JetStream.
-- `Vs Kafka`: Besides being a message broker and Kafka being an high-perfomance event stream, they also differ in that: Kafka is Exactly-Once (idempotent processing, transactional writes, deduplication), Kafka has no message priority, no delayed delivery, and no DLQ.
-- `Acknowledgment`(ACK/NACK): Ensures reliable message processing in autoAck=false mode.
-- `Dead Letter Queue` (DLQ): For failed or expired messages, support replay
+- `Delivery guaranties`: Exactly-Once(deduplication, idempotent processing) while most message brokers are At-Least-Once(manual ack) by default.
+- `Acknowledgment`(ACK/NACK): Ensures reliable message processing in noAck=false mode.
+- `Dead Letter Queue` (DLQ): For failed or expired messages, support reading and replay
 - `Delayed Message`(Time To Delay) Delivery: Messages can be scheduled to become available after a delay.
 - `Message retention`(Time To Live): Expired messages go to DLQ
 - `Consistent hashing`: Hash ring is used to distribute messages among consumers.
@@ -33,20 +32,20 @@ Designed for high scalability and reliability within a Nodejs monolith/msa.
 1. Producer publishes a message to a topic.
 2. The message is validated, encoded, and stored.
 3. Publishing Service routes the message to consumers using:
-    - Routing keys: 1m => x∈n consumers
-      - consumers with routingKey get only messages with the same routingKey
-      - consumers without routingKey get all messages
-    - Consumer group membership: 1m => 1c per group
-      - load is scalled horizontally and balanced among group members by delivering to the only one consumer
-      - failover - if one fails, another takes over
-      - use cases: Worker pools, job queues, ordered streams, command handlers
-    - Correlation IDs: consistent message (sticky) processing (no race condition): 1m => 1c correlated
+   - Routing keys: 1m => x∈n consumers
+     - consumers with routingKey get only messages with the same routingKey
+     - consumers without routingKey get all messages
+   - Consumer group membership: 1m => 1c per group
+     - load is scalled horizontally and balanced among group members by delivering to the only one consumer
+     - failover - if one fails, another takes over
+     - use cases: Worker pools, job queues, ordered streams, command handlers
+   - Correlation IDs: consistent message (sticky) processing (no race condition): 1m => 1c correlated
 4. Consumers either:
-    - Pull from queue or
-    - Receive via push subscription
+   - Pull from queue or
+   - Receive via push subscription
 5. After processing:
-    - Message must be acknowledged (ACK) in no AutoACK
-    - If not ACK'd within timeout → NACK’d and optionally requeued
+   - Message must be acknowledged (ACK) in no AutoACK
+   - If not ACK'd within timeout → NACK’d and optionally requeued
 6. Failed messages go to DLQ .
 7. Delayed messages are queued until their delay expires.
 

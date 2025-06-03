@@ -460,6 +460,14 @@ class PersistedQueueFactory implements IPersistedQueueFactory {
     );
   }
 }
+class MapSerializer<K, V> implements ISerializable {
+  serialize(map: Map<K, V>): [K, V][] {
+    return Array.from(map);
+  }
+  deserialize(data: [K, V][]): Map<K, V> {
+    return new Map<K, V>(data);
+  }
+}
 class PersistedQueueSerializer<T> implements ISerializable {
   constructor(
     private queueFactory: IPersistedQueueFactory,
@@ -496,6 +504,7 @@ export class MessageMetadata {
   topic: string = "";
   correlationId?: string;
   routingKey?: string;
+  dedupId?: string; // new
 
   // Bit flags for optional fields (1 byte)
   get flags(): number {
@@ -510,7 +519,19 @@ export class MessageMetadata {
   }
 }
 interface IMessageValidator<Data> {
-  validate(data: { data: Data; size: number }): void;
+  validate(data: { data: Data; size: number; dedupId?: string }): void;
+}
+class DeduplicationValidator<Data> implements IMessageValidator<Data> {
+  constructor(private deduplicationTracker: IDeduplicationTracker) {}
+
+  validate({ dedupId }: { dedupId?: string }) {
+    if (!dedupId) return;
+    if (this.deduplicationTracker.has(dedupId)) {
+      throw new Error("Message was already published");
+    }
+
+    this.deduplicationTracker.add(dedupId);
+  }
 }
 class SchemaValidator<Data> implements IMessageValidator<Data> {
   constructor(
@@ -545,7 +566,10 @@ class CapacityValidator implements IMessageValidator<any> {
   }
 }
 interface MetadataInput
-  extends Pick<MessageMetadata, "priority" | "correlationId" | "ttd" | "ttl"> {}
+  extends Pick<
+    MessageMetadata,
+    "priority" | "correlationId" | "ttd" | "ttl" | "dedupId"
+  > {}
 interface IMessageCreationResult {
   meta: MessageMetadata;
   message?: Buffer;
@@ -570,26 +594,16 @@ class MessageFactory<Data> implements IMessageFactory<Data> {
     batch: Data[],
     metadataInput: MetadataInput & { topic: string; producerId: number }
   ) {
-    // const batchId = Date.now();
     return Promise.all(
-      batch.map(async (data, index) => {
+      batch.map(async (data) => {
         const meta = new MessageMetadata();
         Object.assign(meta, metadataInput);
         meta.id = uniqueIntGenerator();
-        meta.ts = Date.now();
-        // meta.attempts = 1;
-        // meta.needAcks = 0;
-
-        // if (batch.length > 1) {
-        //   meta.batchId = batchId;
-        //   meta.batchIdx = index;
-        //   meta.batchSize = batch.length;
-        // }
 
         try {
           const message = await this.codec.encode(data);
           this.validators.forEach((v) =>
-            v.validate({ data, size: message.length })
+            v.validate({ data, size: message.length, dedupId: meta.dedupId })
           );
           return { meta, message };
         } catch (error) {
@@ -1763,6 +1777,33 @@ class PipelineFactory<Data> implements IPipelineFactory<Data> {
     return pipeline;
   }
 }
+interface IDeduplicationTracker {
+  has(id: string): boolean;
+  add(id: string): void;
+}
+class DeduplicationTracker implements IDeduplicationTracker {
+  private seen: IPersistedMap<string, number>; // dedupId:timestamp
+  constructor(
+    mapFactory: IPersistedMapFactory,
+    private deduplicationWindowMs = 300_000
+  ) {
+    this.seen = mapFactory.create<string, number>("seen");
+  }
+
+  has(id: string): boolean {
+    const ts = this.seen.get(id);
+    if (!ts) return false;
+    if (Date.now() - ts > this.deduplicationWindowMs) {
+      this.seen.delete(id);
+      return false;
+    }
+    return true;
+  }
+
+  add(id: string): void {
+    this.seen.set(id, Date.now());
+  }
+}
 interface IDelayMonitor<Data> {
   setReadyCallback(onReadyHandler: (data: Data) => Promise<void>): void;
   schedule(data: Data, readyTs: number): void;
@@ -1858,7 +1899,7 @@ class DelayedMessageManager<Data> implements IDelayedMessageManager {
       return;
     }
 
-    const deliveryCount = await this.messageRouter.route(meta, excludes);
+    const deliveryCount = await this.messageRouter.route(meta);
     this.deliveryTracker.setAwaitedDeliveries(meta.id, deliveryCount);
     this.logger?.log(`Message is routed to ${meta.topic}.`, meta);
   };
@@ -1968,7 +2009,7 @@ class ConsumerGroupSerializer implements ISerializable {
 interface IMessageRouter {
   addConsumer(id: number, groupId?: string, routingKeys?: string[]): void;
   removeConsumer(id: number): void;
-  route(meta: MessageMetadata): Promise<number>;
+  route(meta: MessageMetadata, skipDLQ?: boolean): Promise<number>;
   routeBatch(metas: MessageMetadata[]): Promise<number[]>;
   getMetrics(): {
     consumerGroups: {
@@ -1985,7 +2026,8 @@ class MessageRouter<Data> implements IMessageRouter {
     private clientManager: IClientManager,
     private queueManager: IQueueManager,
     private subscriptionManager: ISubscriptionManager<Data>,
-    private dlqManager: IDLQManager<Data>
+    private dlqManager: IDLQManager<Data>,
+    private processedMessageTracker: IProcessedMessageTracker
   ) {
     this.consumerGroups = mapFactory.create<string, IConsumerGroup>(
       `groups`,
@@ -2031,7 +2073,7 @@ class MessageRouter<Data> implements IMessageRouter {
     }
   }
 
-  async route(meta: MessageMetadata): Promise<number> {
+  async route(meta: MessageMetadata, skipDLQ = false): Promise<number> {
     const results = await Promise.all(
       Array.from(this.consumerGroups.values()).map((group) =>
         this.groupRoute(group, meta)
@@ -2048,7 +2090,7 @@ class MessageRouter<Data> implements IMessageRouter {
     }
 
     // all consumers are non-operable or binded to other routingKeys
-    if (!processedCount) {
+    if (!skipDLQ && !processedCount) {
       this.dlqManager.enqueue(meta, "no_consumers");
     }
 
@@ -2072,7 +2114,8 @@ class MessageRouter<Data> implements IMessageRouter {
 
     for (const candidateId of candidates) {
       // filter candidate
-      if (!this.isSuitable(group, candidateId, now, routingKey)) continue;
+      if (!this.isSuitable(group, candidateId, meta.id, now, routingKey))
+        continue;
 
       // prefer idle consumer for single consumer mode
       if (isSingleConsumer && !this.clientManager.isIdle(candidateId)) {
@@ -2110,13 +2153,17 @@ class MessageRouter<Data> implements IMessageRouter {
   private isSuitable(
     group: IConsumerGroup,
     consumerId: number,
+    messageId: number,
     now: number,
     routingKey?: string
   ) {
+    // skip those who have processed it (exactly-once)
+    if (this.processedMessageTracker.has(consumerId, messageId)) return false;
+
     // skip non-operable members (backpressure)
     if (!this.clientManager.isOperable(consumerId, now)) return false;
 
-    // filtered-out
+    // filter by keys
     const expectedKeys = group.getMemberRoutingKeys(consumerId);
     return !expectedKeys?.length || expectedKeys.indexOf(routingKey!) !== -1;
   }
@@ -2259,8 +2306,9 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
   constructor(
     private readonly queueManager: IQueueManager,
     private readonly messageStore: IMessageStore<Data>,
-    private readonly pendingAcks: IPendingAcks,
+    private readonly pendingAcks: IAckRegistry,
     private readonly deliveryTracker: IDeliveryTracker,
+    private readonly processedMessageTracker: IProcessedMessageTracker,
     private readonly clientManager: IClientManager,
     private readonly logger?: ILogCollector
   ) {}
@@ -2275,7 +2323,7 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
     if (!meta || !message) return;
 
     if (!noAck) {
-      this.pendingAcks.addPending(consumerId, messageId);
+      this.pendingAcks.addAck(consumerId, messageId);
     } else {
       this.clientManager.recordActivity(consumerId, {
         messageCount: 1,
@@ -2284,6 +2332,7 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
         status: "idle",
       });
 
+      this.processedMessageTracker.add(consumerId, messageId);
       await this.deliveryTracker.decrementAwaitedDeliveries(messageId);
     }
 
@@ -2301,120 +2350,18 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
 //
 //
 // SRC/ACK_SERVICE.TS
-class PendingAcksEntry extends Map<number, number> {} // {messageId:ts}
-class PendingAcksEntrySerializer implements ISerializable {
-  serialize(entry: PendingAcksEntry) {
-    return Array.from(entry);
-  }
-  deserialize(data: [number, number][]) {
-    return new PendingAcksEntry(data);
-  }
-}
-interface IPendingAcks {
-  addPending(consumerId: number, messageId: number): void;
-  getPendings(consumerId: number): Map<number, number> | undefined;
-  getAllPendings(): IPersistedMap<number, Map<number, number>>;
-  removePending(consumerId: number, messageId?: number): void;
-  isReachedMaxUnacked(consumerId: number): boolean;
-  getMetrics(): {
-    count: number;
-  };
-}
-class PendingAcks implements IPendingAcks {
-  private pendingAcks: IPersistedMap<number, PendingAcksEntry>;
-
-  constructor(
-    mapFactory: IPersistedMapFactory,
-    private clientManager: IClientManager,
-    private maxUnackedPerConsumer = 10
-  ) {
-    this.pendingAcks = mapFactory.create<number, PendingAcksEntry>(
-      "pending_acks",
-      new PendingAcksEntrySerializer()
-    );
-  }
-
-  isReachedMaxUnacked(consumerId: number) {
-    return this.getPendings(consumerId)?.size === this.maxUnackedPerConsumer;
-  }
-
-  getMetrics() {
-    let count = 0;
-    const consumerAcks = this.pendingAcks.values();
-    for (const acks of consumerAcks) {
-      count += acks.size;
-    }
-    return { count };
-  }
-
-  addPending(consumerId: number, messageId: number): void {
-    if (!this.pendingAcks.has(consumerId)) {
-      this.pendingAcks.set(consumerId, new Map());
-    }
-    this.pendingAcks.get(consumerId)?.set(messageId, Date.now());
-
-    this.clientManager.recordActivity(consumerId, {
-      pendingAcks: 1,
-      status: "active",
-    });
-  }
-
-  getPendings(consumerId: number) {
-    return this.pendingAcks.get(consumerId);
-  }
-
-  getAllPendings() {
-    return this.pendingAcks;
-  }
-
-  removePending(consumerId: number, messageId?: number): void {
-    const pendings = this.pendingAcks.get(consumerId);
-    if (!pendings) return;
-    const now = Date.now();
-
-    if (messageId) {
-      if (pendings.has(messageId)) {
-        const consumedAt = pendings.get(messageId)!;
-        pendings.delete(messageId);
-
-        this.clientManager.recordActivity(consumerId, {
-          pendingAcks: -1,
-          messageCount: 1,
-          processingTime: now - consumedAt,
-          status: pendings.size ? "active" : "idle",
-        });
-      }
-    } else if (pendings.size) {
-      const firstConsumeAt = pendings.values().next().value as number;
-      this.clientManager.recordActivity(consumerId, {
-        pendingAcks: -pendings.size,
-        messageCount: pendings.size,
-        processingTime: Date.now() - firstConsumeAt,
-        status: "idle",
-      });
-
-      pendings.clear();
-    }
-
-    if (!pendings.size) {
-      this.pendingAcks.delete(consumerId);
-    }
-  }
-}
 interface IDeliveryTracker {
   setAwaitedDeliveries(messageid: number, deliveries: number): void;
   decrementAwaitedDeliveries(messageId: number): Promise<void>;
   decrementDeliveryAttempts(messageId: number): number;
   getDeliveryRetryBackoff(messageId: number): number;
 }
-class DeliveryEntry {
-  constructor(
-    public neededAcks: number,
-    public attempts: number
-  ) {}
+interface IDeliveryEntry {
+  awaited: number;
+  attempts: number;
 }
 class DeliveryTracker<Data> implements IDeliveryTracker {
-  private deliveries: IPersistedMap<number, DeliveryEntry>;
+  private deliveries: IPersistedMap<number, IDeliveryEntry>;
 
   constructor(
     mapFactory: IPersistedMapFactory,
@@ -2424,24 +2371,25 @@ class DeliveryTracker<Data> implements IDeliveryTracker {
     private readonly initialBackoffMs = 1000,
     private readonly maxBackoffMs = 30_000
   ) {
-    this.deliveries = mapFactory.create<number, DeliveryEntry>("deliveries");
+    this.deliveries = mapFactory.create<number, IDeliveryEntry>("deliveries");
   }
 
   private getOrCreateEntry(messageid: number) {
     const entry = this.deliveries.get(messageid);
-    return entry ?? new DeliveryEntry(0, Math.max(1, this.maxAttempts));
+    return entry ?? { awaited: 0, attempts: Math.max(1, this.maxAttempts) };
   }
 
   setAwaitedDeliveries(messageid: number, deliveries: number) {
     const entry = this.getOrCreateEntry(messageid);
-    entry.neededAcks = deliveries;
+    entry.awaited = deliveries;
+    entry.attempts = this.maxAttempts;
     this.deliveries.set(messageid, entry);
   }
 
   async decrementAwaitedDeliveries(messageId: number) {
     let entry = this.deliveries.get(messageId);
     if (!entry) return;
-    if (--entry.neededAcks > 0) {
+    if (--entry.awaited > 0) {
       this.deliveries.set(messageId, entry);
       return;
     }
@@ -2474,6 +2422,140 @@ class DeliveryTracker<Data> implements IDeliveryTracker {
     );
   }
 }
+interface IProcessedMessageTracker {
+  has(consumerId: number, messageId: number): boolean;
+  add(consumerId: number, messageId: number): void;
+  remove(consumerId: number, messageId: number): void;
+}
+class ProcessedMessageTracker implements IProcessedMessageTracker {
+  private processed: IPersistedMap<number, Map<number, number>>; // consumerId:{messageId:ts}
+
+  constructor(
+    mapFactory: IPersistedMapFactory,
+    private deduplicationWindowMs = 300_000
+  ) {
+    this.processed = mapFactory.create<number, Map<number, number>>(
+      "processed",
+      new MapSerializer<number, number>()
+    );
+  }
+
+  has(consumerId: number, messageId: number): boolean {
+    const processed = this.processed.get(consumerId);
+    if (!processed) return false;
+    const ts = processed.get(messageId);
+    if (!ts) return false;
+    if (Date.now() - ts > this.deduplicationWindowMs) {
+      processed.delete(messageId);
+      return false;
+    }
+    return true;
+  }
+
+  add(consumerId: number, messageId: number): void {
+    let processed = this.processed.get(consumerId);
+    if (!processed) {
+      processed = new Map();
+      this.processed.set(consumerId, processed);
+    }
+    processed.set(messageId, Date.now());
+  }
+
+  remove(consumerId: number, messageId: number): void {
+    this.processed.get(consumerId)?.delete(messageId);
+  }
+}
+interface IAckRegistry {
+  addAck(consumerId: number, messageId: number): void;
+  getAcks(consumerId: number): Map<number, number> | undefined;
+  getAllAcks(): IPersistedMap<number, Map<number, number>>;
+  removeAck(consumerId: number, messageId?: number): void;
+  isReachedMaxUnacked(consumerId: number): boolean;
+  getMetrics(): {
+    count: number;
+  };
+}
+class AckRegistry implements IAckRegistry {
+  private acks: IPersistedMap<number, Map<number, number>>; // consumerId:{messageId:ts}
+
+  constructor(
+    mapFactory: IPersistedMapFactory,
+    private clientManager: IClientManager,
+    private maxUnackedPerConsumer = 10
+  ) {
+    this.acks = mapFactory.create<number, Map<number, number>>(
+      "acks",
+      new MapSerializer<number, number>()
+    );
+  }
+
+  isReachedMaxUnacked(consumerId: number) {
+    return this.getAcks(consumerId)?.size === this.maxUnackedPerConsumer;
+  }
+
+  getMetrics() {
+    let count = 0;
+    const consumerAcks = this.acks.values();
+    for (const acks of consumerAcks) {
+      count += acks.size;
+    }
+    return { count };
+  }
+
+  addAck(consumerId: number, messageId: number): void {
+    if (!this.acks.has(consumerId)) {
+      this.acks.set(consumerId, new Map());
+    }
+    this.acks.get(consumerId)?.set(messageId, Date.now());
+
+    this.clientManager.recordActivity(consumerId, {
+      pendingAcks: 1,
+      status: "active",
+    });
+  }
+
+  getAcks(consumerId: number) {
+    return this.acks.get(consumerId);
+  }
+
+  getAllAcks() {
+    return this.acks;
+  }
+
+  removeAck(consumerId: number, messageId?: number): void {
+    const pendings = this.acks.get(consumerId);
+    if (!pendings) return;
+    const now = Date.now();
+
+    if (messageId) {
+      if (pendings.has(messageId)) {
+        const consumedAt = pendings.get(messageId)!;
+        pendings.delete(messageId);
+
+        this.clientManager.recordActivity(consumerId, {
+          pendingAcks: -1,
+          messageCount: 1,
+          processingTime: now - consumedAt,
+          status: pendings.size ? "active" : "idle",
+        });
+      }
+    } else if (pendings.size) {
+      const firstConsumeAt = pendings.values().next().value as number;
+      this.clientManager.recordActivity(consumerId, {
+        pendingAcks: -pendings.size,
+        messageCount: pendings.size,
+        processingTime: Date.now() - firstConsumeAt,
+        status: "idle",
+      });
+
+      pendings.clear();
+    }
+
+    if (!pendings.size) {
+      this.acks.delete(consumerId);
+    }
+  }
+}
 interface AckTimeoutHandler {
   (consumerId: number, messageId?: number, requeue?: boolean): Promise<number>;
 }
@@ -2486,7 +2568,7 @@ class AckMonitor implements IAckMonitor {
   private timer?: NodeJS.Timeout;
 
   constructor(
-    private pendingAcks: IPendingAcks,
+    private pendingAcks: IAckRegistry,
     private ackTimeoutMs = 30_000
   ) {
     this.timer = setInterval(
@@ -2505,7 +2587,7 @@ class AckMonitor implements IAckMonitor {
 
   private nackTimedOutPendings = async () => {
     const now = Date.now();
-    const pendings = this.pendingAcks.getAllPendings();
+    const pendings = this.pendingAcks.getAllAcks();
     if (!pendings) return;
     for (const [consumerId, messages] of pendings.entries()) {
       for (const [messageId, consumedAt] of messages.entries()) {
@@ -2531,10 +2613,12 @@ interface IAckService {
 }
 class AckService<Data> implements IAckService {
   constructor(
-    private readonly pendingAcks: IPendingAcks,
+    private readonly pendingAcks: IAckRegistry,
     private readonly deliveryTracker: IDeliveryTracker,
+    private readonly processedMessageTracker: IProcessedMessageTracker,
     private readonly ackMonitor: IAckMonitor,
     private readonly messageStore: IMessageStore<Data>,
+    private readonly messageRouter: IMessageRouter,
     private readonly pipeline: IMessagePipeline,
     private readonly subscriptionManager: ISubscriptionManager<Data>,
     private readonly delayedMessageManager: IDelayedMessageManager,
@@ -2548,14 +2632,15 @@ class AckService<Data> implements IAckService {
 
     if (messageId) {
       pendingAcks.push(messageId);
-      this.pendingAcks.removePending(consumerId, messageId);
+      this.pendingAcks.removeAck(consumerId, messageId);
     } else {
-      const pendingMap = this.pendingAcks.getPendings(consumerId);
+      const pendingMap = this.pendingAcks.getAcks(consumerId);
       if (pendingMap) pendingAcks.push(...pendingMap.keys());
-      this.pendingAcks.removePending(consumerId);
+      this.pendingAcks.removeAck(consumerId);
     }
 
     for (const messageId of pendingAcks) {
+      this.processedMessageTracker.add(consumerId, messageId);
       await this.deliveryTracker.decrementAwaitedDeliveries(messageId);
     }
 
@@ -2573,17 +2658,24 @@ class AckService<Data> implements IAckService {
     for (const messageId of messages) {
       const meta = await this.messageStore.readMetadata(messageId);
       if (!meta) continue;
-
-      await this.messageStore.unmarkDeletable(messageId);
       if (this.pipeline.process(meta)) continue;
 
-      // A message is only considered fully processed when all consumers have ACKed it
-      const delay = this.deliveryTracker.getDeliveryRetryBackoff(messageId);
-      meta.ttd = Date.now() - meta.ts + delay;
-      this.delayedMessageManager.enqueue(
-        meta,
-        requeue ? consumerId : undefined
-      );
+      // 1. consumer nacked with requeue=true: he will process message later so we send it to consumer queue after backoff
+      // 2. consumer nacked with requeue=false: he reject to process the message so mark message as processed by consumer and
+      //    reroute it with skipDLQ=true to avoid message ends up in dlq due the 'no_consumers' reason.
+      //    Consumer as well as other consumers which have processed the message will not get it again.
+      //    Rerouting helps to redeliver message to another consumer group member.
+      // 3. AckMonitor nacked(requeue=false): same as 2
+
+      if (requeue) {
+        const delay = this.deliveryTracker.getDeliveryRetryBackoff(messageId);
+        meta.ttd = Date.now() - meta.ts + delay;
+        this.delayedMessageManager.enqueue(meta, consumerId);
+      } else {
+        this.processedMessageTracker.add(consumerId, messageId);
+        const deliveryCount = await this.messageRouter.route(meta, true);
+        this.deliveryTracker.setAwaitedDeliveries(meta.id, deliveryCount);
+      }
 
       this.logger?.log(
         `Message is nacked to ${requeue ? consumerId : meta.topic}.`,
@@ -2631,8 +2723,9 @@ class SubscriptionManager<Data> implements ISubscriptionManager<Data> {
     private clientManager: ClientManager,
     private queueManager: QueueManager,
     private messageStore: IMessageStore<Data>,
-    private pendingAcks: PendingAcks,
+    private pendingAcks: AckRegistry,
     private deliveryTracker: DeliveryTracker<Data>,
+    private processedMessageTracker: IProcessedMessageTracker,
     private logger?: ILogCollector
   ) {}
 
@@ -2672,9 +2765,11 @@ class SubscriptionManager<Data> implements ISubscriptionManager<Data> {
     listener(message);
 
     if (!this.fanouts.has(consumerId)) {
-      this.pendingAcks.addPending(consumerId, meta.id);
+      this.pendingAcks.addAck(consumerId, meta.id);
       return true;
     }
+
+    this.processedMessageTracker.add(consumerId, meta.id);
 
     setImmediate(() => {
       this.logger?.log(`Message is consumed from ${meta.topic}.`, meta);
@@ -2909,18 +3004,17 @@ interface IClientState {
   pendingAcks: number;
 }
 class ClientState implements IClientState {
-  public id!: number;
-  public clientType!: ClientType;
-  public registeredAt!: number;
-  public lastActiveAt!: number;
-  public status!: ClientStatus;
-  public messageCount!: number;
-  public processingTime!: number;
-  public avgProcessingTime!: number;
-  public pendingAcks!: number;
-  constructor(state: IClientState) {
-    Object.assign(this, state);
-  }
+  public registeredAt = Date.now();
+  public lastActiveAt = Date.now();
+  public status: ClientStatus = "active";
+  public messageCount = 0;
+  public processingTime = 0;
+  public avgProcessingTime = 0;
+  public pendingAcks = 0;
+  constructor(
+    public id: number,
+    public clientType: ClientType
+  ) {}
 }
 class ClientStateSerializer {
   serialize(state: IClientState): Partial<IClientState> {
@@ -2928,7 +3022,8 @@ class ClientStateSerializer {
     return rest;
   }
   deserialize(state: Omit<IClientState, "lastActiveAt">): IClientState {
-    return new ClientState({ ...state, lastActiveAt: Date.now() });
+    const client = new ClientState(state.id, state.clientType);
+    return Object.assign(client, state);
   }
 }
 interface IClientManager {
@@ -2967,7 +3062,6 @@ class ClientManager implements IClientManager {
   }
 
   addClient(type: ClientType, id: number) {
-    const now = Date.now();
     const client = this.getClient(id);
 
     if (client) {
@@ -2978,18 +3072,7 @@ class ClientManager implements IClientManager {
       return;
     }
 
-    const state = new ClientState({
-      registeredAt: now,
-      lastActiveAt: now,
-      clientType: type,
-      messageCount: 0,
-      pendingAcks: 0,
-      processingTime: 0,
-      avgProcessingTime: 0,
-      status: "active",
-      id,
-    });
-
+    const state = new ClientState(id, type);
     this.clients.set(id, state);
     return state;
   }
@@ -3016,7 +3099,7 @@ class ClientManager implements IClientManager {
 
   throwIfExists(id: number) {
     if (this.clients.has(id)) {
-      throw new Error(`Client ID ${id} already exists`);
+      throw new Error(`Client with ID ${id} already exists`);
     }
   }
 
@@ -3383,6 +3466,7 @@ interface ITopicConfig {
   consumerPendingThresholdMs?: number;
   initialBackoffMs?: number; // e.g., 1000 ms
   maxBackoffMs?: number; // e.g., 30_000 ms
+  deduplicationWindowMs?: number;
   // partitions?: number;
   // archivalThresholdMs?: number; // 100_000
 }
@@ -3556,7 +3640,7 @@ class TopicFactory implements ITopicFactory {
     const dlqManager = new DLQManager<Data>(name, messageStore, logger);
     const deliveryTracker = new DeliveryTracker(messageStore, metrics);
 
-    const pendingAcks = new PendingAcks(
+    const pendingAcks = new AckRegistry(
       clientManager,
       mergedConfig.consumerPendingThresholdMs
     );
@@ -4034,14 +4118,15 @@ class TopicRegistry implements ITopicRegistry {
   }
 }
 
-// delay before re-queuing (exponential backoff)
 // delete meta keys + encode/decode pointer
+// update topic config
+
 // make all deletable/disposable
 // separation of conserns, ioc(inversify_js), visualize components and flows
 // project structure (save snapshot before)
 
-// go to lmdb or redb
-// optional Exactly-Once: dedupId in MessageMetadata, Transactional Writes(Ensure state changes happen atomically), Consumer-side state tracking(Track processed IDs), Broker-side state coordination(Coordinate with external systems)
+// go to lmdb or redb, use transactional writes(exactly once feature)
+// full Exactly-Once: deduplication(dedupId) & Consumer-side idempotent processing are DONE, Transactional Writes(Ensure state changes happen atomically), Broker-side state coordination(Coordinate with external systems)
 // switch to Standalone server: you hit >50k msg/sec, cross-service/multi-lang support => need protobuf & lib/sdk per lang; for n-processes use proper-lockfile instead of custom Mutex
 
 // class ProtobufCodec implements ICodec {
@@ -4216,3 +4301,445 @@ class TopicRegistry implements ITopicRegistry {
 //             - message_pack: encode(16k m/sec), decode(15k m/sec), size(100b), gc/cpu(medium)
 //        3. leveldb(+snappy)/rocksdb cpp addon
 //           - compressor comparision: gzip(zlib wrapper, 4x but slow)/brotli(+20% zlib, slow) => ZSTD(between gzip & snappy) => snappy(only 2x but fast)
+
+// ############################################## INTERNAL PARTITIONS #################################################################
+// If you want even more throughput, partition each topic internally like Kafka-style partitions:
+// Each partition gets its own queue, DLQ, delayed queue, etc. Consumers can subscribe to one or all partitions.
+// You can route messages across partitions using consistent hashing or round-robin.
+
+// ### 1. **Reduce Lock Contention**
+// If all messages go into a single queue, every producer and consumer must coordinate access to that shared structure. Even in a single thread, this leads to:
+
+// - Sequential enqueue/dequeue operations
+// - Potential bottlenecks in high-throughput scenarios
+// - Poor pipelining of async operations
+
+// ### 2. **Granular Consumer Scaling**
+// Partitioning allows consumers to scale independently per partition. For example:
+
+// - One slow consumer only affects one partition.
+// - Fast consumers can be assigned more partitions.
+// - Load balancing becomes easier via consistent hashing or round-robin strategies.
+
+// Even within a single thread, this enables better **pipelined execution** of async tasks like I/O, timers, and network calls.
+
+// ### 3. **Improved Message Ordering Guarantees**
+// If your system needs strict ordering **per key** (e.g., per user or per session), partitioning by key ensures:
+
+// - All messages for a given key go to the same partition
+// - Consumers process them in order within that partition
+// - No global lock required
+
+// Without partitioning, you'd need expensive synchronization mechanisms to preserve order globally.
+
+// ### 4. **Better Utilization of I/O-Bound Workloads**
+// Node.js excels at handling **I/O-bound** workloads (network, disk, timers). Partitions allow overlapping:
+
+// - Multiple producers writing to different partitions
+// - Consumers reading from different partitions concurrently (via event loop)
+// - Internal DLQs, delayed queues, etc., operating independently
+
+// This maximizes throughput under asynchronous I/O pressure.
+
+// ### 5. **Future-Proofing for Multi-Threading**
+// Even if you start with a single-threaded model, designing with partitions in mind makes it easy to later:
+
+// - Move each partition to a separate `worker_thread`
+// - Distribute partitions across machines
+// - Implement sharding patterns similar to Kafka
+
+// ### Step 1: Add Partition Count to Topic Config
+// ```ts
+// interface ITopicConfig<Data> {
+//   schema?: JSONSchemaType<Data>;
+//   persist?: boolean;
+//   retentionMs?: number;
+//   maxDeliveryAttempts?: number;
+//   maxMessageSize?: number;
+//   partitions?: number; // New field
+// }
+// ```
+
+// ### Step 2: Create Partitioned Queues in `TopicQueueManager`
+// ```ts
+// class TopicQueueManager {
+//   private partitionQueues: IPriorityQueue[];
+//   private routingStrategy: IRoutingStrategy;
+
+//   constructor(
+//     routingStrategy: IRoutingStrategy,
+//     private queueFactory: () => IPriorityQueue<Buffer>,
+//     private partitionCount: number
+//   ) {
+//     this.partitionQueues = Array.from({ length: partitionCount }, queueFactory);
+//     this.routingStrategy = routingStrategy;
+//   }
+
+//   getQueue(key?: string): IPriorityQueue {
+//     if (!key) return this.partitionQueues[0]; // Fallback
+
+//     const hash = this.routingStrategy.getConsumerId(key); // or custom partitioner
+//     const partitionIndex = Math.abs(hash!) % this.partitionCount;
+//     return this.partitionQueues[partitionIndex];
+//   }
+// }
+// ```
+
+// ### Step 3: Modify `Topic` Class to Accept Partitions
+// ```ts
+// class Topic<Data> {
+//   private readonly queues: TopicQueueManager;
+
+//   constructor(
+//     public name: string,
+//     private context: IContext,
+//     routingStrategy: IRoutingStrategy,
+//     private config?: ITopicConfig<Data>
+//   ) {
+//     const partitionCount = config?.partitions || 1;
+//     this.queues = new TopicQueueManager(routingStrategy, context.queueFactory, partitionCount);
+//   }
+// }
+// ```
+
+// ---
+
+// ## 🧱 Step 2: Add Internal Topic Partitioning
+
+// You already have a `TopicQueueManager`. We'll extend it to support internal partitioning.
+
+// ### 🔧 Update `ITopicConfig`
+// ```ts
+// // topics/types.ts
+// interface ITopicConfig<Data> {
+//   schema?: JSONSchemaType<Data>;
+//   persist?: boolean;
+//   retentionMs?: number;
+//   archivalThreshold?: number;
+//   maxSizeBytes?: number;
+//   maxDeliveryAttempts?: number;
+//   maxMessageSize?: number;
+//   partitions?: number; // add this
+// }
+// ```
+
+// ### 🔧 Modify `TopicQueueManager` to Support Partitions
+// ```ts
+// // topics/queue-manager.ts
+// class TopicQueueManager {
+//   private sharedQueue: IPriorityQueue;
+//   private unicastQueues = new Map<number, IPriorityQueue>();
+//   private partitionQueues: IPriorityQueue[];
+
+//   constructor(
+//     private routingStrategy: IRoutingStrategy,
+//     private queueFactory: () => IPriorityQueue<Buffer>,
+//     private partitionCount: number = 1
+//   ) {
+//     this.sharedQueue = this.queueFactory();
+//     this.partitionQueues = Array.from({ length: partitionCount }, queueFactory);
+//   }
+
+//   getPartitionIndex(key: string): number {
+//     const hash = this.routingStrategy.getConsumerId(key); // or custom hasher
+//     return Math.abs(hash!) % this.partitionQueues.length;
+//   }
+
+//   getQueue(key?: string): IPriorityQueue {
+//     if (key) {
+//       const targetConsumer = this.routingStrategy.getConsumerId(key);
+//       const unicastQueue = this.unicastQueues.get(targetConsumer);
+//       if (unicastQueue) return unicastQueue;
+
+//       const partitionIdx = this.getPartitionIndex(key);
+//       return this.partitionQueues[partitionIdx];
+//     }
+//     return this.sharedQueue;
+//   }
+
+//   addConsumerQueue(consumerId: number): void {
+//     this.unicastQueues.set(consumerId, this.queueFactory());
+//   }
+
+//   removeConsumerQueue(consumerId: number): void {
+//     this.unicastQueues.delete(consumerId);
+//   }
+
+//   enqueue(record: Buffer, meta: Metadata): void {
+//     const queue = this.getQueue(meta.correlationId);
+//     queue.enqueue(record, meta.priority);
+//   }
+
+//   dequeue(consumerId: number): Buffer | undefined {
+//     const queue = this.unicastQueues.get(consumerId);
+//     if (queue?.size()) return queue.dequeue();
+//     return this.sharedQueue.dequeue();
+//   }
+// }
+// ```
+
+// ### ✅ Update `Topic` Constructor
+// ```ts
+// // topics/topic.ts
+// constructor(
+//   public name: string,
+//   private context: IContext,
+//   routingStrategy: IRoutingStrategy,
+//   private config?: ITopicConfig<Data>
+// ) {
+//   const partitionCount = config?.partitions || 1;
+//   this.queues = new TopicQueueManager(routingStrategy, context.queueFactory, partitionCount);
+//   ...
+// }
+// ```
+
+// ## 🚫 So Why Do We Even Have Kafka-Style Partitions?
+
+// Kafka-style partitions exist because:
+// - Topics are high-throughput. It supports **millions of messages/sec**
+// - Consumers don't care about strict ordering per key
+// - Partitions allow horizontal scaling within a single topic
+// - Producers write to any partition
+// - Consumers read from one or more partitions
+
+// But these features come at the cost of complexity:
+// - Rebalancing logic
+// - Offset management
+// - Partition assignment strategies
+
+// But in your case:
+// - You **do** care about ordering per key
+// - You’re not trying to maximize throughput at all costs
+// - You prefer simplicity over scale-at-all-costs
+
+// So:
+// ❌ If you don’t need that level of scale, they’re overkill.
+
+// ############################################## LOG BASED QUEUE #################################################################
+
+// class OffsetTracker {
+//   constructor(private storage: IStorage, private topicName: string) {}
+
+//   async getOffset(consumerId: number): Promise<number> {
+//     const key = `offset:${this.topicName}:${consumerId}`;
+//     const buffer = await this.storage.get(this.topicName, key);
+//     return buffer ? buffer.readUInt32BE(0) : 0;
+//   }
+
+//   async commitOffset(consumerId: number, offset: number): Promise<void> {
+//     const key = `offset:${this.topicName}:${consumerId}`;
+//     const buffer = Buffer.alloc(4);
+//     buffer.writeUInt32BE(offset, 0);
+//     await this.storage.put(this.topicName, key, buffer);
+//   }
+// }
+
+// class Topic<Data> {
+//   private readonly offsetTracker: OffsetTracker;
+
+//   constructor(
+//     public name: string,
+//     private context: IContext,
+//     routingStrategy: IRoutingStrategy,
+//     private config?: ITopicConfig<Data>
+//   ) {
+//     this.offsetTracker = new OffsetTracker(context.storage, name);
+//     // ...
+//   }
+
+//   async send(record: Buffer, meta: Metadata): Promise<void> {
+//     if (await this.pipeline.process(record, meta)) return;
+
+//     // Write once to shared log
+//     const offset = await this.getNextOffset();
+//     await this.context.storage.put(this.name, `msg:${offset}`, record);
+
+//     this.metrics.recordMessagePublished(meta);
+//   }
+
+//   private async getNextOffset(): Promise<number> {
+//     const key = `__topic_offset__:${this.name}`;
+//     let current = 0;
+//     try {
+//       const buffer = await this.context.storage.get(this.name, key);
+//       current = buffer ? buffer.readUInt32BE(0) : 0;
+//     } catch {
+//       /* ignore */
+//     }
+//     const next = current + 1;
+//     const buffer = Buffer.alloc(4);
+//     buffer.writeUInt32BE(next, 0);
+//     await this.context.storage.put(this.name, key, buffer);
+//     return next;
+//   }
+
+//   async consume(consumerId: number): Promise<[Data, Metadata] | undefined> {
+//     const offset = await this.offsetTracker.getOffset(consumerId);
+//     const key = `msg:${offset}`;
+//     const record = await this.context.storage.get(this.name, key);
+//     if (!record) return;
+
+//     const message = this.context.codec.decode<Data>(record);
+//     if (await this.pipeline.process(record, message[1])) return;
+
+//     // Advance offset only after successful processing
+//     await this.offsetTracker.commitOffset(consumerId, offset + 1);
+
+//     return message;
+//   }
+// }
+// ```
+
+// ### USER
+// now it is make sense, but for every consume we need to scan offset-next messages with decoding all including those we will skip. Is it similar to consumer groups? cpu greedy consumption just for not duplicate messages per consumer (ram/disk optimization). Is it worth? Another approach: store log as map and use queues per consumer which store only messageId. Put message in log and fan out id to related consumer queues. Which approach is better for u?
+// ### USER
+// i like the log-scan approach, its smart and we can make codec decode only one metadata field (tags in this case) due to preposition. but in scale i think its may be not so fast like messageId fanout approach, especially in edge cases. also in second approach we can use buffer as queue because messageId is a number. Why kafka doesnt use this?
+// ### USER
+// Job queues and eventLog have distinct arch and seems like this lib should be doing one thing eventually.
+// I think i dont want kafka streaming. I just want a scallable message broker which is more like Rabbitmq i guess.
+// RabbitMq analogue: log is an exchange, offsets are binary queues(with messageId if log is map or messageIndex if log is list) binded to exchange but ram effective
+// Message marks will be deleted from the offsets on ack, if nack - also offset manipulation
+// But we need both routing and consistency hashing (correlationId) implementation here
+// What do u think?
+
+// ############################################## ROAD TO SERVER #################################################################
+
+// ### USER
+// If it goes to the standalone nodejs server how it will be scalled?
+
+// ## 🔍 TL;DR: Scaling Strategy for Your Standalone Broker
+
+// | Aspect | Strategy |
+// |-------|----------|
+// | Horizontal Scale | Use topic partitioning + consumer groups |
+// | Fault Tolerance | Add replication & WAL failover |
+// | Cross-Language Support | Expose gRPC or HTTP streaming API |
+// | Scalable Consumers | Use offset tracking + consumer groups |
+// | High Throughput | Offload CPU work (codec) to worker pool |
+// | Persistence | Keep LevelDB/WAL + optional Raft/RocksDB later |
+// | Cluster Coordination | Optional – use Redis, etcd, or Raft |
+
+// ---
+
+// ## ✅ Step-by-Step: From Embedded Lib to Standalone Broker
+
+// ### 1. 📦 Package Structure
+
+// Split the codebase into microservices-style layers:
+
+// ```
+// broker-server/
+// ├── core/               # Core logic (same as lib)
+// ├── api/                # REST/gRPC interface
+// ├── persistence/        # LevelDB/WAL/RocksDB
+// ├── cluster/            # Optional coordination layer
+// ├── cli/                # CLI tool for management
+// └── main.ts             # Entry point
+// ```
+
+// ### 3. 🧩 Define External Interface (gRPC Example)
+
+// ```protobuf
+// // proto/broker.proto
+// syntax = "proto3";
+
+// package broker;
+
+// service TopicService {
+//   rpc Produce(stream ProducerRequest) returns (ProducerResponse);
+//   rpc Consume(ConsumerRequest) returns (stream ConsumerResponse);
+//   rpc Ack(AckRequest) returns (AckResponse);
+//   rpc ReplayDlq(DlqReplayRequest) returns (DlqReplayResponse);
+// }
+
+// message ProducerRequest {
+//   string topic = 1;
+//   bytes data = 2;
+//   map<string, string> metadata = 3;
+// }
+
+// message ProducerResponse {
+//   repeated int64 ids = 1;
+// }
+
+// message ConsumerRequest {
+//   string topic = 1;
+//   int32 consumer_id = 2;
+//   int32 limit = 3;
+//   bool auto_ack = 4;
+// }
+
+// message ConsumerResponse {
+//   int64 id = 1;
+//   bytes data = 2;
+//   map<string, string> metadata = 3;
+// }
+
+// message AckRequest {
+//   string topic = 1;
+//   repeated int64 ids = 2;
+// }
+// ```
+
+// ---
+
+// ### 4. ⚙️ Scaling Internally in Node.js
+
+// Once it’s a server, you can scale using Node.js-native tools:
+
+// #### ✅ A. Multi-Core Parallelism with `cluster.fork()`
+
+// Use Node.js’ `cluster` module to run each topic on a separate process.
+
+// ```ts
+// import cluster from 'cluster';
+// import os from 'os';
+
+// if (cluster.isPrimary) {
+//   const numCPUs = os.cpus().length;
+//   for (let i = 0; i < numCPUs; i++) {
+//     cluster.fork();
+//   }
+// } else {
+//   // Worker process runs the actual broker
+//   startBroker();
+// }
+// ```
+
+// Each topic can be assigned to a thread via consistent hashing of topic name.
+
+// ### 9. 🪶 Lightweight Architecture Benefits
+
+// Even though it's a single server, you can still scale elegantly:
+
+// | Feature | Strategy |
+// |--------|----------|
+// | Single-threaded limits | Move to `cluster` or `worker_threads` |
+// | Consumer concurrency | Assign N consumers per topic |
+// | Message order guarantees | Sticky routing via key hash |
+// | Fan-out efficiency | Broadcast log + virtual offsets |
+// | Backpressure | Rate limiting + buffer control |
+// | Debugging | Metrics + tracing via OpenTelemetry |
+
+// ---
+
+// ### 1. **Isolate High-Traffic Topics into Dedicated Workers**
+
+// You can create a `TopicWorkerPool` that assigns certain topics to dedicated threads:
+
+// ```ts
+// class TopicWorkerPool {
+//   private workers = new Map<string, Worker>();
+//   constructor(private topicNames: string[]) {
+//     topicNames.forEach((name) => {
+//       this.workers.set(name, new Worker(`./topic-worker.js`, { env: { TOPIC: name } }));
+//     });
+//   }
+
+//   get(topicName: string): Worker {
+//     return this.workers.get(topicName)!;
+//   }
+// }
+// ```
+
+// Each worker handles its own queue, consumer routing, and persistence.
