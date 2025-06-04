@@ -46,10 +46,12 @@
     "start:container": "docker run -it --rm $npm_package_name:$npm_package_version"
   },
   "dependencies": {
+    "@msgpack/msgpack": "^3.1.2",
     "ajv": "^8.17.1",
     "crc-32": "^1.2.2",
     "json-schema-compatibility": "^1.1.0",
     "level": "^10.0.0",
+    "ox": "^0.7.2",
     "snappy": "^7.2.2",
     "ts-proto": "^2.7.1"
   },
