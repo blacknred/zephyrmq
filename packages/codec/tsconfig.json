@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@log-system/*": ["../../log-system/src/*"],
+      "@storage/*": ["../../persisted-storage/src/*"],
+      "@core/*": ["../../core/src/*"],
+      "@utils/*": ["../../utils/src/*"],
+      "@schema/*": ["../../schema-validation/src/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules"],
+  "references": [
+    { "path": "../log-system" },
+    { "path": "../persisted-storage" },
+    { "path": "../core" },
+    { "path": "../utils" },
+    { "path": "../schema-validation" }
+  ],
+  
+}

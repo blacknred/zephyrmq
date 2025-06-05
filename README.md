@@ -2,7 +2,9 @@
 ![Node.js](https://shields.io/badge/Node.js-417e38?logo=nodedotjs&logoColor=FFF&style=flat-square)
 [![Build Status](https://github.com/blcknrd/mbroker/workflows/Code%20quality%20checks/badge.svg)](https://github.com/blcknrd/mbroker/actions)
 
-# Zodiak ⚡️⚡️⚡️
+# zephyrmq
+
+![SVG Image](./logo.svg)
 
 LIGHWEIGHT HIGH-PERFOMANCE EMBEDDED MESSAGE BROKER FRAMEWORK
 

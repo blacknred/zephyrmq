@@ -1,59 +1,20 @@
 {
-  "name": "mbroker",
-  "version": "0.0.1",
+  "name": "zephyrmq",
   "description": "message broker in nodejs",
   "packageManager": "pnpm@10.11.0",
-  "homepage": "https://github.com/blacknred/mbroker#readme",
+  "private": true,
+    "homepage": "https://github.com/blacknred/zephyrmq#readme",
   "bugs": {
-    "url": "https://github.com/blacknred/mbroker/issues"
+    "url": "https://github.com/blacknred/zephyrmq/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/blacknred/mbroker.git"
+    "url": "git+https://github.com/blacknred/zephyrmq.git"
   },
   "license": "ISC",
   "author": "blcknrd",
-  "type": "module",
-  "files": [
-    "dist"
-  ],
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": "./dist/index.js",
-    "./package.json": "./package.json"
-  },
-  "engines": {
-    "node": ">=20.18.0"
-  },
-  "scripts": {
-    "lint": "eslint --cache .",
-    "lint:fix": "pnpm run lint --fix",
-    "build": "tsdown",
-    "dev": "tsdown --watch",
-    "dev:node": "node --experimental-default-config-file src/index.ts",
-    "test": "vitest",
-    "typecheck": "tsc --noEmit",
-    "format": "prettier --cache --write .",
-    "release": "bumpp && pnpm publish",
-    "prepublishOnly": "pnpm run build",
-    "tsgo": "tsgo",
-    "proto": "npx protoc --ts_proto_out=./src/generated --ts_proto_opt=outputEncodeMethods=true --proto_path=./src/proto ./src/proto/message.proto",
-    "start": "node ./dist/index.js",
-    "build:container": "docker build -t $npm_package_name:$npm_package_version .",
-    "check:container": "docker build --check .",
-    "start:container": "docker run -it --rm $npm_package_name:$npm_package_version"
-  },
-  "dependencies": {
-    "@msgpack/msgpack": "^3.1.2",
-    "ajv": "^8.17.1",
-    "crc-32": "^1.2.2",
-    "json-schema-compatibility": "^1.1.0",
-    "level": "^10.0.0",
-    "ox": "^0.7.2",
-    "snappy": "^7.2.2",
-    "ts-proto": "^2.7.1"
+  "workspaces": {
+    "packages": ["packages/*"]
   },
   "devDependencies": {
     "@types/node": "^22.15.26",
@@ -62,11 +23,12 @@
     "bumpp": "^10.1.1",
     "eslint": "^9.27.0",
     "eslint-plugin-prettier": "^5.4.0",
-    "pino": "^9.7.0",
+    "supertest": "^6.3.3",
     "prettier": "^3.5.3",
     "tsdown": "^0.12.4",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.33.0",
-    "vitest": "^3.1.4"
+    "vitest": "^3.1.4",
+    "pino": "^9.7.0"
   }
 }
