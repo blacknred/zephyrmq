@@ -1,19 +1,15 @@
-// @ts-check
-
-import eslint from '@eslint/js';
-import tseslint from 'typescript-eslint';
-import eslintPluginPrettierRecommended from 'eslint-plugin-prettier/recommended';
-
-export default tseslint.config(
-  {
-    ignores: ['**/node_modules/**', '**/dist/**']
+module.exports = {
+  root: true,
+  env: {
+    es2022: true,
+    node: true,
+    jest: true
   },
-  eslint.configs.recommended,
-  tseslint.configs.recommended,
-  eslintPluginPrettierRecommended,
-  {
-    rules: {
-      'no-console': 'off' // ['warn', { allow: ['warn', 'error'] }]
-    }
+  extends: ['eslint:recommended', 'plugin:@typescript-eslint/recommended'],
+  parser: '@typescript-eslint/parser',
+  plugins: ['@typescript-eslint'],
+  ignores: ['**/node_modules/**', '**/dist/**'],
+  rules: {
+    'no-console': 'off' // ['warn', { allow: ['warn', 'error'] }]
   }
-);
+};

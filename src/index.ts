@@ -595,674 +595,6 @@ class MessageFactory<Data> implements IMessageFactory<Data> {
 }
 //
 //
-//
-// SRC/MESSAGE_STORAGE_SERVICE.TS
-// wal: message durability, write as fast as possible: setImmediate flush + no snappy
-interface IWriteAheadLog {
-  append(data: Buffer): Promise<number | void>;
-  read(offset: number, length: number): Promise<Buffer | void>;
-  truncate(upToOffset: number): Promise<void>;
-  close(): Promise<void>;
-  getMetrics(): Promise<{
-    fileSize: number | undefined;
-    batchSize: number;
-    batchCount: number;
-    isFlushing: boolean;
-  }>;
-}
-class WriteAheadLog implements IWriteAheadLog {
-  private fileHandle?: fs.FileHandle;
-  private flushPromise?: Promise<void>;
-  private isFlushing = false;
-  private batch: Buffer[] = [];
-  private batchSize = 0;
-
-  constructor(
-    private filePath: string,
-    private maxBatchSizeBytes = 1 * 1024 * 1024,
-    private logger?: ILogCollector
-  ) {
-    this.init();
-  }
-
-  private async init() {
-    try {
-      await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-      this.fileHandle = await fs.open(this.filePath, "a+");
-    } catch (error) {
-      this.logger?.log("Failed to initialize WAL", { error }, "error");
-    }
-  }
-
-  private scheduleFlush(): Promise<void> | void {
-    if (!this.fileHandle) return;
-    if (this.isFlushing) return this.flushPromise!;
-    this.isFlushing = true;
-
-    this.flushPromise = new Promise<void>(async (resolve, reject) => {
-      setImmediate(async () => {
-        if (!this.fileHandle) return;
-        try {
-          const toWrite = Buffer.concat(this.batch);
-          await this.fileHandle.write(toWrite);
-          await this.fileHandle.sync();
-          this.batch = [];
-          this.batchSize = 0;
-          resolve();
-        } catch (err) {
-          reject(err);
-        } finally {
-          this.isFlushing = false;
-          this.flushPromise = undefined;
-
-          if (this.batch.length > 0) {
-            this.scheduleFlush();
-          }
-        }
-      });
-    });
-
-    return this.flushPromise;
-  }
-
-  [Symbol.asyncDispose]() {
-    return this.close();
-  }
-
-  // api
-
-  async append(data: Buffer): Promise<number | void> {
-    if (!this.fileHandle) return;
-
-    try {
-      const { size: offset } = await this.fileHandle.stat();
-      this.batch.push(data);
-      this.batchSize += data.length;
-
-      if (this.batchSize > this.maxBatchSizeBytes) {
-        this.scheduleFlush();
-      }
-
-      return offset;
-    } catch (error) {
-      this.logger?.log("Failed to append to WAL", { error }, "error");
-    }
-  }
-
-  async read(offset: number, length: number): Promise<Buffer | void> {
-    if (!this.fileHandle) return;
-
-    try {
-      const buffer = Buffer.alloc(length);
-      await this.fileHandle.read(buffer, 0, length, offset);
-      return buffer;
-    } catch (error) {
-      this.logger?.log("Failed to read from WAL", { error }, "error");
-    }
-  }
-
-  async truncate(upToOffset: number): Promise<void> {
-    try {
-      if (!this.fileHandle) {
-        this.fileHandle = await fs.open(this.filePath, "r+");
-      }
-
-      await this.fileHandle.truncate(upToOffset);
-      await this.fileHandle.sync();
-    } catch (error) {
-      this.logger?.log("Failed to truncate the WAL", { error }, "error");
-    }
-  }
-
-  async close() {
-    if (!this.fileHandle) return;
-    if (this.batch.length > 0) {
-      await this.scheduleFlush();
-    }
-    await this.fileHandle.close();
-  }
-
-  async getMetrics() {
-    const stats = await this.fileHandle?.stat();
-    return {
-      fileSize: stats?.size,
-      batchSize: this.batchSize,
-      batchCount: this.batch.length,
-      isFlushing: this.isFlushing,
-    };
-  }
-}
-// message_log: snappy, +fast_read(scan_within_segments), +easy_retention(delete_whole_segment), +compactable(create_new_segments_with_only_actual_data)
-interface ISegmentInfo {
-  id: number;
-  filePath: string;
-  indexFilePath: string;
-  baseOffset: number;
-  lastOffset: number;
-  size: number;
-  messageCount: number;
-  fileHandle?: fs.FileHandle;
-}
-export class SegmentPointer {
-  segmentId!: number;
-  offset!: number;
-  length!: number;
-  messageOffset!: number;
-}
-interface ISegmentManager {
-  getMaxSegmentSizeBytes(): number;
-  close(): Promise<void>;
-  getSegments(): Map<number, ISegmentInfo>;
-  getCurrentSegment(): ISegmentInfo | undefined;
-  setCurrentSegment(segment: ISegmentInfo): void;
-  getAllSegments(): ISegmentInfo[];
-}
-class SegmentManager implements ISegmentManager {
-  static HEADER_SIZE = 24;
-  private segments = new Map<number, ISegmentInfo>();
-  private currentSegment?: ISegmentInfo;
-
-  constructor(
-    private baseDir: string,
-    private maxSegmentSizeBytes: number,
-    private logger?: ILogCollector
-  ) {
-    this.init();
-  }
-
-  private async init(): Promise<void> {
-    await this.loadExistingSegments();
-    await this.ensureCurrentSegment();
-  }
-
-  private async loadExistingSegments(): Promise<void> {
-    try {
-      const files = await fs.readdir(this.baseDir);
-      for (const file of files.sort()) {
-        if (!file.endsWith(".segment")) continue;
-        const id = parseInt(file.split(".")[0], 10);
-        const filePath = path.join(this.baseDir, file);
-        const indexFilePath = filePath.replace(".segment", ".index");
-
-        const fileHandle = await fs.open(filePath, "r");
-        const header = Buffer.alloc(SegmentManager.HEADER_SIZE);
-        const { bytesRead } = await fileHandle.read(
-          header,
-          0,
-          SegmentManager.HEADER_SIZE,
-          0
-        );
-
-        let baseOffset = 0;
-        if (bytesRead >= SegmentManager.HEADER_SIZE) {
-          baseOffset = Number(header.readBigUInt64BE(6));
-        }
-
-        const messageCount = await this.countMessagesInSegment(fileHandle);
-        const stat = await fs.stat(filePath);
-
-        this.segments.set(id, {
-          id,
-          filePath,
-          indexFilePath,
-          baseOffset,
-          lastOffset: baseOffset + messageCount - 1,
-          size: stat.size,
-          messageCount,
-          fileHandle,
-        });
-      }
-    } catch (error) {
-      this.logger?.log(
-        "Failed to load MessageLog segments",
-        { error },
-        "error"
-      );
-    }
-  }
-
-  private async countMessagesInSegment(
-    fileHandle: fs.FileHandle
-  ): Promise<number> {
-    let pos = SegmentManager.HEADER_SIZE;
-    let count = 0;
-
-    while (true) {
-      const lenBuf = Buffer.alloc(8);
-      const { bytesRead } = await fileHandle.read(lenBuf, 0, 8, pos);
-      if (bytesRead < 8) break;
-
-      const length = lenBuf.readUInt32BE(0);
-      const checksum = lenBuf.readUInt32BE(4);
-      const msgBuffer = Buffer.alloc(length);
-
-      await fileHandle.read(msgBuffer, 0, length, pos + 8);
-
-      if (checksum !== crc.buf(msgBuffer)) break;
-      pos += 8 + length;
-      count++;
-    }
-
-    return count;
-  }
-
-  private async ensureCurrentSegment(): Promise<void> {
-    if (
-      this.currentSegment &&
-      this.currentSegment.size < this.maxSegmentSizeBytes
-    ) {
-      return;
-    }
-
-    let newId = 0;
-    if (this.segments.size > 0) {
-      newId = Math.max(...this.segments.keys()) + 1;
-    }
-
-    const filePath = path.join(this.baseDir, `${newId}.segment`);
-    const indexFilePath = filePath.replace(".segment", ".index");
-    const fileHandle = await fs.open(filePath, "w+");
-
-    const header = Buffer.alloc(SegmentManager.HEADER_SIZE);
-    header.writeUInt32BE(0xcafebabe, 0); // magic
-    header.writeUInt16BE(1, 4); // version
-    header.writeBigUInt64BE(BigInt(newId), 6); // base offset placeholder
-    header.writeBigUInt64BE(BigInt(Date.now()), 14); // timestamp
-
-    await fileHandle.write(header, 0, SegmentManager.HEADER_SIZE, 0);
-
-    const indexFileHandle = await fs.open(indexFilePath, "w");
-    await indexFileHandle.close();
-
-    const segment: ISegmentInfo = {
-      id: newId,
-      filePath,
-      indexFilePath,
-      baseOffset: newId,
-      lastOffset: newId,
-      size: SegmentManager.HEADER_SIZE,
-      messageCount: 0,
-      fileHandle,
-    };
-
-    this.currentSegment = segment;
-    this.segments.set(newId, segment);
-  }
-
-  getMaxSegmentSizeBytes() {
-    return this.maxSegmentSizeBytes;
-  }
-
-  async close() {
-    for (const seg of this.segments.values()) {
-      await seg.fileHandle?.close();
-    }
-    if (this.currentSegment?.fileHandle) {
-      await this.currentSegment.fileHandle.close();
-    }
-  }
-
-  getSegments() {
-    return this.segments;
-  }
-
-  getCurrentSegment() {
-    return this.currentSegment;
-  }
-
-  setCurrentSegment(segment: ISegmentInfo) {
-    this.currentSegment = segment;
-    this.segments.set(segment.id, segment);
-  }
-
-  getAllSegments() {
-    return Array.from(this.segments.values());
-  }
-}
-interface IIndexManager {
-  writeIndexEntry(segment: ISegmentInfo, record: SegmentPointer): Promise<void>;
-}
-class IndexManager implements IIndexManager {
-  static INDEX_ENTRY_SIZE = 12;
-  constructor(private logger?: ILogCollector) {}
-
-  async writeIndexEntry(
-    segment: ISegmentInfo,
-    record: SegmentPointer
-  ): Promise<void> {
-    try {
-      const indexEntry = Buffer.alloc(IndexManager.INDEX_ENTRY_SIZE);
-      indexEntry.writeBigUInt64BE(BigInt(record.messageOffset), 0);
-      indexEntry.writeUInt32BE(record.offset, 8);
-
-      const indexHandle = await fs.open(segment.indexFilePath, "a");
-      await indexHandle.write(
-        indexEntry,
-        0,
-        IndexManager.INDEX_ENTRY_SIZE,
-        segment.messageCount * IndexManager.INDEX_ENTRY_SIZE
-      );
-      await indexHandle.close();
-    } catch (error) {
-      this.logger?.log("Failed to write index entry", { error }, "error");
-    }
-  }
-}
-interface IMessageAppender {
-  append(data: Buffer): Promise<SegmentPointer | void>;
-}
-class MessageAppender implements IMessageAppender {
-  private mutex = new Mutex();
-
-  constructor(
-    private segmentManager: ISegmentManager,
-    private indexManager: IIndexManager,
-    private logger?: ILogCollector
-  ) {}
-
-  async append(data: Buffer): Promise<SegmentPointer | void> {
-    const segment = this.segmentManager.getCurrentSegment();
-    if (!segment) return;
-
-    await this.mutex.acquire();
-    try {
-      const checksum = crc.buf(data);
-      const lengthBuffer = Buffer.alloc(8);
-      lengthBuffer.writeUInt32BE(data.length, 0);
-      lengthBuffer.writeUInt32BE(checksum, 4);
-
-      const offset = segment.size;
-      await segment.fileHandle!.write(lengthBuffer, 0, 8, offset);
-      await segment.fileHandle!.write(data, 0, data.length, offset + 8);
-
-      const pointer = new SegmentPointer();
-      pointer.segmentId = segment.id;
-      pointer.offset = offset;
-      pointer.length = data.length;
-      pointer.messageOffset = segment.lastOffset + 1;
-
-      await this.indexManager.writeIndexEntry(segment, pointer);
-
-      segment.size += 8 + data.length;
-      segment.lastOffset += 1;
-      segment.messageCount += 1;
-
-      if (segment.size >= this.segmentManager.getMaxSegmentSizeBytes()) {
-        await segment.fileHandle!.sync();
-        await segment.fileHandle!.close();
-        segment.fileHandle = undefined;
-        this.segmentManager.setCurrentSegment({ ...segment }); // rotate
-      }
-
-      return pointer;
-    } catch (error) {
-      this.logger?.log("Failed to append to MessageLog", { error }, "error");
-    } finally {
-      this.mutex.release();
-    }
-  }
-}
-interface ILogMessageReader {
-  read(pointer: SegmentPointer): Promise<Buffer | void>;
-}
-class LogMessageReader implements ILogMessageReader {
-  constructor(
-    private segmentManager: ISegmentManager,
-    private logger?: ILogCollector
-  ) {}
-
-  async read(pointer: SegmentPointer): Promise<Buffer | void> {
-    const segment = this.segmentManager.getSegments().get(pointer.segmentId);
-    if (!segment) return;
-    try {
-      const buffer = Buffer.alloc(pointer.length);
-      await segment.fileHandle!.read(
-        buffer,
-        0,
-        pointer.length,
-        pointer.offset + 8
-      );
-      return buffer;
-    } catch (error) {
-      this.logger?.log("Failed to read from MessageLog", { error }, "error");
-    }
-  }
-}
-interface ICompactor {
-  compactSingleSegment(
-    segmentId: number,
-    offsetsToDelete: number[]
-  ): Promise<void>;
-}
-class Compactor implements ICompactor {
-  static HEADER_SIZE = 24;
-
-  constructor(
-    private baseDir: string,
-    private segmentManager: ISegmentManager,
-    private logger?: ILogCollector
-  ) {}
-
-  async compactSingleSegment(
-    segmentId: number,
-    offsetsToDelete: number[]
-  ): Promise<void> {
-    const segment = this.segmentManager.getSegments().get(segmentId);
-    if (!segment) return;
-
-    try {
-      const allRecords = await this.readAllFromSegment(segment);
-      const setToDelete = new Set(offsetsToDelete);
-      const filteredRecords = allRecords.filter(
-        (r) => !setToDelete.has(r.offset)
-      );
-
-      const newSegment = await this.createNewCompactedSegment(
-        segment,
-        filteredRecords
-      );
-
-      await this.replaceSegment(segment, newSegment);
-
-      this.segmentManager.getSegments().delete(segment.id);
-      this.segmentManager.getSegments().set(newSegment.id, newSegment);
-
-      if (this.segmentManager.getCurrentSegment()?.id === segment.id) {
-        this.segmentManager.setCurrentSegment(newSegment);
-      }
-    } catch (error) {
-      this.logger?.log(
-        `Failed to compact segment ${segmentId}`,
-        { error },
-        "error"
-      );
-    }
-  }
-
-  private async readAllFromSegment(
-    segment: ISegmentInfo
-  ): Promise<SegmentPointer[]> {
-    const result: SegmentPointer[] = [];
-    let pos = Compactor.HEADER_SIZE;
-
-    while (true) {
-      const lenBuf = Buffer.alloc(8);
-      let handle = segment.fileHandle;
-      if (!handle) handle = await fs.open(segment.filePath, "r");
-
-      const { bytesRead } = await handle.read(lenBuf, 0, 8, pos);
-      if (bytesRead < 8) break;
-
-      const length = lenBuf.readUInt32BE(0);
-      const checksum = lenBuf.readUInt32BE(4);
-      const msgBuffer = Buffer.alloc(length);
-
-      await handle.read(msgBuffer, 0, length, pos + 8);
-
-      if (checksum !== crc.buf(msgBuffer)) break;
-
-      const offsets = result.map((r) => r.messageOffset);
-      const messageOffset = Math.max(...offsets, segment.baseOffset - 1) + 1;
-
-      result.push({
-        segmentId: segment.id,
-        offset: pos,
-        length,
-        messageOffset,
-      });
-
-      pos += 8 + length;
-      if (!segment.fileHandle) await handle.close();
-    }
-    return result;
-  }
-
-  private async createNewCompactedSegment(
-    original: ISegmentInfo,
-    filteredRecords: SegmentPointer[]
-  ): Promise<ISegmentInfo> {
-    const newFilePath = path.join(this.baseDir, `${original.id}.compacted`);
-    const newFileHandle = await fs.open(newFilePath, "w+");
-
-    let originalHandle = original.fileHandle;
-    if (!originalHandle) {
-      originalHandle = await fs.open(original.filePath, "r");
-    }
-
-    const header = Buffer.alloc(Compactor.HEADER_SIZE);
-    const { bytesRead } = await originalHandle.read(
-      header,
-      0,
-      Compactor.HEADER_SIZE,
-      0
-    );
-    if (bytesRead < Compactor.HEADER_SIZE) {
-      throw new Error("Invalid segment header");
-    }
-
-    await newFileHandle.write(header, 0, Compactor.HEADER_SIZE, 0);
-
-    let currentPos = Compactor.HEADER_SIZE;
-
-    for (const record of filteredRecords) {
-      const buffer = Buffer.alloc(record.length);
-      let handle = original.fileHandle;
-
-      if (!handle) handle = await fs.open(original.filePath, "r");
-      await handle.read(buffer, 0, record.length, record.offset);
-      if (!original.fileHandle) await handle.close();
-
-      await newFileHandle.write(buffer, 0, buffer.length, currentPos);
-      currentPos += record.length;
-    }
-
-    await newFileHandle.sync();
-    await newFileHandle.close();
-
-    return {
-      id: original.id,
-      filePath: newFilePath,
-      baseOffset: original.baseOffset,
-      size: currentPos,
-      messageCount: filteredRecords.length,
-      fileHandle: undefined,
-    } as ISegmentInfo;
-  }
-
-  private async replaceSegment(
-    oldSegment: ISegmentInfo,
-    newSegment: ISegmentInfo
-  ): Promise<void> {
-    const oldPath = oldSegment.filePath;
-    const newPath = newSegment.filePath;
-
-    await fs.unlink(oldPath).catch(() => {});
-    await fs.rename(newPath, oldPath);
-    const fileHandle = await fs.open(oldPath, "r+");
-
-    newSegment.fileHandle = fileHandle;
-  }
-}
-interface IMessageLog {
-  append(data: Buffer): Promise<SegmentPointer | void>;
-  read(pointer: SegmentPointer): Promise<Buffer | void>;
-  compactSegmentsByRemovingOldMessages(
-    pointers: SegmentPointer[]
-  ): Promise<void>;
-  close(): Promise<void>;
-  getMetrics(): Promise<{
-    totalSize: number;
-    messageCount: number;
-    currentSegmentId: number | undefined;
-    segmentCount: number;
-  }>;
-}
-class MessageLog implements IMessageLog {
-  constructor(
-    private segmentManager: ISegmentManager,
-    private appender: IMessageAppender,
-    private reader: ILogMessageReader,
-    private compactor: ICompactor,
-    private logger?: ILogCollector
-  ) {}
-
-  async append(data: Buffer): Promise<SegmentPointer | void> {
-    return this.appender.append(data);
-  }
-
-  async read(pointer: SegmentPointer): Promise<Buffer | void> {
-    return this.reader.read(pointer);
-  }
-
-  async compactSegmentsByRemovingOldMessages(
-    pointers: SegmentPointer[]
-  ): Promise<void> {
-    const recordsBySegment = new Map<number, Set<number>>();
-    for (const pointer of pointers) {
-      if (!recordsBySegment.has(pointer.segmentId)) {
-        recordsBySegment.set(pointer.segmentId, new Set());
-      }
-      recordsBySegment.get(pointer.segmentId)?.add(pointer.offset);
-    }
-
-    const compactionPromises: Promise<void>[] = [];
-    for (const [segmentId, offsetsToDelete] of recordsBySegment.entries()) {
-      compactionPromises.push(
-        this.compactor.compactSingleSegment(segmentId, [...offsetsToDelete])
-      );
-    }
-
-    try {
-      await Promise.all(compactionPromises);
-    } catch (error) {
-      this.logger?.log("Failed to compact MessageLog", { error }, "error");
-    }
-  }
-
-  async close() {
-    await this.segmentManager.close();
-  }
-
-  async getMetrics() {
-    const segments = this.segmentManager.getAllSegments();
-    const currentSegmentId = this.segmentManager.getCurrentSegment()?.id;
-    const [totalSize, messageCount] = segments.reduce(
-      (sum, seg) => {
-        sum[0] += seg.size;
-        sum[1] += seg.messageCount;
-        return sum;
-      },
-      [0, 0]
-    );
-
-    return {
-      totalSize,
-      messageCount,
-      currentSegmentId,
-      segmentCount: segments.length,
-    };
-  }
-}
 // message_store
 interface IWALReplayer {
   replay(): Promise<void>;
@@ -1310,6 +642,7 @@ class WALReplayer implements IWALReplayer {
           pointer,
           SegmentPointerSchema
         );
+
         await this.db.batch([
           { type: "put", key: `meta!${meta.id}`, value: metaBuffer },
           { type: "put", key: `ptr!${meta.id}`, value: pointerBuffer },
@@ -2475,17 +1808,14 @@ interface IAckRegistry {
   };
 }
 class AckRegistry implements IAckRegistry {
-  private acks: IPersistedMap<number, Map<number, number>>; // consumerId:{messageId:ts}
+  private acks: IPersistedMap<number, Record<number, number>>; // consumerId:{messageId:ts}
 
   constructor(
     mapFactory: IPersistedMapFactory,
     private activityTracker: IClientActivityTracker,
     private maxUnackedPerConsumer = 10
   ) {
-    this.acks = mapFactory.create<number, Map<number, number>>(
-      "acks",
-      new MapSerializer<number, number>()
-    );
+    this.acks = mapFactory.create<number, Record<number, number>>("acks");
   }
 
   isReachedMaxUnacked(consumerId: number) {
@@ -3037,10 +2367,7 @@ class DLQService<Data> implements IDLQService<Data> {
 // SRC/CLIENT_MANAGEMENT_SERVICE.TS
 type ClientType = "producer" | "consumer" | "dlq_consumer";
 type ClientStatus = "active" | "idle" | "lagging";
-interface IClientState {
-  id: number;
-  clientType: ClientType;
-  registeredAt: number;
+interface IMutableClientState {
   lastActiveAt: number;
   // Metrics
   status: ClientStatus;
@@ -3049,9 +2376,11 @@ interface IClientState {
   avgProcessingTime: number;
   pendingAcks: number;
 }
-type IMutableClientState = Partial<
-  Omit<IClientState, "id" | "clientType" | "registeredAt">
->;
+interface IClientState extends IMutableClientState {
+  id: number;
+  clientType: ClientType;
+  registeredAt: number;
+}
 class ClientState implements IClientState {
   public registeredAt = Date.now();
   public lastActiveAt = Date.now();
@@ -3065,25 +2394,12 @@ class ClientState implements IClientState {
     public clientType: ClientType
   ) {}
 }
-class ClientStateSerializer {
-  serialize(state: IClientState): Partial<IClientState> {
-    const { lastActiveAt, ...rest } = state;
-    return rest;
-  }
-  deserialize(state: Omit<IClientState, "lastActiveAt">): IClientState {
-    const client = new ClientState(state.id, state.clientType);
-    return Object.assign(client, state);
-  }
-}
 interface IClientRegistry {
   addClient(type: ClientType, id: number): ClientState | undefined;
   removeClient(id: number): number;
   getClient(id: number): IClientState | undefined;
   getClients(filter?: (client: IClientState) => boolean): Set<IClientState>;
-  updateClient(
-    id: number,
-    state: Partial<Omit<IClientState, "id" | "clientType" | "registeredAt">>
-  ): void;
+  updateClient(id: number, state: IMutableClientState): void;
   exists(id: number): boolean;
   throwIfExists(id: number): void;
 }
@@ -3091,10 +2407,7 @@ class ClientRegistry implements IClientRegistry {
   private clients: IPersistedMap<number, IClientState>;
 
   constructor(mapFactory: IPersistedMapFactory) {
-    this.clients = mapFactory.create<number, IClientState>(
-      "clients",
-      new ClientStateSerializer()
-    );
+    this.clients = mapFactory.create<number, IClientState>("clients");
   }
 
   addClient(type: ClientType, id: number) {
@@ -3102,6 +2415,7 @@ class ClientRegistry implements IClientRegistry {
     if (client) return;
 
     const state = new ClientState(id, type);
+    state.lastActiveAt = Date.now();
     this.clients.set(id, state);
     return state;
   }
@@ -3206,111 +2520,6 @@ class ClientActivityTracker implements IClientActivityTracker {
     return !!client && client.status === "idle";
   }
 }
-
-// class LagAwareCircuitBreaker extends CircuitBreaker {
-//   private lagThresholdMs = 30_000;
-
-//   recordActivity(clientId: number, activity: Partial<IClientState>) {
-//     super.recordActivity(clientId, activity);
-//     const state = this.getClient(clientId);
-//     if (state && Date.now() - state.lastActiveAt > this.lagThresholdMs) {
-//       this.open();
-//     }
-//   }
-// }
-// class LagMonitor {
-//   constructor(private topic: ITopic<any>) {}
-//   async checkLag(consumerId: number) {
-//     const pending = this.topic.getMetadata().pendingAcks.count;
-//     const lastAck = this.topic.getMetadata().lastAckTime;
-//     const lag = Date.now() - lastAck;
-//     this.logger.log(`Consumer ${consumerId} has ${pending} pending messages`);
-//     if (lag > this.lagThresholdMs) {
-//       this.circuitBreaker.openCircuit(consumerId);
-//     }
-//   }
-// }
-// recordActivity(clientId: number, activityRecord: Partial<IClientState>) {
-//   const client = this.clients.get(clientId);
-//   if (!client) return;
-
-//   const now = Date.now();
-//   const windowMs = 60_000;
-//   client.messageCount++;
-//   client.activityLog ??= [];
-//   client.activityLog.push(now);
-
-//   // Clean up old entries
-//   client.activityLog = client.activityLog.filter(
-//     (ts) => now - ts < windowMs
-//   );
-
-//   if (client.messageCount > this.maxMessagesPerMinute) {
-//     throw new Error("Rate limit exceeded");
-//   }
-
-//   // Proceed with update
-//   for (let key in activityRecord) {
-//     if (typeof client[key] === "number") {
-//       client[key] += activityRecord[key];
-//     } else {
-//       client[key] = activityRecord[key];
-//     }
-//   }
-// }
-
-// class CircuitBreaker {
-//   constructor(
-
-//     private failureThreshold = 5;
-//   private resetTimeoutMs = 30_000;
-//   ) {
-
-//   }
-
-//   private failures = new Map<number, number>();
-//   private states = new Map<
-//     number,
-//     "closed" | "open" | "half_open"
-//   >();
-
-//   register(consumerId: number) {
-//     this.states.set(consumerId, "closed");
-//   }
-
-//   markFailure(consumerId: number): void {
-//     const count = (this.failures.get(consumerId) ?? 0) + 1;
-//     this.failures.set(consumerId, count);
-
-//     if (count >= this.failureThreshold) {
-//       this.openCircuit(consumerId);
-//     }
-//   }
-
-//   markSuccess(consumerId: number): void {
-//     this.failures.delete(consumerId);
-//     this.halfOpenCircuit(consumerId);
-//   }
-
-//   isOpen(consumerId: number): boolean {
-//     return this.states.get(consumerId) === "open";
-//   }
-
-//   private openCircuit(consumerId: number) {
-//     this.states.set(consumerId, "open");
-//     setTimeout(() => this.halfOpenCircuit(consumerId), this.resetTimeoutMs);
-//   }
-
-//   private halfOpenCircuit(consumerId: number) {
-//     this.states.set(consumerId, "half_open");
-//     setTimeout(() => this.closeCircuit(consumerId), 10_000);
-//   }
-
-//   private closeCircuit(consumerId: number) {
-//     this.states.set(consumerId, "closed");
-//     this.failures.delete(consumerId);
-//   }
-// }
 interface IClientMetricsCollector {
   getMetrics(): {
     count: number;
@@ -4394,6 +3603,68 @@ class TopicRegistry implements ITopicRegistry {
   }
 }
 
+// In Layered Arch Data Layer is rigid - knows concrete db impl
+// Clean Arch uses the idea of Dependency Inversion to solve this.
+// It says that the Domain Layer should not depend on the Data Layer.
+// Instead, the Data Layer should depend on interfaces from the Domain Layer.
+// Business logic no longer depends on how the data is received.
+// It does not care which network or database library is used.
+
+// is all about make domain contract-only and use di everywhere
+// usecases is a specific domain workflow that prevents domain logic leak into controllers/UI by
+// control Validating input data, Converting DTOs → Domain Objects, Handling errors consistently
+
+// Domain objects (core_interfaces, entities)
+// Application (usecase workflows(input_validation, dto=>domain_objects))
+// Infra ()
+
+// Testability: Mock IUserRepository easily in unit tests
+
+// Swappable Infrastructure: Change databases without touching use cases
+
+// // ✅ 1. Use Case (business rules only)
+// @Injectable()
+// export class RegisterUserUseCase {
+//   constructor(
+//     private userRepository: IUserRepository, // Interface
+//     private notifier: INotifier             // Interface
+//   ) {}
+
+//   async execute(command: RegisterUserCommand) {
+//     if (await this.userRepository.exists(command.email)) {
+//       throw new DomainException('Email taken'); // Domain exception
+//     }
+//     const user = User.create(command.email, command.password);
+//     await this.userRepository.save(user);
+//     await this.notifier.notify('USER_REGISTERED', user);
+//   }
+// }
+
+// // ✅ 2. Infrastructure Service (implements interface)
+// @Injectable()
+// export class UserRepository implements IUserRepository {
+//   // MongoDB/TypeORM implementation
+// }
+
+// // ✅ 3. Adapter (NestJS controller)
+// @Controller()
+// export class UserController {
+//   constructor(private registerUser: RegisterUserUseCase) {}
+
+//   @Post('/register')
+//   async register(@Body() body: RegisterUserDto) {
+//     await this.registerUser.execute(body);
+//   }
+// }
+
+// usecases knows how to delete
+
+// The Layers (From Inner to Outer)
+// - Entities: Enterprise-wide business objects (most stable)
+// - Use Cases: Application-specific business rules
+// - Interface Adapters: Convert data between use cases and external agencies
+// - Frameworks & Drivers: UI, databases, frameworks (most volatile)
+
 // codec now can throw => dlq "processing_error"
 // + mesage sampling, circuet broker, Message Throttling, Message Encryption
 // update topic config
@@ -4403,6 +3674,111 @@ class TopicRegistry implements ITopicRegistry {
 // make all deletable/disposable
 // separation of conserns, ioc(inversify_js), visualize components and flows
 // project structure (save snapshot before)
+
+// class LagAwareCircuitBreaker extends CircuitBreaker {
+//   private lagThresholdMs = 30_000;
+
+//   recordActivity(clientId: number, activity: Partial<IClientState>) {
+//     super.recordActivity(clientId, activity);
+//     const state = this.getClient(clientId);
+//     if (state && Date.now() - state.lastActiveAt > this.lagThresholdMs) {
+//       this.open();
+//     }
+//   }
+// }
+// class LagMonitor {
+//   constructor(private topic: ITopic<any>) {}
+//   async checkLag(consumerId: number) {
+//     const pending = this.topic.getMetadata().pendingAcks.count;
+//     const lastAck = this.topic.getMetadata().lastAckTime;
+//     const lag = Date.now() - lastAck;
+//     this.logger.log(`Consumer ${consumerId} has ${pending} pending messages`);
+//     if (lag > this.lagThresholdMs) {
+//       this.circuitBreaker.openCircuit(consumerId);
+//     }
+//   }
+// }
+// recordActivity(clientId: number, activityRecord: Partial<IClientState>) {
+//   const client = this.clients.get(clientId);
+//   if (!client) return;
+
+//   const now = Date.now();
+//   const windowMs = 60_000;
+//   client.messageCount++;
+//   client.activityLog ??= [];
+//   client.activityLog.push(now);
+
+//   // Clean up old entries
+//   client.activityLog = client.activityLog.filter(
+//     (ts) => now - ts < windowMs
+//   );
+
+//   if (client.messageCount > this.maxMessagesPerMinute) {
+//     throw new Error("Rate limit exceeded");
+//   }
+
+//   // Proceed with update
+//   for (let key in activityRecord) {
+//     if (typeof client[key] === "number") {
+//       client[key] += activityRecord[key];
+//     } else {
+//       client[key] = activityRecord[key];
+//     }
+//   }
+// }
+
+// class CircuitBreaker {
+//   constructor(
+
+//     private failureThreshold = 5;
+//   private resetTimeoutMs = 30_000;
+//   ) {
+
+//   }
+
+//   private failures = new Map<number, number>();
+//   private states = new Map<
+//     number,
+//     "closed" | "open" | "half_open"
+//   >();
+
+//   register(consumerId: number) {
+//     this.states.set(consumerId, "closed");
+//   }
+
+//   markFailure(consumerId: number): void {
+//     const count = (this.failures.get(consumerId) ?? 0) + 1;
+//     this.failures.set(consumerId, count);
+
+//     if (count >= this.failureThreshold) {
+//       this.openCircuit(consumerId);
+//     }
+//   }
+
+//   markSuccess(consumerId: number): void {
+//     this.failures.delete(consumerId);
+//     this.halfOpenCircuit(consumerId);
+//   }
+
+//   isOpen(consumerId: number): boolean {
+//     return this.states.get(consumerId) === "open";
+//   }
+
+//   private openCircuit(consumerId: number) {
+//     this.states.set(consumerId, "open");
+//     setTimeout(() => this.halfOpenCircuit(consumerId), this.resetTimeoutMs);
+//   }
+
+//   private halfOpenCircuit(consumerId: number) {
+//     this.states.set(consumerId, "half_open");
+//     setTimeout(() => this.closeCircuit(consumerId), 10_000);
+//   }
+
+//   private closeCircuit(consumerId: number) {
+//     this.states.set(consumerId, "closed");
+//     this.failures.delete(consumerId);
+//   }
+// }
 
 // LATER
 // 0. Hierarchical Topics (Nested topics like logs.debug, orders.payment, events.user.signup for Fine-grained routing, Subscription wildcards)
