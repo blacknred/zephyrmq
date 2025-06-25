@@ -1754,12 +1754,12 @@ class DeliveryTracker<Data> implements IDeliveryTracker {
     );
   }
 }
-interface IProcessedMessageTracker {
+interface IProcessedMessageRegistry {
   has(consumerId: number, messageId: number): boolean;
   add(consumerId: number, messageId: number): void;
   remove(consumerId: number, messageId: number): void;
 }
-class ProcessedMessageTracker implements IProcessedMessageTracker {
+class ProcessedMessageRegistry implements IProcessedMessageRegistry {
   private processed: IPersistedMap<number, Map<number, number>>; // consumerId:{messageId:ts}
 
   constructor(
@@ -2329,7 +2329,7 @@ interface IDLQService<Data> {
 class DLQService<Data> implements IDLQService<Data> {
   constructor(
     private readonly dlqManager: IDLQManager<Data>,
-    private readonly clientManager: IClientManager
+    private readonly clientManager: IClientActivityTracker
   ) {}
 
   createDlqReader() {

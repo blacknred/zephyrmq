@@ -40,16 +40,37 @@ export class MessageFactory<Data> implements IMessageFactory<Data> {
 }
 
 // MessageMetadata, ClientState
-// ITopic
 // ISchemaDefinition, ISchemaValidator, ISchemaSerializer,
-// IClientRegistry, 
-
-
-// CreateTopicUseCase, UpdateTopicConfigUseCase, ListTopicsUseCase, 
-// GetTopicUseCase(withMetrics), DeleteTopicUseCase, CollectTopicMetricsUseCase
+// ITopicRegistry
+// IClientRegistry
+// ISubscriptionRegistry
+// IDeadLetterRegistry
+// IDeliveryRegistry, IProcessedMessageRegistry, IAckRegistry
+// IQueueRegistry
+// IDeduplicationRegistry, IConsumerGroup, IConsumerGroupRegistry, IHashRing, IHashRingStore, IDelayedQueue
 // 
+
+// - schema
 // RegisterSchemaDefinitionUseCase, RemoveSchemaDefinitionUseCase
-// ListSchemaDefinitionUseCase, GetSchemaDefinition, GetSchemaValidator
+// ListSchemaDefinitionUseCase, GetSchemaDefinition
+// - topic
+// CreateTopicUseCase, ListTopicsUseCase, GetTopicUseCase(name, config),
+// UpdateTopicConfigUseCase, DeleteTopicUseCase, GetTopicMetricsUseCase
+// - client
+// CreateProducerUseCase, CreateConsumerUseCase, CreateDLQConsumerUseCase,
+// GetClientUseCase, ListClientsUseCase, DeleteClientUseCase
+
+// - dlq
+// CreateDLQReaderUseCase, ReplayDLQReaderUseCase
+// - publishing
+// PublishUseCase
+// - consumption
+// ConsumeUseCase, SubscribeUseCase, UnsubscribeUseCase
+// - ack
+// AckMessagesUseCase, UnackMessagesUseCase
+
+
+
 
 
 // domain: entities and interfaces for infra classes
