@@ -1,9 +1,9 @@
 import crc from "crc-32";
 import fs from "node:fs/promises";
 import path from "path";
+import type { ILogger } from "src/domain/interfaces/ILogger";
 import type { ISegmentInfo } from "src/domain/interfaces/ISegmentInfo";
 import type { ISegmentManager } from "src/domain/interfaces/ISegmentManager";
-import type { ILogCollector } from "../../utils/LogCollector";
 
 export class FileSegmentManager implements ISegmentManager {
   static HEADER_SIZE = 24;
@@ -14,7 +14,7 @@ export class FileSegmentManager implements ISegmentManager {
   constructor(
     private baseDir: string,
     private maxSegmentSizeBytes: number,
-    private logger?: ILogCollector
+    private logger?: ILogger
   ) {
     this.init();
   }
@@ -65,11 +65,7 @@ export class FileSegmentManager implements ISegmentManager {
         });
       }
     } catch (error) {
-      this.logger?.log(
-        "Failed to load MessageLog segments",
-        { error },
-        "error"
-      );
+      this.logger?.error("Failed to load MessageLog segments", { error });
     }
   }
 

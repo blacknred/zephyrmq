@@ -1,6 +1,6 @@
 import type { IAppender } from "../../domain/interfaces/IAppender";
 
-export class CreateClient {
+export class RegisterSchemaDefinition {
   constructor(private appender: IAppender) {}
 
   async execute(data: Buffer) {

@@ -1,15 +1,5 @@
-export interface ILogger {
-  info(msg: string, extra?: unknown): void;
-  warn(msg: string, extra?: unknown): void;
-  error(msg: string, extra?: unknown): void;
-  debug?(msg: string, extra?: unknown): void;
-}
-
-export interface ILogCollector {
-  log(msg: string, extra?: object, level?: keyof ILogger): void;
-  flush: () => void;
-  destroy(): void;
-}
+import type { ILogger } from "src/domain/interfaces/ILogger";
+import type { ILogCollector } from "src/domain/services/ILogCollector";
 
 export class LogCollector implements ILogCollector {
   private flushId?: NodeJS.Immediate;

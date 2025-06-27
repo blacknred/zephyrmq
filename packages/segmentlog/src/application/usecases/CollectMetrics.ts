@@ -6,14 +6,12 @@ export class CollectMetrics {
   async execute() {
     const currentSegmentId = this.segmentManager.getCurrentSegment()?.id;
     const segments = this.segmentManager.getAllSegments();
-    const [totalSize, recordCount] = segments.reduce(
-      (sum, seg) => {
-        sum[0] += seg.size;
-        sum[1] += seg.recordCount;
-        return sum;
-      },
-      [0, 0]
-    );
+    let totalSize = 0;
+    let recordCount = 0;
+    for (let segment of segments) {
+      totalSize += segment.size;
+      recordCount += segment.recordCount;
+    }
 
     return {
       totalSize,

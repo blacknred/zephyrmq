@@ -50,30 +50,8 @@ export class MessageFactory<Data> implements IMessageFactory<Data> {
 // IDeduplicationRegistry, IConsumerGroup, IConsumerGroupRegistry, IHashRing, IHashRingStore, IDelayedQueue
 // 
 
-// - schema
-// RegisterSchemaDefinitionUseCase, RemoveSchemaDefinitionUseCase
-// ListSchemaDefinitionUseCase, GetSchemaDefinition
-// - topic
-// CreateTopicUseCase, ListTopicsUseCase, GetTopicUseCase(name, config),
-// UpdateTopicConfigUseCase, DeleteTopicUseCase, GetTopicMetricsUseCase
-// - client
-// CreateProducerUseCase, CreateConsumerUseCase, CreateDLQConsumerUseCase,
-// GetClientUseCase, ListClientsUseCase, DeleteClientUseCase
-
-// - dlq
-// CreateDLQReaderUseCase, ReplayDLQReaderUseCase
-// - publishing
-// PublishUseCase
-// - consumption
-// ConsumeUseCase, SubscribeUseCase, UnsubscribeUseCase
-// - ack
-// AckMessagesUseCase, UnackMessagesUseCase
 
 
 
 
 
-// domain: entities and interfaces for infra classes
-// infra: work with io/cpu bound side effects
-// application: usecases(atomic domain operation, mostly public api) and non-state non-sideeffect 'utility' classes
-// factories: dedicated

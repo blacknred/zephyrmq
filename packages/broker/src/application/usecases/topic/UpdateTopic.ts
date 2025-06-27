@@ -1,5 +1,6 @@
 import type { IAppender } from "../../domain/interfaces/IAppender";
 
+// config
 export class UpdateTopic {
   constructor(private appender: IAppender) {}
 

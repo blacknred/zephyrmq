@@ -1,2 +1,2 @@
 export * from "./domain/ports/IWriteAheadLog";
-export { WriteAheadLogFactory } from "./factories/WalFactory";
+export { FileWriteAheadLogFactory } from "./factories/FileWalFactory";

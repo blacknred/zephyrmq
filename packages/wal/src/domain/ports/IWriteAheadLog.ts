@@ -4,7 +4,7 @@ export interface IWriteAheadLog {
   truncate(upToOffset: number): Promise<void>;
   close(): Promise<void>;
   getMetrics(): Promise<{
-    fileSize: number | undefined;
+    size: number | undefined;
     batchSize: number;
     batchCount: number;
     isFlushing: boolean;

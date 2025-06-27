@@ -1,6 +1,5 @@
 import type { IAppender } from "../../domain/interfaces/IAppender";
 
-// name, config, metrics
 export class GetTopicMetrics {
   constructor(private appender: IAppender) {}
 

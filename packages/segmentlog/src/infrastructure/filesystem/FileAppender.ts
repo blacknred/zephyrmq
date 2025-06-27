@@ -3,8 +3,8 @@ import { SegmentPointer } from "src/domain/entities/SegmentPointer";
 import type { IAppender } from "src/domain/interfaces/IAppender";
 import type { IIndexManager } from "src/domain/interfaces/IIndexManager";
 import type { ISegmentManager } from "src/domain/interfaces/ISegmentManager";
-import type { ILogCollector } from "../../utils/LogCollector";
 import { Mutex } from "../../utils/Mutex";
+import type { ILogger } from "src/domain/interfaces/ILogger";
 
 export class FileAppender implements IAppender {
   private mutex = new Mutex();
@@ -12,7 +12,7 @@ export class FileAppender implements IAppender {
   constructor(
     private segmentManager: ISegmentManager,
     private indexManager: IIndexManager,
-    private logger?: ILogCollector
+    private logger?: ILogger
   ) {}
 
   async append(data: Buffer): Promise<SegmentPointer | void> {
@@ -52,7 +52,7 @@ export class FileAppender implements IAppender {
 
       return pointer;
     } catch (error) {
-      this.logger?.log("Failed to append to MessageLog", { error }, "error");
+      this.logger?.error("Failed to append to MessageLog", { error });
     } finally {
       this.mutex.release();
     }

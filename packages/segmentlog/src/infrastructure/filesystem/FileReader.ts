@@ -1,12 +1,12 @@
 import type { SegmentPointer } from "src/domain/entities/SegmentPointer";
+import type { ILogger } from "src/domain/interfaces/ILogger";
 import type { IReader } from "src/domain/interfaces/IReader";
 import type { ISegmentManager } from "src/domain/interfaces/ISegmentManager";
-import type { ILogCollector } from "../../utils/LogCollector";
 
 export class FileReader implements IReader {
   constructor(
     private segmentManager: ISegmentManager,
-    private logger?: ILogCollector
+    private logger?: ILogger
   ) {}
 
   async read(pointer: SegmentPointer): Promise<Buffer | void> {
@@ -24,7 +24,7 @@ export class FileReader implements IReader {
 
       return buffer;
     } catch (error) {
-      this.logger?.log("Failed to read", { error }, "error");
+      this.logger?.error("Failed to read", { error });
     }
   }
 }

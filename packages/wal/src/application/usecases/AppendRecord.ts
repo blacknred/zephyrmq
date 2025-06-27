@@ -1,6 +1,6 @@
-import type { IAppender } from "../../domain/interfaces/IAppender";
+import type { IAppender } from "../../domain/ports/IAppender";
 
-export class CreateClient {
+export class AppendRecord {
   constructor(private appender: IAppender) {}
 
   async execute(data: Buffer) {

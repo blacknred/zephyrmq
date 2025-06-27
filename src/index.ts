@@ -3319,6 +3319,8 @@ class LogService implements ILogService {
     this.topicCollectors.forEach((collector) => collector.flush());
   }
 }
+
+
 // schema_registry
 interface ISchemaDefRecord<T> {
   schemaDef: JSONSchemaType<T>;

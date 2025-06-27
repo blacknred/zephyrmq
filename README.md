@@ -40,15 +40,15 @@ Designed for high scalability and reliability within a Nodejs monolith/msa.
    - Consumer group membership: 1m => 1c per group
      - load is scalled horizontally and balanced among group members by delivering to the only one consumer
      - failover - if one fails, another takes over
-     - use cases: Worker pools, job queues, ordered streams, command handlers
+     - use cases: worker pools, job queues, ordered streams, command handlers
    - Correlation IDs: consistent message (sticky) processing (no race condition): 1m => 1c correlated
 4. Consumers either:
-   - Pull from queue or
+   - Pull from queue
    - Receive via push subscription
 5. After processing:
-   - Message must be acknowledged (ACK) in no AutoACK
+   - Message must be acknowledged (ACK) in no AutoACK mode
    - If not ACK'd within timeout → NACK’d and optionally requeued
-6. Failed messages go to DLQ .
+6. Failed messages go to DLQ.
 7. Delayed messages are queued until their delay expires.
 
 ### ✅ Use Cases

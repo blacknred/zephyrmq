@@ -3,9 +3,9 @@ import fs from "fs/promises";
 import path from "path";
 import type { SegmentPointer } from "src/domain/entities/SegmentPointer";
 import type { ICompactor } from "src/domain/interfaces/ICompactor";
+import type { ILogger } from "src/domain/interfaces/ILogger";
 import type { ISegmentInfo } from "src/domain/interfaces/ISegmentInfo";
 import type { ISegmentManager } from "src/domain/interfaces/ISegmentManager";
-import type { ILogCollector } from "../../utils/LogCollector";
 
 export class FileCompactor implements ICompactor {
   static HEADER_SIZE = 24;
@@ -13,7 +13,7 @@ export class FileCompactor implements ICompactor {
   constructor(
     private baseDir: string,
     private segmentManager: ISegmentManager,
-    private logger?: ILogCollector
+    private logger?: ILogger
   ) {}
 
   async compact(deletedPointers: SegmentPointer[]): Promise<void> {
@@ -36,7 +36,7 @@ export class FileCompactor implements ICompactor {
     try {
       await Promise.all(compactionPromises);
     } catch (error) {
-      this.logger?.log("Failed to compact segments", { error }, "error");
+      this.logger?.error("Failed to compact segments", { error });
     }
   }
 
@@ -68,11 +68,7 @@ export class FileCompactor implements ICompactor {
         this.segmentManager.setCurrentSegment(newSegment);
       }
     } catch (error) {
-      this.logger?.log(
-        `Failed to compact segment ${segmentId}`,
-        { error },
-        "error"
-      );
+      this.logger?.error(`Failed to compact segment ${segmentId}`, { error });
     }
   }
 

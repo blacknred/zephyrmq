@@ -1,6 +1,6 @@
 import type { IAppender } from "../../domain/interfaces/IAppender";
 
-export class CreateClient {
+export class SubscribeToMessages {
   constructor(private appender: IAppender) {}
 
   async execute(data: Buffer) {
