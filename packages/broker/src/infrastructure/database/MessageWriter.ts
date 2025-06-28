@@ -1,10 +1,13 @@
+import type { ISegmentLog } from "@segmentlog/index";
+import type { IWriteAheadLog } from "@wal/index";
 import type { MessageMetadata } from "src/domain/models/MessageMetadata";
+import type { ILogCollector } from "src/domain/services/ILogCollector";
 import type { IMessageWriter } from "src/domain/services/IMessageWriter";
 
 export class MessageWriter implements IMessageWriter {
   constructor(
     private wal: IWriteAheadLog,
-    private log: IMessageLog,
+    private log: ISegmentLog,
     private db: Level<string, Buffer>,
     private codec: ICodec,
     private logger?: ILogCollector,

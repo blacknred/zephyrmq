@@ -3,7 +3,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@encoder/*": ["../encoder/src/*"],
+      "@codec/*": ["../codec/src/*"],
       "@segmentlog/*": ["../segmentlog/src/*"],
       "@wal/*": ["../wal/src/*"],
       "@pds/*": ["../pds/src/*"]
@@ -12,7 +12,7 @@
   "include": ["src/**/*"],
   "exclude": ["node_modules"],
   "references": [
-    { "path": "../encoder" },
+    { "path": "../codec" },
     { "path": "../segmentlog" },
     { "path": "../wal" },
     { "path": "../pds" }

@@ -13,11 +13,7 @@ import { FileReader } from "src/infrastructure/filesystem/FileReader";
 import { FileSegmentManager } from "src/infrastructure/filesystem/FileSegmentManager";
 import { FileCompactor } from "../infrastructure/filesystem/FileCompactor";
 
-export interface ISegmentLogFactory {
-  create(name: string): ISegmentLog;
-}
-
-export class FileSegmentLogFactory implements ISegmentLogFactory {
+export class FileSegmentLogFactory {
   constructor(
     private readonly baseDir: string,
     private readonly maxSegmentSizeBytes: number = 10 * 1024 * 1024, // 10MB

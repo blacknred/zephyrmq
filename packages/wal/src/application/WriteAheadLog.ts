@@ -5,7 +5,7 @@ import type { CollectMetrics } from "./usecases/CollectMetrics";
 import type { ReadRecord } from "./usecases/ReadRecord";
 import type { TruncateRecords } from "./usecases/TruncateRecords";
 
-export class FileWriteAheadLog implements IWriteAheadLog {
+export class WriteAheadLog implements IWriteAheadLog {
   constructor(
     private appendRecord: AppendRecord,
     private readRecord: ReadRecord,

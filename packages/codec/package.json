@@ -1,5 +1,5 @@
 {
-  "name": "@zephyrmq/encoder",
+  "name": "@zephyrmq/codec",
   "version": "0.0.1",
   "description": "binary codec for @zephyrmq",
   "type": "module",
