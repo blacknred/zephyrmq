@@ -1,4 +1,4 @@
-import type { IWALReplayer } from "src/domain/services/IWALReplayer";
+import type { IWALReplayer } from "@domain/ports/IWALReplayer";
 
 export class WALReplayer implements IWALReplayer {
   constructor(

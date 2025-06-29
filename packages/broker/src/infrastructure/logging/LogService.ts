@@ -1,6 +1,6 @@
-import type { ILogger } from "src/domain/interfaces/ILogger";
-import type { ILogCollector } from "src/domain/services/ILogCollector";
-import type { ILogService } from "src/domain/services/ILogService";
+import type { ILogger } from "@app/interfaces/ILogger";
+import type { ILogCollector } from "@domain/ports/ILogCollector";
+import type { ILogService } from "@domain/ports/ILogService";
 import { LogCollector } from "./LogCollector";
 
 export class LogService implements ILogService {

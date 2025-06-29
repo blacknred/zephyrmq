@@ -3,6 +3,10 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
+      "@infra/*": ["src/infrastructure/*"],
+      "@domain/*": ["src/domain/*"],
+      "@app/*": ["src/application/*"],
+      "@util/*": ["src/util/*"],
       "@codec/*": ["../codec/src/*"],
       "@segmentlog/*": ["../segmentlog/src/*"],
       "@wal/*": ["../wal/src/*"],

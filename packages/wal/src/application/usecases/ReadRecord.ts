@@ -1,4 +1,4 @@
-import type { IReader } from "../../domain/ports/IReader";
+import type { IReader } from "@domain/ports/IReader";
 
 export class ReadRecord {
   constructor(private reader: IReader) {}

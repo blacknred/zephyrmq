@@ -1,15 +1,19 @@
-import type { IEncoder } from "src/domain/interfaces/IEncoder";
-import type { ISchemaRegistry } from "src/domain/interfaces/ISchemaRegistry";
-import type { ISizeCalculator } from "src/domain/interfaces/ISizeCalculator";
-import type { WorkerPool } from "../WorkerPool";
+import type { ICompressor } from "@domain/ports/ICompressor";
+import type { IEncryptor } from "@domain/ports/IEncryptor";
+import type { ISchemaBasedSizeCalculator } from "@domain/ports/ISchemaBasedSizeCalculator";
+import type { ISchemaRegistry } from "@domain/ports/ISchemaRegistry";
+import type { ISerializer } from "@domain/ports/ISerializer";
+import type { WorkerPool } from "@infra/processor/worker/WorkerPool";
 
 export class Encode<T> {
   constructor(
-    private encoder: IEncoder,
     private schemaRegistry: ISchemaRegistry,
-    private sizeCalculator: ISizeCalculator,
+    private sizeCalculator: ISchemaBasedSizeCalculator,
     private workerPool: WorkerPool,
-    private sizeThreshold: number
+    private sizeThreshold: number,
+    private serializer: ISerializer,
+    private compressor: ICompressor,
+    private encryptor?: IEncryptor
   ) {}
 
   async execute(data: T, schemaRef?: string, compress = false) {
@@ -28,6 +32,13 @@ export class Encode<T> {
       }
     }
 
-    return this.encoder.encode(data, schema, compress);
+    try {
+      const buffer = this.serializer.serialize(data, schema);
+      const compressed = this.compressor.compress(buffer, compress);
+      if (!this.encryptor) return compressed;
+      return this.encryptor.encrypt(compressed);
+    } catch (cause) {
+      throw new Error(`Encoding failed`, { cause });
+    }
   }
 }

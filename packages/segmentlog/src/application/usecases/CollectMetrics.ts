@@ -1,4 +1,4 @@
-import type { ISegmentManager } from "../../domain/interfaces/ISegmentManager";
+import type { ISegmentManager } from "@domain/ports/ISegmentManager";
 
 export class CollectMetrics {
   constructor(private segmentManager: ISegmentManager) {}

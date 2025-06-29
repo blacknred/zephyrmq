@@ -1,5 +1,5 @@
-import type { ISchemaRemover } from "src/domain/interfaces/ISchemaRemover";
-import type { WorkerPool } from "../WorkerPool";
+import type { ISchemaRemover } from "@domain/ports/ISchemaRemover";
+import type { WorkerPool } from "@infra/processor/worker/WorkerPool";
 
 export class RemoveSchema {
   constructor(

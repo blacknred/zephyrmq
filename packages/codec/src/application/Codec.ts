@@ -1,6 +1,6 @@
-import type { ICodec } from "src/domain/interfaces/ICodec";
+import type { ICodec } from "@app/interfaces/ICodec";
 import type { Decode } from "./usecases/Decode";
-import { Encode } from "./usecases/Encode";
+import type { Encode } from "./usecases/Encode";
 import type { RegisterSchema } from "./usecases/RegisterSchema";
 import type { RemoveSchema } from "./usecases/RemoveSchema";
 
@@ -21,7 +21,7 @@ export class Codec implements ICodec {
   }
 
   async decode<T>(buffer: Buffer, schemaRef?: string): Promise<T> {
-    return this.decoder.execute(buffer, schemaRef);
+    return this.decoder.execute<T>(buffer, schemaRef);
   }
 
   async registerSchema<T>(name: string, schema: T) {

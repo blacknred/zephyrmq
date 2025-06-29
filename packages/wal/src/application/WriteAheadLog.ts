@@ -1,4 +1,4 @@
-import type { IWriteAheadLog } from "src/domain/ports/IWriteAheadLog";
+import type { IWriteAheadLog } from "@app/interfaces/IWriteAheadLog";
 import type { AppendRecord } from "./usecases/AppendRecord";
 import type { CloseLog } from "./usecases/CloseLog";
 import type { CollectMetrics } from "./usecases/CollectMetrics";

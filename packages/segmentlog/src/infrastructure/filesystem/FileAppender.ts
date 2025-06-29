@@ -1,18 +1,16 @@
+import { SegmentPointer } from "@domain/entities/SegmentPointer";
+import type { IAppender } from "@domain/ports/IAppender";
+import type { IIndexManager } from "@domain/ports/IIndexManager";
+import type { ISegmentManager } from "@domain/ports/ISegmentManager";
+import { Mutex } from "@util/Mutex";
 import crc from "crc-32";
-import { SegmentPointer } from "src/domain/entities/SegmentPointer";
-import type { IAppender } from "src/domain/interfaces/IAppender";
-import type { IIndexManager } from "src/domain/interfaces/IIndexManager";
-import type { ISegmentManager } from "src/domain/interfaces/ISegmentManager";
-import { Mutex } from "../../utils/Mutex";
-import type { ILogger } from "src/domain/interfaces/ILogger";
 
 export class FileAppender implements IAppender {
   private mutex = new Mutex();
 
   constructor(
     private segmentManager: ISegmentManager,
-    private indexManager: IIndexManager,
-    private logger?: ILogger
+    private indexManager: IIndexManager
   ) {}
 
   async append(data: Buffer): Promise<SegmentPointer | void> {
@@ -51,8 +49,8 @@ export class FileAppender implements IAppender {
       }
 
       return pointer;
-    } catch (error) {
-      this.logger?.error("Failed to append to MessageLog", { error });
+    } catch (cause) {
+      throw new Error("Failed to append", { cause });
     } finally {
       this.mutex.release();
     }

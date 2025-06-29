@@ -1,4 +1,4 @@
-import type { IMessageReader } from "src/domain/services/IMessageReader";
+import type { IMessageReader } from "@domain/ports/IMessageReader";
 
 export class MessageReader<Data> implements IMessageReader<Data> {
   constructor(

@@ -1,8 +1,8 @@
 import type { ISegmentLog } from "@segmentlog/index";
 import type { IWriteAheadLog } from "@wal/index";
-import type { MessageMetadata } from "src/domain/models/MessageMetadata";
-import type { ILogCollector } from "src/domain/services/ILogCollector";
-import type { IMessageWriter } from "src/domain/services/IMessageWriter";
+import type { MessageMetadata } from "@domain/entities/MessageMetadata";
+import type { ILogCollector } from "@domain/ports/ILogCollector";
+import type { IMessageWriter } from "@domain/ports/IMessageWriter";
 
 export class MessageWriter implements IMessageWriter {
   constructor(

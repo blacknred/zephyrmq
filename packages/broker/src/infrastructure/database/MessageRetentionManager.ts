@@ -1,4 +1,4 @@
-import type { IMessageRetentionManager } from "src/domain/services/IMessageRetentionManager";
+import type { IMessageRetentionManager } from "@domain/ports/IMessageRetentionManager";
 
 export class MessageRetentionManager implements IMessageRetentionManager {
   private retentionTimer?: NodeJS.Timeout;

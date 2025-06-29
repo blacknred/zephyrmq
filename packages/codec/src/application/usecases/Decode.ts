@@ -1,17 +1,21 @@
+import type { IDecompressor } from "@domain/ports/IDecompressor";
+import type { IDecryptor } from "@domain/ports/IDecryptor";
+import type { IDeserializer } from "@domain/ports/IDeserializer";
+import type { ISchemaRegistry } from "@domain/ports/ISchemaRegistry";
+import type { WorkerPool } from "@infra/processor/worker/WorkerPool";
 import type { TransferListItem } from "node:worker_threads";
-import type { IDecoder } from "src/domain/interfaces/IDecoder";
-import type { ISchemaRegistry } from "src/domain/interfaces/ISchemaRegistry";
-import type { WorkerPool } from "../WorkerPool";
 
 export class Decode {
   constructor(
-    private decoder: IDecoder,
     private schemaRegistry: ISchemaRegistry,
     private workerPool: WorkerPool,
-    private sizeThreshold: number
+    private sizeThreshold: number,
+    private deserializer: IDeserializer,
+    private decompressor: IDecompressor,
+    private decryptor?: IDecryptor
   ) {}
 
-  async execute<T>(buffer: Buffer, schemaRef?: string) {
+  async execute<T>(buffer: Buffer, schemaRef?: string): Promise<T> {
     if (buffer.length > this.sizeThreshold) {
       // buffer => uint8array for transferlist
       const arrayBuffer = buffer.buffer as TransferListItem;
@@ -25,10 +29,16 @@ export class Decode {
       );
     }
 
-    const schema = schemaRef
-      ? this.schemaRegistry.getSchema<T>(schemaRef)
-      : undefined;
+    try {
+      const decrypted = this.decryptor?.decrypt(buffer) ?? buffer;
+      const decompressed = this.decompressor.decompress(decrypted);
 
-    return this.decoder.decode<T>(buffer, schema);
+      if (!schemaRef) return this.deserializer.deserialize(decompressed);
+
+      const schema = this.schemaRegistry.getSchema<T>(schemaRef);
+      return this.deserializer.deserialize<T>(decompressed, schema);
+    } catch (cause) {
+      throw new Error(`Decoding failed`, { cause });
+    }
   }
 }

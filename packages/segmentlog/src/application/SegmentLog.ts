@@ -1,5 +1,5 @@
-import type { SegmentPointer } from "../domain/entities/SegmentPointer";
-import type { ISegmentLog } from "../domain/interfaces/ISegmentLog";
+import type { SegmentPointer } from "@domain/entities/SegmentPointer";
+import type { ISegmentLog } from "./interfaces/ISegmentLog";
 import type { AppendRecord } from "./usecases/AppendRecord";
 import type { CloseLog } from "./usecases/CloseLog";
 import type { CollectMetrics } from "./usecases/CollectMetrics";

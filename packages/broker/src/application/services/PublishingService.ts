@@ -1,4 +1,4 @@
-import type { MessageMetadata } from "src/domain/models/MessageMetadata";
+import type { MessageMetadata } from "@domain/entities/MessageMetadata";
 
 export interface IPublishingService {
   publish(

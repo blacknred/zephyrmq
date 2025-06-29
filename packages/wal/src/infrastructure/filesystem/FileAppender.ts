@@ -1,7 +1,6 @@
-import type { IAppender } from "src/domain/ports/IAppender";
-import type { ILogManager } from "src/domain/ports/ILogManager";
-import type { ILogger } from "src/domain/ports/ILogger";
 import type { FileHandle } from "fs/promises";
+import type { IAppender } from "@domain/ports/IAppender";
+import type { ILogManager } from "@domain/ports/ILogManager";
 
 export class FileAppender implements IAppender {
   private flushPromise?: Promise<void>;
@@ -11,8 +10,7 @@ export class FileAppender implements IAppender {
 
   constructor(
     private logManager: ILogManager<FileHandle>,
-    private maxBatchSizeBytes = 1 * 1024 * 1024,
-    private logger?: ILogger
+    private maxBatchSizeBytes = 1 * 1024 * 1024
   ) {}
 
   async append(data: Buffer): Promise<number | void> {
@@ -28,8 +26,8 @@ export class FileAppender implements IAppender {
       }
 
       return offset;
-    } catch (error) {
-      this.logger?.error("Failed to append to WAL", { error });
+    } catch (cause) {
+      throw new Error("Failed to append to WAL", { cause });
     }
   }
 

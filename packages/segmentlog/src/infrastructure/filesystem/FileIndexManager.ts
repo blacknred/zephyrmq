@@ -1,12 +1,10 @@
 import fs from "fs/promises";
-import type { SegmentPointer } from "src/domain/entities/SegmentPointer";
-import type { IIndexManager } from "src/domain/interfaces/IIndexManager";
-import type { ILogger } from "src/domain/interfaces/ILogger";
-import type { ISegmentInfo } from "src/domain/interfaces/ISegmentInfo";
+import type { SegmentPointer } from "@domain/entities/SegmentPointer";
+import type { IIndexManager } from "@domain/ports/IIndexManager";
+import type { ISegmentInfo } from "@domain/ports/ISegmentInfo";
 
 export class FileIndexManager implements IIndexManager {
   static INDEX_ENTRY_SIZE = 12;
-  constructor(private logger?: ILogger) {}
 
   async writeIndexEntry(
     segment: ISegmentInfo,
@@ -27,8 +25,10 @@ export class FileIndexManager implements IIndexManager {
       );
 
       await indexHandle.close();
-    } catch (error) {
-      this.logger?.error("Failed to write index entry", { error });
+    } catch (cause) {
+      throw new Error(`"Failed to write index entry"`, {
+        cause,
+      });
     }
   }
 }

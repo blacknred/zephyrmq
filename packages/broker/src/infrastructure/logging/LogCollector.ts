@@ -1,5 +1,5 @@
-import type { ILogger } from "src/domain/interfaces/ILogger";
-import type { ILogCollector } from "src/domain/services/ILogCollector";
+import type { ILogger } from "@app/interfaces/ILogger";
+import type { ILogCollector } from "@domain/ports/ILogCollector";
 
 export class LogCollector implements ILogCollector {
   private flushId?: NodeJS.Immediate;

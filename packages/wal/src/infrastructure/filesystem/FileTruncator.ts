@@ -1,16 +1,14 @@
 import type { FileHandle } from "fs/promises";
 import fs from "fs/promises";
-import type { ILogger } from "src/domain/ports/ILogger";
-import type { ILogManager } from "src/domain/ports/ILogManager";
-import type { ITruncator } from "src/domain/ports/ITruncator";
+import type { ILogManager } from "@domain/ports/ILogManager";
+import type { ITruncator } from "@domain/ports/ITruncator";
 
 export class FileTruncator implements ITruncator {
   static HEADER_SIZE = 24;
 
   constructor(
     private filePath: string,
-    private logManager: ILogManager<FileHandle>,
-    private logger?: ILogger
+    private logManager: ILogManager<FileHandle>
   ) {}
 
   async truncate(upToOffset: number): Promise<void> {
@@ -21,8 +19,8 @@ export class FileTruncator implements ITruncator {
 
       await this.logManager.log.truncate(upToOffset);
       await this.logManager.log.sync();
-    } catch (error) {
-      this.logger?.error("Failed to truncate the WAL", { error });
+    } catch (cause) {
+      throw new Error("Failed to truncate the WAL", { cause });
     }
   }
 }

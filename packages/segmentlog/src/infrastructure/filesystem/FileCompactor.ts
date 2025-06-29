@@ -1,19 +1,17 @@
+import type { SegmentPointer } from "@domain/entities/SegmentPointer";
+import type { ICompactor } from "@domain/ports/ICompactor";
+import type { ISegmentInfo } from "@domain/ports/ISegmentInfo";
+import type { ISegmentManager } from "@domain/ports/ISegmentManager";
 import crc from "crc-32";
 import fs from "fs/promises";
 import path from "path";
-import type { SegmentPointer } from "src/domain/entities/SegmentPointer";
-import type { ICompactor } from "src/domain/interfaces/ICompactor";
-import type { ILogger } from "src/domain/interfaces/ILogger";
-import type { ISegmentInfo } from "src/domain/interfaces/ISegmentInfo";
-import type { ISegmentManager } from "src/domain/interfaces/ISegmentManager";
 
 export class FileCompactor implements ICompactor {
   static HEADER_SIZE = 24;
 
   constructor(
     private baseDir: string,
-    private segmentManager: ISegmentManager,
-    private logger?: ILogger
+    private segmentManager: ISegmentManager
   ) {}
 
   async compact(deletedPointers: SegmentPointer[]): Promise<void> {
@@ -35,8 +33,8 @@ export class FileCompactor implements ICompactor {
 
     try {
       await Promise.all(compactionPromises);
-    } catch (error) {
-      this.logger?.error("Failed to compact segments", { error });
+    } catch (cause) {
+      throw new Error("Failed to compact segments", { cause });
     }
   }
 
@@ -67,8 +65,10 @@ export class FileCompactor implements ICompactor {
       if (this.segmentManager.getCurrentSegment()?.id === segment.id) {
         this.segmentManager.setCurrentSegment(newSegment);
       }
-    } catch (error) {
-      this.logger?.error(`Failed to compact segment ${segmentId}`, { error });
+    } catch (cause) {
+      throw new Error(`Failed to compact segment ${segmentId}`, {
+        cause,
+      });
     }
   }
 
@@ -107,6 +107,7 @@ export class FileCompactor implements ICompactor {
       pos += 8 + length;
       if (!segment.fileHandle) await handle.close();
     }
+
     return result;
   }
 
