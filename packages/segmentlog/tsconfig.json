@@ -1,13 +1,12 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "baseUrl": ".",
+    "baseUrl": "src",
     "composite": true,
     "paths": {
-      "@infra/*": ["src/infrastructure/*"],
-      "@domain/*": ["src/domain/*"],
-      "@app/*": ["src/application/*"],
-      "@util/*": ["src/util/*"]
+      "@infra/*": ["infrastructure/*"],
+      "@domain/*": ["domain/*"],
+      "@app/*": ["application/*"],
     }
   },
   "include": ["src/**/*"],

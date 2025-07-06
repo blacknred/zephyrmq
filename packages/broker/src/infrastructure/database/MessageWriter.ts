@@ -3,12 +3,13 @@ import type { IWriteAheadLog } from "@wal/index";
 import type { MessageMetadata } from "@domain/entities/MessageMetadata";
 import type { ILogCollector } from "@domain/ports/ILogCollector";
 import type { IMessageWriter } from "@domain/ports/IMessageWriter";
+import type { IMap } from "@zephyrmq/mapstore/index";
 
 export class MessageWriter implements IMessageWriter {
   constructor(
     private wal: IWriteAheadLog,
     private log: ISegmentLog,
-    private db: Level<string, Buffer>,
+    private db: Db,// Level<string, Buffer>,
     private codec: ICodec,
     private logger?: ILogCollector,
     private maxMessageTTLMs = 3_600_000_000
@@ -51,6 +52,7 @@ export class MessageWriter implements IMessageWriter {
       );
 
       const ttl = meta.ts + (meta.ttl || this.maxMessageTTLMs);
+      // meta!, ptr!, ttl!, last_wal_offset
       await this.db.batch([
         { type: "put", key: `meta!${meta.id}`, value: metaBuffer },
         { type: "put", key: `ptr!${meta.id}`, value: pointerBuffer },

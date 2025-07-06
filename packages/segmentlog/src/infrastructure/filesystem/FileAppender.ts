@@ -2,7 +2,7 @@ import { SegmentPointer } from "@domain/entities/SegmentPointer";
 import type { IAppender } from "@domain/ports/IAppender";
 import type { IIndexManager } from "@domain/ports/IIndexManager";
 import type { ISegmentManager } from "@domain/ports/ISegmentManager";
-import { Mutex } from "@util/Mutex";
+import { Mutex } from "@infra/util/Mutex";
 import crc from "crc-32";
 
 export class FileAppender implements IAppender {

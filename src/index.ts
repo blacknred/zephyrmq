@@ -21,453 +21,6 @@ import { uniqueIntGenerator } from "./utils";
 //
 //
 // PERSISTENT_STRUCTURE
-interface IFlushManager {
-  register(task: () => Promise<void>): void;
-  unregister(task: () => Promise<void>): void;
-  commit(): void;
-  flush: () => Promise<void>;
-  size(): number;
-  stop(): void;
-}
-class FlushManager implements IFlushManager {
-  private flushes: Array<() => Promise<void>> = [];
-  private pendingCounter = 0;
-  private timer?: NodeJS.Timeout;
-
-  constructor(
-    private persistThresholdMs = 1000,
-    private maxPendingFlushes = 100,
-    private memoryPressureThresholdMB = 1024
-  ) {
-    this.init();
-  }
-
-  stop() {
-    clearInterval(this.timer);
-    this.timer = undefined;
-    this.flush();
-  }
-
-  register(task: () => Promise<void>) {
-    this.flushes.push(task);
-  }
-
-  unregister(task: () => Promise<void>): void {
-    const idx = this.flushes.indexOf(task);
-    if (idx === -1) return;
-    this.flushes.splice(idx, 1);
-  }
-
-  commit() {
-    if (++this.pendingCounter < this.maxPendingFlushes) return;
-    if (!this.isMemoryPressured()) return;
-    this.flush();
-  }
-
-  size() {
-    return this.flushes.length;
-  }
-
-  flush = async () => {
-    if (!this.pendingCounter) return;
-    this.pendingCounter = 0;
-    await Promise.all(this.flushes);
-  };
-
-  private init() {
-    if (this.persistThresholdMs === Infinity) return;
-    this.timer = setInterval(
-      this.flush,
-      Math.max(this.persistThresholdMs, 100)
-    );
-    process.on("beforeExit", this.stop);
-  }
-
-  private isMemoryPressured() {
-    const { rss } = process.memoryUsage();
-    const usedMB = Math.round(rss / 1024 / 1024);
-    return usedMB > this.memoryPressureThresholdMB;
-  }
-}
-export interface ISerializable<T = unknown, R = unknown, K = string | number> {
-  serialize(data: T, key: K): R;
-  deserialize(data: R, key: K): T;
-}
-abstract class PersistedStructure {
-  protected mutex = new Mutex();
-  protected isCleared = false;
-
-  constructor(
-    protected db: Level<string, unknown>,
-    protected namespace: string,
-    protected flushManager?: IFlushManager,
-    protected logger?: ILogCollector
-  ) {
-    this.flushManager?.register(this.flush);
-    this.init();
-  }
-
-  protected async init() {
-    try {
-      for await (const [k, v] of this.db.iterator({
-        gt: `${this.namespace}!`,
-        lt: `${this.namespace}~`,
-      })) {
-        const key = k.slice(this.namespace.length + 1);
-        await this.restoreItem(key, v);
-      }
-    } catch (error) {
-      this.logger?.log(
-        `Failed to restore ${this.namespace}`,
-        { error },
-        "error"
-      );
-    }
-  }
-
-  protected abstract evictIfFull(): void;
-  protected abstract isFlushSkipped(): boolean;
-  protected abstract flushCleanup(): void;
-  protected abstract flushIterator(): Generator<
-    readonly [string | number, any],
-    void,
-    unknown
-  >;
-  protected abstract restoreItem(
-    key: string | number,
-    value: unknown
-  ): Promise<void>;
-
-  flush = async () => {
-    if (this.isFlushSkipped()) return;
-    await this.mutex.acquire();
-
-    try {
-      if (this.isCleared) {
-        await this.db.clear({
-          gt: `${this.namespace}!`,
-          lt: `${this.namespace}~`,
-        });
-
-        this.isCleared = false;
-        this.flushCleanup();
-        return;
-      }
-
-      const batch = this.db.batch();
-
-      for (const [key, value] of this.flushIterator()) {
-        const prefix = `${this.namespace}!${key}`;
-        if (value !== undefined) {
-          batch.put(prefix, value);
-        } else {
-          batch.del(prefix);
-        }
-      }
-
-      await batch.write();
-      this.flushCleanup();
-    } catch (error) {
-      this.logger?.log(`Failed to flush ${this.namespace}`, { error }, "error");
-    } finally {
-      this.mutex.release();
-    }
-  };
-
-  stop(): void {
-    this.flushManager?.unregister(this.flush);
-  }
-}
-export interface IPersistedMap<K, V> {
-  flush(): Promise<void>;
-  has(key: K): boolean;
-  get(key: K): V | undefined;
-  set(key: K, value: V): Map<K, V>;
-  delete(key: K): boolean;
-  clear(): void;
-  size: number;
-  keys(): MapIterator<K>;
-  values(): MapIterator<V>;
-  entries(): MapIterator<[K, V]>;
-}
-class PersistedMap<K extends string | number, V>
-  extends PersistedStructure
-  implements IPersistedMap<K, V>
-{
-  private map = new Map<K, V>();
-  private dirtyKeys = new Set<K>();
-
-  constructor(
-    db: Level<string, unknown>,
-    namespace: string,
-    flushManager?: IFlushManager,
-    logger?: ILogCollector,
-    private valueSerializer?: ISerializable<V>,
-    private maxSize = Infinity
-  ) {
-    super(db, namespace, flushManager, logger);
-  }
-
-  has(key: K) {
-    return this.map.has(key);
-  }
-
-  get(key: K) {
-    return this.map.get(key);
-  }
-
-  set(key: K, value: V) {
-    // works for primitives, non-primitive will always return true which is also ok
-    if (this.map.get(key) !== value) {
-      this.dirtyKeys.add(key);
-      this.flushManager?.commit();
-    }
-    this.map.set(key, value);
-    this.evictIfFull();
-    return this.map;
-  }
-
-  delete(key: K): boolean {
-    this.dirtyKeys.add(key);
-    this.flushManager?.commit();
-    return this.map.delete(key);
-  }
-
-  clear(): void {
-    this.isCleared = true;
-    this.map.clear();
-    this.flush();
-  }
-
-  get size(): number {
-    return this.map.size;
-  }
-
-  keys() {
-    return this.map.keys();
-  }
-
-  values() {
-    return this.map.values();
-  }
-
-  entries() {
-    return this.map.entries();
-  }
-
-  override evictIfFull(): void {
-    if (this.map.size >= this.maxSize) {
-      const firstKey = this.map.keys().next().value!;
-      this.map.delete(firstKey);
-    }
-  }
-
-  override async restoreItem(key: K, value: V): Promise<void> {
-    const deserialisedValue =
-      this.valueSerializer?.deserialize(value, key as K) ?? value;
-    this.map.set(key, deserialisedValue);
-  }
-
-  override isFlushSkipped(): boolean {
-    return this.dirtyKeys.size === 0;
-  }
-
-  override flushCleanup() {
-    this.dirtyKeys.clear();
-  }
-
-  override *flushIterator() {
-    for (const key of this.dirtyKeys) {
-      const value = this.map.get(key);
-      if (value == undefined) {
-        yield [key, undefined] as const;
-      } else {
-        yield [
-          key,
-          this.valueSerializer?.serialize(value, key) ?? value,
-        ] as const;
-      }
-    }
-  }
-}
-export interface IPersistedMapFactory {
-  create<K extends string | number, V>(
-    name: string,
-    valueSerializer?: ISerializable<V>
-  ): PersistedMap<K, V>;
-}
-class PersistedMapFactory implements IPersistedMapFactory {
-  constructor(
-    private db: Level<string, unknown>,
-    private maxSize = Infinity,
-    private flushManager?: IFlushManager,
-    private logger?: ILogCollector
-  ) {}
-
-  create<K extends string | number, V>(
-    name: string,
-    valueSerializer?: ISerializable<V>
-  ) {
-    return new PersistedMap<K, V>(
-      this.db,
-      name,
-      this.flushManager,
-      this.logger,
-      valueSerializer,
-      this.maxSize
-    );
-  }
-}
-interface IPersistedQueue<T> extends IPriorityQueue<T> {
-  flush(): Promise<void>;
-  clear(): void;
-}
-class PersistedQueue<T, K extends string | number>
-  extends PersistedStructure
-  implements IPersistedQueue<T>
-{
-  private pendingUpdates = new Map<K, [T, number] | undefined>();
-
-  constructor(
-    db: Level<string, unknown>,
-    public namespace: string,
-    private queue: IPriorityQueue<T>,
-    private keyRetriever: (entry: T) => K,
-    flushManager?: IFlushManager,
-    logger?: ILogCollector,
-    private valueSerializer?: ISerializable<T>,
-    private maxSize = Infinity
-  ) {
-    super(db, namespace, flushManager, logger);
-  }
-
-  enqueue(value: T, priority = 0): void {
-    this.queue.enqueue(value, priority);
-    const key = this.keyRetriever(value);
-    this.pendingUpdates.set(key, [value, priority]);
-    this.flushManager?.commit();
-    this.evictIfFull();
-  }
-
-  dequeue(): T | undefined {
-    const data = this.queue.dequeue();
-    if (data) {
-      const key = this.keyRetriever(data);
-      this.pendingUpdates.set(key, undefined);
-      this.flushManager?.commit();
-    }
-
-    return data;
-  }
-
-  clear() {
-    this.isCleared = true;
-    this.flush();
-  }
-
-  size(): number {
-    return this.queue.size();
-  }
-
-  peek() {
-    return this.queue.peek();
-  }
-
-  isEmpty(): boolean {
-    return this.queue.isEmpty();
-  }
-
-  override evictIfFull(): void {
-    // LRU-style eviction (simplified)
-    if (this.queue.size() < this.maxSize) return;
-    this.dequeue();
-  }
-
-  override async restoreItem(key: K, value: [T, number]): Promise<void> {
-    try {
-      const [rawData, priority] = value;
-      this.queue.enqueue(
-        this.valueSerializer?.deserialize(rawData, key) ?? rawData,
-        priority
-      );
-    } catch (e) {}
-  }
-
-  override isFlushSkipped(): boolean {
-    return this.pendingUpdates.size === 0;
-  }
-
-  override flushCleanup() {
-    this.pendingUpdates.clear();
-  }
-
-  override *flushIterator() {
-    for (const [key, value] of this.pendingUpdates) {
-      if (value == undefined) {
-        yield [key, undefined] as const;
-      } else {
-        const [data, priority] = value;
-        yield [
-          key,
-          [this.valueSerializer?.serialize(data, key) ?? data, priority],
-        ] as const;
-      }
-    }
-  }
-}
-interface IPersistedQueueFactory {
-  create<T, K extends string | number>(
-    name: string,
-    keyRetriever: (entry: T) => K,
-    valueSerializer?: ISerializable<T>
-  ): PersistedQueue<T, K>;
-}
-class PersistedQueueFactory implements IPersistedQueueFactory {
-  constructor(
-    private queueFactory: new () => IPriorityQueue<any>,
-    private db: Level<string, unknown>,
-    private maxSize = Infinity,
-    private flushManager?: IFlushManager,
-    private logger?: ILogCollector
-  ) {}
-
-  create<T, K extends string | number>(
-    name: string,
-    keyRetriever: (entry: T) => K,
-    valueSerializer?: ISerializable<T>
-  ) {
-    return new PersistedQueue<T, K>(
-      this.db,
-      name,
-      new this.queueFactory(),
-      keyRetriever,
-      this.flushManager,
-      this.logger,
-      valueSerializer,
-      this.maxSize
-    );
-  }
-}
-class MapSerializer<K, V> implements ISerializable {
-  serialize(map: Map<K, V>): [K, V][] {
-    return Array.from(map);
-  }
-  deserialize(data: [K, V][]): Map<K, V> {
-    return new Map<K, V>(data);
-  }
-}
-class PersistedQueueSerializer<T> implements ISerializable {
-  constructor(
-    private queueFactory: IPersistedQueueFactory,
-    private keyRetriever: (entry: T) => string | number
-  ) {}
-  serialize(_: unknown, key: string) {
-    return key;
-  }
-  deserialize(name: string) {
-    return this.queueFactory.create(`queue!${name}`, this.keyRetriever);
-  }
-}
 //
 //
 //
@@ -3030,7 +2583,7 @@ class TopicFactory implements ITopicFactory {
 
     this.validateTopicName(name);
     const codec = new this.codecFactory();
-    const logger = this.logService?.forTopic(name);
+    const logger = this.logService?.for(name);
 
     const db = new Level("./broker.db", {
       compression: false,
@@ -3289,13 +2842,13 @@ class LogCollector implements ILogCollector {
   }
 }
 interface ILogService {
-  globalCollector: ILogCollector;
-  forTopic(name: string): ILogCollector;
+  log: ILogCollector['log'];
+  for(name: string): ILogCollector;
   flushAll(): void;
 }
 class LogService implements ILogService {
-  private topicCollectors = new Map<string, ILogCollector>();
-  public globalCollector: ILogCollector;
+  private collectors = new Map<string, ILogCollector>();
+  private globalCollector: ILogCollector;
 
   constructor(
     private logger: ILogger,
@@ -3304,19 +2857,23 @@ class LogService implements ILogService {
     this.globalCollector = new LogCollector(logger, config.bufferSize);
   }
 
-  forTopic(name: string): ILogCollector {
-    if (!this.topicCollectors.has(name)) {
-      this.topicCollectors.set(
+  log() {
+    return this.globalCollector.log;
+  }
+
+  for(name: string): ILogCollector {
+    if (!this.collectors.has(name)) {
+      this.collectors.set(
         name,
         new LogCollector(this.logger, this.config.bufferSize, name)
       );
     }
-    return this.topicCollectors.get(name)!;
+    return this.collectors.get(name)!;
   }
 
   flushAll(): void {
     this.globalCollector.flush();
-    this.topicCollectors.forEach((collector) => collector.flush());
+    this.collectors.forEach((collector) => collector.flush());
   }
 }
 
@@ -3578,7 +3135,7 @@ class TopicRegistry implements ITopicRegistry {
     const topic = this.topicFactory.create<Data>(name, config);
     this.topics.set(name, topic);
 
-    this.logService?.globalCollector.log("Topic created", {
+    this.logService?.log("Topic created", {
       ...config,
       name,
     });
@@ -3601,7 +3158,7 @@ class TopicRegistry implements ITopicRegistry {
     this.get(name);
     this.topics.delete(name);
 
-    this.logService?.globalCollector.log("Topic deleted", { name });
+    this.logService?.log("Topic deleted", { name });
   }
 }
 

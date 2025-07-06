@@ -6,11 +6,10 @@
       "@infra/*": ["src/infrastructure/*"],
       "@domain/*": ["src/domain/*"],
       "@app/*": ["src/application/*"],
-      "@util/*": ["src/util/*"],
-      "@codec/*": ["../codec/src/*"],
-      "@segmentlog/*": ["../segmentlog/src/*"],
-      "@wal/*": ["../wal/src/*"],
-      "@pds/*": ["../pds/src/*"]
+      "@zephyrmq/codec/*": ["../codec/src/*"],
+      "@zephyrmq/segmentlog/*": ["../segmentlog/src/*"],
+      "@zephyrmq/wal/*": ["../wal/src/*"],
+      "@zephyrmq/mapstore/*": ["../mapstore/src/*"]
     }
   },
   "include": ["src/**/*"],
@@ -19,6 +18,6 @@
     { "path": "../codec" },
     { "path": "../segmentlog" },
     { "path": "../wal" },
-    { "path": "../pds" }
+    { "path": "../mapstore" }
   ]
 }
