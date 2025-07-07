@@ -1,9 +1,9 @@
-import type { IMapFlusher } from "@domain/ports/IMapFlusher";
+import type { IDBFlusher } from "@domain/ports/IDBFlusher";
 
-export class FlushMap {
-  constructor(private readonly mapFlusher: IMapFlusher) {}
+export class FlushMap<K, V> {
+  constructor(private readonly dbFlusher: IDBFlusher<K, V>) {}
 
   execute() {
-    return this.mapFlusher.flush();
+    return this.dbFlusher.flush();
   }
 }

@@ -14,7 +14,7 @@ import {
   InMemoryHashRing,
   SHA256HashService,
   type IHashRing,
-} from "./hash_ring";
+} from "../packages/broker/src/infrastructure/hashRing/MapStoreHashRing";
 import { Mutex } from "./mutex";
 import { uniqueIntGenerator } from "./utils";
 //
@@ -2787,96 +2787,6 @@ class TopicMetricsCollector implements IMetricsCollector {
 //
 // ROOT
 // logger
-interface ILogger {
-  info(msg: string, extra?: unknown): void;
-  warn(msg: string, extra?: unknown): void;
-  error(msg: string, extra?: unknown): void;
-  debug?(msg: string, extra?: unknown): void;
-}
-interface ILogCollector {
-  log(msg: string, extra?: object, level?: keyof ILogger): void;
-  flush: () => void;
-  destroy(): void;
-}
-class LogCollector implements ILogCollector {
-  private flushId?: NodeJS.Immediate;
-  private buffer = new Set<[string, object, keyof ILogger]>();
-
-  constructor(
-    private logger: ILogger,
-    private chunkSize = 50,
-    private topic?: string
-  ) {}
-
-  log(msg: string, extra?: object, level: keyof ILogger = "info") {
-    this.buffer.add([msg, extra ?? {}, level]);
-    this.scheduleFlush();
-  }
-
-  private scheduleFlush() {
-    this.flushId ??= setImmediate(this.flush);
-  }
-
-  flush = () => {
-    this.flushId = undefined;
-    let count = 0;
-    const ts = Date.now();
-    const { topic } = this;
-
-    for (const entry of this.buffer) {
-      if (count++ >= this.chunkSize) break;
-      const [message, extra, level] = entry;
-      this.logger[level]?.(message, Object.assign(extra, { topic, ts }));
-      this.buffer.delete(entry);
-    }
-
-    if (this.buffer.size > 0) {
-      this.scheduleFlush();
-    }
-  };
-
-  destroy() {
-    clearImmediate(this.flushId);
-    this.flushId = undefined;
-    this.buffer = new Set();
-  }
-}
-interface ILogService {
-  log: ILogCollector['log'];
-  for(name: string): ILogCollector;
-  flushAll(): void;
-}
-class LogService implements ILogService {
-  private collectors = new Map<string, ILogCollector>();
-  private globalCollector: ILogCollector;
-
-  constructor(
-    private logger: ILogger,
-    private config: { bufferSize?: number } = {}
-  ) {
-    this.globalCollector = new LogCollector(logger, config.bufferSize);
-  }
-
-  log() {
-    return this.globalCollector.log;
-  }
-
-  for(name: string): ILogCollector {
-    if (!this.collectors.has(name)) {
-      this.collectors.set(
-        name,
-        new LogCollector(this.logger, this.config.bufferSize, name)
-      );
-    }
-    return this.collectors.get(name)!;
-  }
-
-  flushAll(): void {
-    this.globalCollector.flush();
-    this.collectors.forEach((collector) => collector.flush());
-  }
-}
-
 
 // schema_registry
 interface ISchemaDefRecord<T> {

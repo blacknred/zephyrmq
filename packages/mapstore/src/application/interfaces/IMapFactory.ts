@@ -2,7 +2,6 @@ import type { ISerializable } from "@domain/ports/ISerializable";
 import type { IMap } from "./IMap";
 
 export interface IMapOptions<T> {
-  maxSize?: number;
   serializer?: ISerializable<T>;
 }
 

@@ -1,9 +1,17 @@
-import type { IRecordDeleter } from "@domain/ports/IRecordDeleter";
+import type { ICache } from "@domain/ports/ICache";
+import type { IDBFlusher } from "@domain/ports/IDBFlusher";
+import type { IMapSizer } from "@domain/ports/IMapSizer";
 
-export class DeleteRecord<K> {
-  constructor(private readonly recordDeleter: IRecordDeleter<K>) {}
+export class DeleteRecord<K, V> {
+  constructor(
+    private readonly cache: ICache<K, V>,
+    private readonly dbFlusher: IDBFlusher<K, V>,
+    private readonly sizer: IMapSizer
+  ) {}
 
   execute(key: K) {
-    return this.recordDeleter.delete(key);
+    this.dbFlusher.commit(key);
+    this.sizer.size--;
+    return this.cache.delete(key);
   }
 }

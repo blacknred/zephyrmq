@@ -13,15 +13,15 @@ import type { SetRecord } from "./usecases/SetRecord";
 export class Map<K extends string | number, V> implements IMap<K, V> {
   constructor(
     private getMapSize: GetMapSize,
-    private checkKeyPresence: CheckKeyPresence<K>,
+    private checkKeyPresence: CheckKeyPresence<K, V>,
     private getValue: GetValue<K, V>,
     private setRecord: SetRecord<K, V>,
-    private deleteRecord: DeleteRecord<K>,
-    private readKeys: ReadKeys<K>,
-    private readValues: ReadValues<V>,
+    private deleteRecord: DeleteRecord<K, V>,
+    private readKeys: ReadKeys<K, V>,
+    private readValues: ReadValues<K, V>,
     private readEntries: ReadEntries<K, V>,
-    private cleanMap: CleanMap,
-    private flushMap: FlushMap
+    private cleanMap: CleanMap<K, V>,
+    private flushMap: FlushMap<K, V>
   ) {}
 
   get size(): number {

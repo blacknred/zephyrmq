@@ -1,3 +1,5 @@
+import type { AsyncMapIterator } from "./AsyncMapIterator";
+
 export interface IKeysReader<K> {
-  keys(): MapIterator<K>;
+  keys(): AsyncMapIterator<K>;
 }

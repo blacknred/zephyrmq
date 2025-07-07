@@ -1,9 +1,19 @@
-import type { IKeyPresenceChecker } from "@domain/ports/IKeyPresenceChecker";
+import type { ICache } from "@domain/ports/ICache";
+import type { IValueGetter } from "@domain/ports/IValueGetter";
 
-export class CheckKeyPresence<K> {
-  constructor(private readonly keyChecker: IKeyPresenceChecker<K>) {}
+export class CheckKeyPresence<K, V> {
+  constructor(
+    private readonly cache: ICache<K, V>,
+    private readonly valueGetter: IValueGetter<K, V>
+  ) {}
 
-  execute(key: K) {
-    return this.keyChecker.has(key);
+  async execute(key: K) {
+    const exists = this.cache.has(key);
+    if (!exists) {
+      const value = await this.valueGetter.get(key);
+      if (value) this.cache.set(key, value);
+      return value != undefined;
+    }
+    return exists;
   }
 }

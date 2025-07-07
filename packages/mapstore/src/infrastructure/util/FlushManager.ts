@@ -1,19 +1,22 @@
-import type { IFlushManager } from "@domain/ports/IFlushManager";
-import { Level } from "level";
+import type {
+  IDBFlushManager,
+  IDBFlushManagerConfig,
+  IFlushTask,
+} from "@domain/ports/IDBFlushManager";
 
-export class FlushTaskRegistry {
-  private flushes: Array<() => Promise<void>> = [];
+export class IFlushTaskRegistry {
+  private flushes: Array<IFlushTask> = [];
 
-  register(task: () => Promise<void>) {
+  register(task: IFlushTask) {
     this.flushes.push(task);
   }
 
-  unregister(task: () => Promise<void>) {
+  unregister(task: IFlushTask) {
     const idx = this.flushes.indexOf(task);
     if (idx !== -1) this.flushes.splice(idx, 1);
   }
 
-  getTasks(): Array<() => Promise<void>> {
+  getTasks(): Array<IFlushTask> {
     return [...this.flushes];
   }
 }
@@ -28,63 +31,71 @@ export class MemoryPressureChecker {
   }
 }
 
-export class FlushManager implements IFlushManager {
+export class FlushManager implements IDBFlushManager {
+  private taskRegistry: IFlushTaskRegistry;
+  private memoryChecker: MemoryPressureChecker;
+
+  private maxPendingFlushes = 100;
+  private persistThresholdMs = 1000;
   private pendingCounter = 0;
   private timer?: NodeJS.Timeout;
 
-  constructor(
-    private taskRegistry = new FlushTaskRegistry(),
-    private memoryChecker = new MemoryPressureChecker(1024),
-    private persistThresholdMs = 1000,
-    private maxPendingFlushes = 100
-  ) {
+  constructor({
+    memoryUsageThresholdMB,
+    persistThresholdMs,
+    maxPendingFlushes,
+  }: IDBFlushManagerConfig) {
+    this.taskRegistry = new IFlushTaskRegistry();
+    this.memoryChecker = new MemoryPressureChecker(memoryUsageThresholdMB);
+
+    if (maxPendingFlushes) {
+      this.maxPendingFlushes = maxPendingFlushes;
+    }
+
+    if (persistThresholdMs) {
+      this.persistThresholdMs = persistThresholdMs;
+    }
+
     this.init();
   }
 
   private init() {
     if (this.persistThresholdMs === Infinity) return;
     this.timer = setInterval(
-      () => this.flush(),
+      this.flush,
       Math.max(this.persistThresholdMs, 100)
     );
 
-    process.on("beforeExit", () => this.close());
+    process.on("beforeExit", this.close);
   }
 
-  close() {
+  close = () => {
     clearInterval(this.timer);
     this.timer = undefined;
     this.flush();
-  }
+  };
 
-  register(task: () => Promise<void>) {
+  register(task: IFlushTask) {
     this.taskRegistry.register(task);
   }
 
-  unregister(task: () => Promise<void>) {
+  unregister(task: IFlushTask) {
     this.taskRegistry.unregister(task);
   }
 
   commit() {
-    if (++this.pendingCounter < this.maxPendingFlushes) return;
-    if (!this.memoryChecker.isMemoryPressured()) return;
-    this.flush();
+    if (
+      ++this.pendingCounter >= this.maxPendingFlushes ||
+      this.memoryChecker.isMemoryPressured()
+    ) {
+      this.flush();
+    }
   }
 
-  private async flush() {
+  private flush = async () => {
     if (!this.pendingCounter) return;
     this.pendingCounter = 0;
     const tasks = this.taskRegistry.getTasks();
     await Promise.all(tasks.map((task) => task()));
-  }
+  };
 }
-const db = new Level("./broker.db", {
-      compression: false,
-      // valueEncoding: {
-      //   type: "custom",
-      //   encode: codec.encodeSync,
-      //   decode: codec.decodeSync,
-      //   buffer: true,
-      // },
-    });
-    db.sublevel

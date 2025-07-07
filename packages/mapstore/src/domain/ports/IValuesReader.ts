@@ -1,3 +1,5 @@
+import type { AsyncMapIterator } from "./AsyncMapIterator";
+
 export interface IValuesReader<V> {
-  values(): MapIterator<V>;
+  values(): AsyncMapIterator<V>;
 }

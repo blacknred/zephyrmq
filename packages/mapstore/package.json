@@ -22,6 +22,7 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
-    "level": "^10.0.0"
+    "level": "^10.0.0",
+    "lmdb": "^3.4.1"
   }
 }

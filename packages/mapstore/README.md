@@ -6,7 +6,4 @@
 
 ![SVG Image](../../logo.svg)
 
-Persisted Map datastructure for @zephyrmq.
-
-<!-- queuestore built on mapstore
-structdb as a higher-level umbrella package that combines mapstore, queueStore -->Ø
+Write-through cache persisted Map storage for metadata and operational state in @zephyrmq.

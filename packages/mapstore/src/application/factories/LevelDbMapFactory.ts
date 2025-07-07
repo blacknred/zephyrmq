@@ -10,74 +10,71 @@ import { ReadEntries } from "@app/usecases/ReadEntries";
 import { ReadKeys } from "@app/usecases/ReadKeys";
 import { ReadValues } from "@app/usecases/ReadValues";
 import { SetRecord } from "@app/usecases/SetRecord";
-import type { IFlushManager } from "@domain/ports/IFlushManager";
-import { LevelDbEntriesReader } from "@infra/leveldb/LevelDbEntriesReader";
-import { LevelDbKeyPresenceChecker } from "@infra/leveldb/LevelDbKeyPresenceChecker";
-import { LevelDbKeysReader } from "@infra/leveldb/LevelDbKeysReader";
-import { LevelDbMap } from "@infra/leveldb/LevelDbMap";
-import { LevelDbMapCleaner } from "@infra/leveldb/LevelDbMapCleaner";
-import { LevelDbMapFlusher } from "@infra/leveldb/LevelDbMapFlusher";
-import { LevelDbMapSizer } from "@infra/leveldb/LevelDbMapSizer";
-import { LevelDbRecordDeleter } from "@infra/leveldb/LevelDbRecordDeleter";
-import { LevelDbRecordSetter } from "@infra/leveldb/LevelDbRecordSetter";
-import { LevelDbValueGetter } from "@infra/leveldb/LevelDbValueGetter";
-import { LevelDbValuesReader } from "@infra/leveldb/LevelDbValuesReader";
+import type { IDBFlushManager } from "@domain/ports/IDBFlushManager";
+import { FifoCache } from "@infra/cache/fifo/FifoCache";
+import { FifiCacheEntriesReader } from "@infra/cache/fifo/FifoCacheEntriesReader";
+import { FifiCacheKeysReader } from "@infra/cache/fifo/FifoCacheKeysReader";
+import { FifiCacheValuesReader } from "@infra/cache/fifo/FifoCacheValuesReader";
+import { LevelDbCacheRestorer } from "@infra/storage/leveldb/LevelDbCacheRestorer";
+import { LevelDbEntriesReader } from "@infra/storage/leveldb/LevelDbEntriesReader";
+import { LevelDbKeysReader } from "@infra/storage/leveldb/LevelDbKeysReader";
+import { LevelDbMapFlusher } from "@infra/storage/leveldb/LevelDbMapFlusher";
+import { LevelDbMapSizer } from "@infra/storage/leveldb/LevelDbMapSizer";
+import { LevelDbValueGetter } from "@infra/storage/leveldb/LevelDbValueGetter";
+import { LevelDbValuesReader } from "@infra/storage/leveldb/LevelDbValuesReader";
 import type { Level } from "level";
 
 export class LevelDbMapFactory implements IMapFactory {
+  private static instanceCount = 0;
+
   constructor(
     private db: Level<string, unknown>,
-    private flushManager: IFlushManager
+    private flushManager: IDBFlushManager
   ) {}
 
   create<K extends string | number, V>(
     name: string,
-    { maxSize, serializer }: IMapOptions<V> = {}
+    { serializer }: IMapOptions<V> = {}
   ) {
-    const dirtyKeys = new Set<K>();
-    const map = new LevelDbMap<K, V>(this.db, name, serializer);
     const mapSizer = new LevelDbMapSizer();
-    const keyChecker = new LevelDbKeyPresenceChecker(map, this.db, name);
-    const valueGetter = new LevelDbValueGetter(map, this.db, name);
-    const keysReader = new LevelDbKeysReader(map, this.db, name);
-    const valuesReader = new LevelDbValuesReader(map, this.db, name);
-    const entriesReader = new LevelDbEntriesReader(map, this.db, name);
 
-    const recordSetter = new LevelDbRecordSetter(
-      this.flushManager,
-      map,
-      dirtyKeys,
-      mapSizer,
-      maxSize
+    const cache = new FifoCache<K, V>(LevelDbMapFactory.instanceCount++);
+    new LevelDbCacheRestorer(cache, this.db, name, serializer).restore();
+    const cacheEnriesReader = new FifiCacheEntriesReader(cache);
+    const cacheKeysReader = new FifiCacheKeysReader(cache);
+    const cacheValuesReader = new FifiCacheValuesReader(cache);
+
+    const dbValueGetter = new LevelDbValueGetter<K, V>(
+      this.db,
+      name,
+      serializer
     );
-    const recordDeleter = new LevelDbRecordDeleter(
-      this.flushManager,
-      map,
-      dirtyKeys,
-      mapSizer
+    const dbEntriesReader = new LevelDbEntriesReader<K, V>(
+      this.db,
+      name,
+      serializer
     );
-    const mapCleaner = new LevelDbMapCleaner(this.flushManager, map, mapSizer);
-    const mapFlusher = new LevelDbMapFlusher(
+    const dbKeysReader = new LevelDbKeysReader<K, V>(dbEntriesReader);
+    const dbValuesReader = new LevelDbValuesReader<K, V>(dbEntriesReader);
+    const dbFlusher = new LevelDbMapFlusher<K, V>(
       this.db,
       this.flushManager,
       name,
-      map,
-      dirtyKeys,
       mapSizer,
       serializer
     );
 
     return new Map<K, V>(
       new GetMapSize(mapSizer),
-      new CheckKeyPresence(keyChecker),
-      new GetValue(valueGetter),
-      new SetRecord(recordSetter),
-      new DeleteRecord(recordDeleter),
-      new ReadKeys(keysReader),
-      new ReadValues(valuesReader),
-      new ReadEntries(entriesReader),
-      new CleanMap(mapCleaner),
-      new FlushMap(mapFlusher)
+      new CheckKeyPresence(cache, dbValueGetter),
+      new GetValue(cache, dbValueGetter),
+      new SetRecord(cache, dbFlusher),
+      new DeleteRecord(cache, dbFlusher, mapSizer),
+      new ReadKeys(cache, cacheKeysReader, dbKeysReader, mapSizer),
+      new ReadValues(cache, cacheValuesReader, dbValuesReader, mapSizer),
+      new ReadEntries(cache, cacheEnriesReader, dbEntriesReader, mapSizer),
+      new CleanMap(cache, dbFlusher, mapSizer),
+      new FlushMap(dbFlusher)
     );
   }
 }

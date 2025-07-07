@@ -1,9 +1,17 @@
-import type { IMapCleaner } from "@domain/ports/IMapCleaner";
+import type { ICache } from "@domain/ports/ICache";
+import type { IDBFlusher } from "@domain/ports/IDBFlusher";
+import type { IMapSizer } from "@domain/ports/IMapSizer";
 
-export class CleanMap {
-  constructor(private readonly mapCleaner: IMapCleaner) {}
+export class CleanMap<K, V> {
+  constructor(
+    private readonly cache: ICache<K, V>,
+    private readonly dbFlusher: IDBFlusher<K, V>,
+    private readonly sizer: IMapSizer
+  ) {}
 
   execute() {
-    return this.mapCleaner.clean();
+    this.cache.clear();
+    this.sizer.size = 0;
+    this.dbFlusher.flush();
   }
 }
