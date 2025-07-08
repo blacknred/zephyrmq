@@ -1,6 +1,6 @@
-import type { ICache } from "../../../domain/interfaces/ICache";
-import type { ICacheRestorer } from "../../../domain/interfaces/ICacheRestorer";
-import type { ISerializable } from "../../../domain/interfaces/ISerializable";
+import type { ICache } from "@domain/interfaces/ICache";
+import type { ICacheRestorer } from "@domain/interfaces/ICacheRestorer";
+import type { ISerializable } from "@domain/interfaces/ISerializable";
 import type { Level } from "level";
 
 export class LevelDbCacheRestorer<K, V> implements ICacheRestorer {

@@ -1,8 +1,8 @@
 import type {
   IDBFlushManager,
   IFlushTask,
-} from "../../domain/interfaces/IDBFlushManager";
-import type { IMemoryPressureChecker } from "../../domain/interfaces/IMemoryPressureChecker";
+} from "@domain/interfaces/IDBFlushManager";
+import type { IMemoryPressureChecker } from "@domain/interfaces/IMemoryPressureChecker";
 
 export class FlushManager implements IDBFlushManager {
   private pendingCounter = 0;

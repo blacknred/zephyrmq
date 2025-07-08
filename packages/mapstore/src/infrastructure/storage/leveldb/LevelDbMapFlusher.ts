@@ -1,6 +1,6 @@
-import type { IDBFlushManager } from "../../../domain/interfaces/IDBFlushManager";
-import type { IDBFlusher } from "../../../domain/interfaces/IDBFlusher";
-import type { ISerializable } from "../../../domain/interfaces/ISerializable";
+import type { IDBFlushManager } from "@domain/interfaces/IDBFlushManager";
+import type { IDBFlusher } from "@domain/interfaces/IDBFlusher";
+import type { ISerializable } from "@domain/interfaces/ISerializable";
 import { Mutex } from "@infra/util/Mutex";
 import type { Level } from "level";
 

@@ -1,6 +1,6 @@
-import type { ICache } from "@zephyrmq/mapstore/src/domain/interfaces/ICache";
-import type { ICleaner } from "@zephyrmq/mapstore/src/domain/interfaces/ICleaner";
-import type { IKeyTracker } from "@zephyrmq/mapstore/src/domain/interfaces/IKeyTracker";
+import type { ICache } from "@domain/interfaces/ICache";
+import type { ICleaner } from "@domain/interfaces/ICleaner";
+import type { IKeyTracker } from "@domain/interfaces/IKeyTracker";
 
 export class CleanMap<K, V> {
   constructor(

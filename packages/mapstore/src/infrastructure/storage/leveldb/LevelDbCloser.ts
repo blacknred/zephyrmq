@@ -1,5 +1,5 @@
-import type { IDBCloser } from "../../../domain/interfaces/IDBCloser";
-import type { IDBFlushManager } from "../../../domain/interfaces/IDBFlushManager";
+import type { IDBCloser } from "@domain/interfaces/IDBCloser";
+import type { IDBFlushManager } from "@domain/interfaces/IDBFlushManager";
 import { Level } from "level";
 
 export class LevelDbCloser implements IDBCloser {

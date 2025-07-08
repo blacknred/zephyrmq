@@ -1,5 +1,5 @@
-import { LevelDbMapFactory } from "@app/factories/LevelDbMapFactory";
-import { MapStore } from "@app/MapStore";
+import type { IMapStore } from "@app/interfaces/IMapStore";
+import { MapStore } from "@app/services/MapStore";
 import { CloseDB } from "@app/usecases/CloseDB";
 import { CreateMap } from "@app/usecases/CreateMap";
 import { MemoryCapacityService } from "@infra/ram/MemoryCapacityService";
@@ -8,6 +8,8 @@ import { FlushManager } from "@infra/storage/FlushManager";
 import { LevelDbCloser } from "@infra/storage/leveldb/LevelDbCloser";
 import { Level, type DatabaseOptions } from "level";
 import { FifoCacheFactory } from "./FifoCacheFactory";
+import { LevelDbMapFactory } from "./LevelDbMapFactory";
+import { CacheCapacityCalculator } from "@infra/cache/CacheCapacityCalculator";
 
 interface IDBFlushManagerConfig {
   persistThresholdMs?: number;
@@ -19,8 +21,11 @@ export interface IMapStoreConfig
   extends DatabaseOptions<string, unknown>,
     IDBFlushManagerConfig {}
 
-export class MapStoreFactory {
-  create(location: string, options: IMapStoreConfig | undefined = {}) {
+export class LevelDbMapStoreFactory {
+  create(
+    location: string,
+    options: IMapStoreConfig | undefined = {}
+  ): IMapStore {
     const {
       persistThresholdMs,
       maxPendingFlushes,
@@ -36,7 +41,9 @@ export class MapStoreFactory {
       maxPendingFlushes
     );
 
-    const cacheFactory = new FifoCacheFactory(new MemoryCapacityService());
+    const cacheFactory = new FifoCacheFactory(
+      new CacheCapacityCalculator(new MemoryCapacityService())
+    );
 
     const dbCloser = new LevelDbCloser(db, flushManager);
     const mapCreator = new LevelDbMapFactory(db, flushManager, cacheFactory);

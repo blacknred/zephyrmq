@@ -1,4 +1,4 @@
-import type { ICleaner } from "../../../domain/interfaces/ICleaner";
+import type { ICleaner } from "@domain/interfaces/ICleaner";
 import { Mutex } from "@infra/util/Mutex";
 import type { Level } from "level";
 

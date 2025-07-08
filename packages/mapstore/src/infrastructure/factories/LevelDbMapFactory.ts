@@ -1,6 +1,5 @@
-import type { ICacheFactory } from "@infra/factories/ICacheFactory";
-import type { IMapFactory, IMapOptions } from "@app/interfaces/IMapFactory";
-import { Map } from "@app/Map";
+import type { IMap } from "@app/interfaces/IMap";
+import { Map } from "@app/services/Map";
 import { CheckKeyPresence } from "@app/usecases/CheckKeyPresence";
 import { CleanMap } from "@app/usecases/CleanMap";
 import { DeleteRecord } from "@app/usecases/DeleteRecord";
@@ -11,7 +10,7 @@ import { ReadEntries } from "@app/usecases/ReadEntries";
 import { ReadKeys } from "@app/usecases/ReadKeys";
 import { ReadValues } from "@app/usecases/ReadValues";
 import { SetRecord } from "@app/usecases/SetRecord";
-import type { IDBFlushManager } from "../../domain/interfaces/IDBFlushManager";
+import type { ISerializable } from "@domain/interfaces/ISerializable";
 import { CuckooFilterKeyTracker } from "@infra/keytracker/cuckoo-filter/CuckooFilterKeyTracker";
 import { LevelDbCacheRestorer } from "@infra/storage/leveldb/LevelDbCacheRestorer";
 import { LevelDbEntriesReader } from "@infra/storage/leveldb/LevelDbEntriesReader";
@@ -21,10 +20,14 @@ import { LevelDbMapFlusher } from "@infra/storage/leveldb/LevelDbMapFlusher";
 import { LevelDbValueGetter } from "@infra/storage/leveldb/LevelDbValueGetter";
 import { LevelDbValuesReader } from "@infra/storage/leveldb/LevelDbValuesReader";
 import type { Level } from "level";
+import type { IDBFlushManager } from "@domain/interfaces/IDBFlushManager";
+import type { ICacheFactory } from "./ICacheFactory";
 
-export class LevelDbMapFactory implements IMapFactory {
-  static CACHE_MEMORY_RATIO = 1 / 3;
+interface IMapOptions<T> {
+  serializer?: ISerializable<T>;
+}
 
+export class LevelDbMapFactory {
   constructor(
     private db: Level<string, unknown>,
     private flushManager: IDBFlushManager,
@@ -34,9 +37,10 @@ export class LevelDbMapFactory implements IMapFactory {
   create<K extends string | number, V>(
     name: string,
     { serializer }: IMapOptions<V> = {}
-  ) {
+  ): IMap<K, V> {
     const { cache, cacheEnriesReader, cacheKeysReader, cacheValuesReader } =
-      this.cacheFactory.create();
+      this.cacheFactory.create<K, V>();
+
     new LevelDbCacheRestorer(cache, this.db, name, serializer).restore();
 
     const dbValueGetter = new LevelDbValueGetter<K, V>(

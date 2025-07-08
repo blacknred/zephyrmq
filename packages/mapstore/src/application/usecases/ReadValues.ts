@@ -1,6 +1,6 @@
-import type { ICache } from "../../domain/interfaces/ICache";
-import type { IKeyTracker } from "../../domain/interfaces/IKeyTracker";
-import type { IValuesReader } from "../../domain/interfaces/IValuesReader";
+import type { ICache } from "@domain/interfaces/ICache";
+import type { IKeyTracker } from "@domain/interfaces/IKeyTracker";
+import type { IValuesReader } from "@domain/interfaces/IValuesReader";
 
 export class ReadValues<K, V> {
   constructor(

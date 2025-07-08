@@ -1,5 +1,5 @@
-import type { IEntriesReader } from "../../../domain/interfaces/IEntriesReader";
-import type { ISerializable } from "../../../domain/interfaces/ISerializable";
+import type { IEntriesReader } from "@domain/interfaces/IEntriesReader";
+import type { ISerializable } from "@domain/interfaces/ISerializable";
 import type { Level } from "level";
 
 export class LevelDbEntriesReader<K, V> implements IEntriesReader<K, V> {

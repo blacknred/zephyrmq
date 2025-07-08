@@ -1,4 +1,4 @@
-import type { IKeyTracker } from "../../domain/interfaces/IKeyTracker";
+import type { IKeyTracker } from "@domain/interfaces/IKeyTracker";
 
 export class GetMapSize<K> {
   constructor(private readonly keyTracker: IKeyTracker<K>) {}

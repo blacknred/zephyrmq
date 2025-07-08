@@ -1,6 +1,6 @@
-import type { ICache } from "../../domain/interfaces/ICache";
-import type { IDBFlusher } from "../../domain/interfaces/IDBFlusher";
-import type { IKeyTracker } from "../../domain/interfaces/IKeyTracker";
+import type { ICache } from "@domain/interfaces/ICache";
+import type { IDBFlusher } from "@domain/interfaces/IDBFlusher";
+import type { IKeyTracker } from "@domain/interfaces/IKeyTracker";
 
 export class SetRecord<K, V> {
   constructor(
