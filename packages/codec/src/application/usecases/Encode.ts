@@ -3,7 +3,7 @@ import type { IEncryptor } from "@domain/ports/IEncryptor";
 import type { ISchemaBasedSizeCalculator } from "@domain/ports/ISchemaBasedSizeCalculator";
 import type { ISchemaRegistry } from "@domain/ports/ISchemaRegistry";
 import type { ISerializer } from "@domain/ports/ISerializer";
-import type { WorkerPool } from "@infra/processor/worker/WorkerPool";
+import type { WorkerPool } from "@infra/worker/WorkerPool";
 
 export class Encode<T> {
   constructor(
@@ -42,3 +42,5 @@ export class Encode<T> {
     }
   }
 }
+
+// infra/facades/encoder,decoder

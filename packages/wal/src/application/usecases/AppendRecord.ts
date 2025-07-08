@@ -1,4 +1,4 @@
-import type { IAppender } from "@domain/ports/IAppender";
+import type { IAppender } from "@domain/interfaces/IAppender";
 
 export class AppendRecord {
   constructor(private appender: IAppender) {}

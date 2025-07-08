@@ -1,5 +1,5 @@
 import type { ISegmentLog } from "@app/interfaces/ISegmentLog";
-import { SegmentLog } from "@app/SegmentLog";
+import { SegmentLog } from "@app/services/SegmentLog";
 import { AppendRecord } from "@app/usecases/AppendRecord";
 import { CloseLog } from "@app/usecases/CloseLog";
 import { CollectMetrics } from "@app/usecases/CollectMetrics";

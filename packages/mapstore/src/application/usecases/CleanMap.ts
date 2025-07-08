@@ -1,17 +1,17 @@
-import type { ICache } from "@domain/ports/ICache";
-import type { IDBFlusher } from "@domain/ports/IDBFlusher";
-import type { IMapSizer } from "@domain/ports/IMapSizer";
+import type { ICache } from "@zephyrmq/mapstore/src/domain/interfaces/ICache";
+import type { ICleaner } from "@zephyrmq/mapstore/src/domain/interfaces/ICleaner";
+import type { IKeyTracker } from "@zephyrmq/mapstore/src/domain/interfaces/IKeyTracker";
 
 export class CleanMap<K, V> {
   constructor(
     private readonly cache: ICache<K, V>,
-    private readonly dbFlusher: IDBFlusher<K, V>,
-    private readonly sizer: IMapSizer
+    private readonly dbCleaner: ICleaner,
+    private readonly keyTracker: IKeyTracker<K>
   ) {}
 
   execute() {
     this.cache.clear();
-    this.sizer.size = 0;
-    this.dbFlusher.flush();
+    this.dbCleaner.clear();
+    this.keyTracker.clear();
   }
 }

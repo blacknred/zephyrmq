@@ -1,14 +1,14 @@
 import type { IWriteAheadLog } from "@app/interfaces/IWriteAheadLog";
+import { WriteAheadLog } from "@app/services/WriteAheadLog";
 import { AppendRecord } from "@app/usecases/AppendRecord";
 import { CloseLog } from "@app/usecases/CloseLog";
 import { CollectMetrics } from "@app/usecases/CollectMetrics";
 import { ReadRecord } from "@app/usecases/ReadRecord";
 import { TruncateRecords } from "@app/usecases/TruncateRecords";
-import { WriteAheadLog } from "@app/WriteAheadLog";
-import { FileAppender } from "@infra/filesystem/FileAppender";
-import { FileLogManager } from "@infra/filesystem/FileLogManager";
-import { FileReader } from "@infra/filesystem/FileReader";
-import { FileTruncator } from "@infra/filesystem/FileTruncator";
+import { FileAppender } from "../filesystem/FileAppender";
+import { FileLogManager } from "../filesystem/FileLogManager";
+import { FileReader } from "../filesystem/FileReader";
+import { FileTruncator } from "../filesystem/FileTruncator";
 
 export class FileWriteAheadLogFactory {
   constructor(

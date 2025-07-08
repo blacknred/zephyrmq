@@ -1,4 +1,4 @@
-import type { ITruncator } from "@domain/ports/ITruncator";
+import type { ITruncator } from "@domain/interfaces/ITruncator";
 
 export class TruncateRecords {
   constructor(private truncator: ITruncator) {}

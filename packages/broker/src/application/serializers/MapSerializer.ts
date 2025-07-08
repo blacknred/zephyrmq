@@ -1,4 +1,4 @@
-import type { ISerializable } from "@domain/ports/ISerializable";
+import type { ISerializable } from "@domain/interfaces/ISerializable";
 
 export class MapSerializer<K, V> implements ISerializable {
   serialize(map: Map<K, V>): [K, V][] {

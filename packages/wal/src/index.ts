@@ -1,2 +1,2 @@
-export * from "@app/factories/FileWalFactory";
+export * from "@infra/factories/FileWalFactory";
 export * from "@app/interfaces/IWriteAheadLog";

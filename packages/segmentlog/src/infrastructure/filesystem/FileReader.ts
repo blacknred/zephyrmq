@@ -1,6 +1,6 @@
 import type { SegmentPointer } from "@domain/entities/SegmentPointer";
-import type { IReader } from "@domain/ports/IReader";
-import type { ISegmentManager } from "@domain/ports/ISegmentManager";
+import type { IReader } from "@domain/interfaces/IReader";
+import type { ISegmentManager } from "@domain/interfaces/ISegmentManager";
 
 export class FileReader implements IReader {
   constructor(private segmentManager: ISegmentManager) {}

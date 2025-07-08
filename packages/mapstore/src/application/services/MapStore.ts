@@ -1,7 +1,7 @@
-import type { IMapStore } from "./interfaces/IDB";
-import type { IMapOptions } from "./interfaces/IMapFactory";
-import type { CloseDB } from "./usecases/CloseDB";
-import type { CreateMap } from "./usecases/CreateMap";
+import type { IMapStore } from "../interfaces/IMapStore";
+import type { IMapOptions } from "../interfaces/IMapFactory";
+import type { CloseDB } from "../usecases/CloseDB";
+import type { CreateMap } from "../usecases/CreateMap";
 
 export class MapStore implements IMapStore {
   constructor(

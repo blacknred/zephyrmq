@@ -1,5 +1,5 @@
-import type { ISerializable } from "@domain/ports/ISerializable";
-import type { IValueGetter } from "@domain/ports/IValueGetter";
+import type { ISerializable } from "../../../domain/interfaces/ISerializable";
+import type { IValueGetter } from "../../../domain/interfaces/IValueGetter";
 import type { Level } from "level";
 
 export class LevelDbValueGetter<K, V> implements IValueGetter<K, V> {

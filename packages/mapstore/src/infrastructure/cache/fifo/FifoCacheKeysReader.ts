@@ -1,8 +1,8 @@
-import type { AsyncMapIterator } from "@domain/ports/AsyncMapIterator";
-import type { ICache } from "@domain/ports/ICache";
-import type { IKeysReader } from "@domain/ports/IKeysReader";
+import type { AsyncMapIterator } from "@domain/interfaces/AsyncMapIterator";
+import type { ICache } from "@domain/interfaces/ICache";
+import type { IKeysReader } from "@domain/interfaces/IKeysReader";
 
-export class FifiCacheKeysReader<K, V> implements IKeysReader<K> {
+export class FifoCacheKeysReader<K, V> implements IKeysReader<K> {
   constructor(private cache: ICache<K, V>) {}
 
   keys(): AsyncMapIterator<K> {

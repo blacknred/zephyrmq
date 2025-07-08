@@ -2,8 +2,7 @@ import type { IDecompressor } from "@domain/ports/IDecompressor";
 import type { IDecryptor } from "@domain/ports/IDecryptor";
 import type { IDeserializer } from "@domain/ports/IDeserializer";
 import type { ISchemaRegistry } from "@domain/ports/ISchemaRegistry";
-import type { WorkerPool } from "@infra/processor/worker/WorkerPool";
-import type { TransferListItem } from "node:worker_threads";
+import type { WorkerPool } from "@infra/worker/WorkerPool";
 
 export class Decode {
   constructor(
@@ -18,14 +17,12 @@ export class Decode {
   async execute<T>(buffer: Buffer, schemaRef?: string): Promise<T> {
     if (buffer.length > this.sizeThreshold) {
       // buffer => uint8array for transferlist
-      const arrayBuffer = buffer.buffer as TransferListItem;
-      const byteOffset = buffer.byteOffset;
-      const byteLength = buffer.byteLength;
+      const { byteOffset, byteLength } = buffer;
 
       return this.workerPool.send<T>(
         "decode",
         [{ byteOffset, byteLength }, schemaRef],
-        [arrayBuffer]
+        [buffer.buffer]
       );
     }
 

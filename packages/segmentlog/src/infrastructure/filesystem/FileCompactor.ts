@@ -1,7 +1,7 @@
 import type { SegmentPointer } from "@domain/entities/SegmentPointer";
-import type { ICompactor } from "@domain/ports/ICompactor";
-import type { ISegmentInfo } from "@domain/ports/ISegmentInfo";
-import type { ISegmentManager } from "@domain/ports/ISegmentManager";
+import type { ICompactor } from "@domain/interfaces/ICompactor";
+import type { ISegmentInfo } from "@domain/interfaces/ISegmentInfo";
+import type { ISegmentManager } from "@domain/interfaces/ISegmentManager";
 import crc from "crc-32";
 import fs from "fs/promises";
 import path from "path";

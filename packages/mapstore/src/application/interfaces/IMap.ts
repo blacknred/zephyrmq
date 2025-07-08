@@ -1,4 +1,4 @@
-import type { AsyncMapIterator } from "@domain/ports/AsyncMapIterator";
+import type { AsyncMapIterator } from "../../domain/interfaces/AsyncMapIterator";
 
 export interface IMap<K, V> {
   size: number;

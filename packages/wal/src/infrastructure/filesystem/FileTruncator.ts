@@ -1,7 +1,7 @@
 import type { FileHandle } from "fs/promises";
 import fs from "fs/promises";
-import type { ILogManager } from "@domain/ports/ILogManager";
-import type { ITruncator } from "@domain/ports/ITruncator";
+import type { ILogManager } from "@domain/interfaces/ILogManager";
+import type { ITruncator } from "@domain/interfaces/ITruncator";
 
 export class FileTruncator implements ITruncator {
   static HEADER_SIZE = 24;

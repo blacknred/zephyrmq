@@ -1,19 +1,15 @@
-import type { ICache } from "@domain/ports/ICache";
-import type { IValueGetter } from "@domain/ports/IValueGetter";
+import type { ICache } from "@domain/interfaces/ICache";
+import type { IKeyTracker } from "@domain/interfaces/IKeyTracker";
 
 export class CheckKeyPresence<K, V> {
   constructor(
     private readonly cache: ICache<K, V>,
-    private readonly valueGetter: IValueGetter<K, V>
+    private readonly keyTracker: IKeyTracker<K>
   ) {}
 
   async execute(key: K) {
-    const exists = this.cache.has(key);
-    if (!exists) {
-      const value = await this.valueGetter.get(key);
-      if (value) this.cache.set(key, value);
-      return value != undefined;
-    }
-    return exists;
+    // cache is faster than keytracker so check it first
+    if (this.cache.has(key)) return true;
+    return this.keyTracker.has(key);
   }
 }

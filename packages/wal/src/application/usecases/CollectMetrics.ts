@@ -1,6 +1,6 @@
 import type { FileHandle } from "fs/promises";
-import type { IAppender } from "@domain/ports/IAppender";
-import type { ILogManager } from "@domain/ports/ILogManager";
+import type { IAppender } from "@domain/interfaces/IAppender";
+import type { ILogManager } from "@domain/interfaces/ILogManager";
 
 export class CollectMetrics {
   constructor(

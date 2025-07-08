@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import type { SegmentPointer } from "@domain/entities/SegmentPointer";
-import type { IIndexManager } from "@domain/ports/IIndexManager";
-import type { ISegmentInfo } from "@domain/ports/ISegmentInfo";
+import type { IIndexManager } from "@domain/interfaces/IIndexManager";
+import type { ISegmentInfo } from "@domain/interfaces/ISegmentInfo";
 
 export class FileIndexManager implements IIndexManager {
   static INDEX_ENTRY_SIZE = 12;

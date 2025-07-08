@@ -22,6 +22,7 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
+    "bloom-filters": "^3.0.4",
     "level": "^10.0.0",
     "lmdb": "^3.4.1"
   }

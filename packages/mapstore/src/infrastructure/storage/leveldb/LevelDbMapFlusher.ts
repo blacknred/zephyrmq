@@ -1,7 +1,6 @@
-import type { IDBFlushManager } from "@domain/ports/IDBFlushManager";
-import type { IDBFlusher } from "@domain/ports/IDBFlusher";
-import type { IMapSizer } from "@domain/ports/IMapSizer";
-import type { ISerializable } from "@domain/ports/ISerializable";
+import type { IDBFlushManager } from "../../../domain/interfaces/IDBFlushManager";
+import type { IDBFlusher } from "../../../domain/interfaces/IDBFlusher";
+import type { ISerializable } from "../../../domain/interfaces/ISerializable";
 import { Mutex } from "@infra/util/Mutex";
 import type { Level } from "level";
 
@@ -13,7 +12,6 @@ export class LevelDbMapFlusher<K, V> implements IDBFlusher<K, V> {
     private db: Level<string, unknown>,
     private flushManager: IDBFlushManager,
     private name: string,
-    private sizer: IMapSizer,
     private serializer?: ISerializable<V>
   ) {
     this.flushManager.register(this.flush);
@@ -25,20 +23,10 @@ export class LevelDbMapFlusher<K, V> implements IDBFlusher<K, V> {
   }
 
   flush = async () => {
-    if (this.dirtyKeys.size === 0 || !this.sizer.size) return;
-    const prefix = `${this.name}!`;
-    const suffix = `${this.name}~`;
-
+    if (this.dirtyKeys.size === 0) return;
     await this.mutex.acquire();
 
     try {
-      if (!this.sizer.size) {
-        await this.db.clear({ gt: prefix, lt: suffix });
-        
-        this.dirtyKeys.clear();
-        return;
-      }
-
       const batch = this.db.batch();
 
       for (const [key, value] of this.dirtyKeys) {

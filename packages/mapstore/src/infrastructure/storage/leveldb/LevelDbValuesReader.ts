@@ -1,6 +1,6 @@
-import type { AsyncMapIterator } from "@domain/ports/AsyncMapIterator";
-import type { IEntriesReader } from "@domain/ports/IEntriesReader";
-import type { IValuesReader } from "@domain/ports/IValuesReader";
+import type { AsyncMapIterator } from "../../../domain/interfaces/AsyncMapIterator";
+import type { IEntriesReader } from "../../../domain/interfaces/IEntriesReader";
+import type { IValuesReader } from "../../../domain/interfaces/IValuesReader";
 
 export class LevelDbValuesReader<K, V> implements IValuesReader<V> {
   constructor(private entriesReader: IEntriesReader<K, V>) {}

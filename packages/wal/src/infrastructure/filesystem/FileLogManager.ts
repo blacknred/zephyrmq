@@ -1,7 +1,7 @@
 import type { FileHandle } from "fs/promises";
 import fs from "fs/promises";
 import path from "path";
-import type { ILogManager } from "@domain/ports/ILogManager";
+import type { ILogManager } from "@domain/interfaces/ILogManager";
 
 export class FileLogManager implements ILogManager<FileHandle> {
   public log?: FileHandle;

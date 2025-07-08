@@ -1,10 +1,10 @@
 import type { SegmentPointer } from "@domain/entities/SegmentPointer";
-import type { ISegmentLog } from "./interfaces/ISegmentLog";
-import type { AppendRecord } from "./usecases/AppendRecord";
-import type { CloseLog } from "./usecases/CloseLog";
-import type { CollectMetrics } from "./usecases/CollectMetrics";
-import type { CompactSegments } from "./usecases/CompactSegments";
-import type { ReadRecord } from "./usecases/ReadRecord";
+import type { ISegmentLog } from "../interfaces/ISegmentLog";
+import type { AppendRecord } from "../usecases/AppendRecord";
+import type { CloseLog } from "../usecases/CloseLog";
+import type { CollectMetrics } from "../usecases/CollectMetrics";
+import type { CompactSegments } from "../usecases/CompactSegments";
+import type { ReadRecord } from "../usecases/ReadRecord";
 
 export class SegmentLog implements ISegmentLog {
   constructor(

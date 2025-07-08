@@ -1,5 +1,5 @@
 import type { SegmentPointer } from "@domain/entities/SegmentPointer";
-import type { ICompactor } from "@domain/ports/ICompactor";
+import type { ICompactor } from "@domain/interfaces/ICompactor";
 
 export class CompactSegments {
   constructor(private compactor: ICompactor) {}

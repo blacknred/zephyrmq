@@ -1,20 +1,24 @@
-import type { ICache } from "@domain/ports/ICache";
-import type { IKeysReader } from "@domain/ports/IKeysReader";
-import type { IMapSizer } from "@domain/ports/IMapSizer";
+import type { ICache } from "../../domain/interfaces/ICache";
+import type { IKeyTracker } from "../../domain/interfaces/IKeyTracker";
+import type { IKeysReader } from "../../domain/interfaces/IKeysReader";
 
 export class ReadKeys<K, V> {
   constructor(
     private readonly cache: ICache<K, V>,
     private readonly cacheEntriesReader: IKeysReader<K>,
-    private readonly storageEntriesReader: IKeysReader<K>,
-    private readonly sizer: IMapSizer
+    private readonly dbEntriesReader: IKeysReader<K>,
+    private readonly keyTracker: IKeyTracker<K>
   ) {}
 
   execute() {
-    if (this.cache.size == this.sizer.size) {
+    if (this.areAllKeysInCache()) {
       return this.cacheEntriesReader.keys();
     }
 
-    return this.storageEntriesReader.keys();
+    return this.dbEntriesReader.keys();
+  }
+
+  private areAllKeysInCache(): boolean {
+    return this.cache.size === this.keyTracker.length;
   }
 }

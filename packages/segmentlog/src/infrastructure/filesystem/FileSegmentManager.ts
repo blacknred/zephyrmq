@@ -1,5 +1,5 @@
-import type { ISegmentInfo } from "@domain/ports/ISegmentInfo";
-import type { ISegmentManager } from "@domain/ports/ISegmentManager";
+import type { ISegmentInfo } from "@domain/interfaces/ISegmentInfo";
+import type { ISegmentManager } from "@domain/interfaces/ISegmentManager";
 import crc from "crc-32";
 import fs from "node:fs/promises";
 import path from "node:path";

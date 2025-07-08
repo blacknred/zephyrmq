@@ -1,18 +1,18 @@
 import type { IMap } from "@app/interfaces/IMap";
-import type { CheckKeyPresence } from "./usecases/CheckKeyPresence";
-import type { CleanMap } from "./usecases/CleanMap";
-import type { DeleteRecord } from "./usecases/DeleteRecord";
-import type { FlushMap } from "./usecases/FlushMap";
-import type { GetMapSize } from "./usecases/GetMapSize";
-import type { GetValue } from "./usecases/GetValue";
-import type { ReadEntries } from "./usecases/ReadEntries";
-import type { ReadKeys } from "./usecases/ReadKeys";
-import type { ReadValues } from "./usecases/ReadValues";
-import type { SetRecord } from "./usecases/SetRecord";
+import type { CheckKeyPresence } from "../usecases/CheckKeyPresence";
+import type { CleanMap } from "../usecases/CleanMap";
+import type { DeleteRecord } from "../usecases/DeleteRecord";
+import type { FlushMap } from "../usecases/FlushMap";
+import type { GetMapSize } from "../usecases/GetMapSize";
+import type { GetValue } from "../usecases/GetValue";
+import type { ReadEntries } from "../usecases/ReadEntries";
+import type { ReadKeys } from "../usecases/ReadKeys";
+import type { ReadValues } from "../usecases/ReadValues";
+import type { SetRecord } from "../usecases/SetRecord";
 
 export class Map<K extends string | number, V> implements IMap<K, V> {
   constructor(
-    private getMapSize: GetMapSize,
+    private getMapSize: GetMapSize<K>,
     private checkKeyPresence: CheckKeyPresence<K, V>,
     private getValue: GetValue<K, V>,
     private setRecord: SetRecord<K, V>,

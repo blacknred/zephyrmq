@@ -1,5 +1,5 @@
 import type { ISchemaRegistrar } from "@domain/ports/ISchemaRegistrar";
-import type { WorkerPool } from "@infra/processor/worker/WorkerPool";
+import type { WorkerPool } from "@infra/worker/WorkerPool";
 
 export class RegisterSchema<T> {
   constructor(

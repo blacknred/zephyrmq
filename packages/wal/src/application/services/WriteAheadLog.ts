@@ -1,9 +1,9 @@
-import type { IWriteAheadLog } from "@app/interfaces/IWriteAheadLog";
-import type { AppendRecord } from "./usecases/AppendRecord";
-import type { CloseLog } from "./usecases/CloseLog";
-import type { CollectMetrics } from "./usecases/CollectMetrics";
-import type { ReadRecord } from "./usecases/ReadRecord";
-import type { TruncateRecords } from "./usecases/TruncateRecords";
+import type { IWriteAheadLog } from "../interfaces/IWriteAheadLog";
+import type { AppendRecord } from "../usecases/AppendRecord";
+import type { CloseLog } from "../usecases/CloseLog";
+import type { CollectMetrics } from "../usecases/CollectMetrics";
+import type { ReadRecord } from "../usecases/ReadRecord";
+import type { TruncateRecords } from "../usecases/TruncateRecords";
 
 export class WriteAheadLog implements IWriteAheadLog {
   constructor(

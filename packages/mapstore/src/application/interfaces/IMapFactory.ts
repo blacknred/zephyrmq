@@ -1,4 +1,4 @@
-import type { ISerializable } from "@domain/ports/ISerializable";
+import type { ISerializable } from "../../domain/interfaces/ISerializable";
 import type { IMap } from "./IMap";
 
 export interface IMapOptions<T> {

@@ -1,6 +1,6 @@
 import type { FileHandle } from "fs/promises";
-import type { ILogManager } from "@domain/ports/ILogManager";
-import type { IReader } from "@domain/ports/IReader";
+import type { ILogManager } from "@domain/interfaces/ILogManager";
+import type { IReader } from "@domain/interfaces/IReader";
 
 export class FileReader implements IReader {
   constructor(private logManager: ILogManager<FileHandle>) {}
