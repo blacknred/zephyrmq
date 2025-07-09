@@ -1,5 +1,5 @@
-import type { ISchemaRegistrar } from "@domain/ports/ISchemaRegistrar";
-import type { ISchemaRegistry } from "@domain/ports/ISchemaRegistry";
+import type { ISchemaRegistrar } from "@domain/interfaces/ISchemaRegistrar";
+import type { ISchemaRegistry } from "@domain/interfaces/ISchemaRegistry";
 import { BinarySchema, type ISchemaDefinition } from "./BinarySchema";
 
 export class BinarySchemaRegistrar

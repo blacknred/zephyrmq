@@ -1,11 +1,12 @@
-import { Codec } from "@app/Codec";
-import type { ICodec } from "@app/interfaces/ICodec";
+import type { ICodec, ICodecConfig } from "@app/interfaces/ICodec";
+import { SizeThresholdThreadingPolicy } from "@app/policies/SizeThresholdThreadingPolicy";
+import { Codec } from "@app/services/Codec";
+import { ThreadedCodec } from "@app/services/ThreadedCodec";
 import { Decode } from "@app/usecases/Decode";
 import { Encode } from "@app/usecases/Encode";
 import { RegisterSchema } from "@app/usecases/RegisterSchema";
 import { RemoveSchema } from "@app/usecases/RemoveSchema";
-import type { IEncryptionOptions } from "@domain/ports/IEncryptionOptions";
-import type { ISchema } from "@domain/ports/ISchema";
+import type { ISchema } from "@domain/interfaces/ISchema";
 import { SnappyCompressor } from "@infra/compression/snappy/SnappyCompressor";
 import { SnappyDecompressor } from "@infra/compression/snappy/SnappyDecompessor";
 import { CipherDecryptor } from "@infra/encryption/cipher/CipherDecryptor";
@@ -16,25 +17,18 @@ import { BinarySchemaRemover } from "@infra/serialization/binarySchema/BinarySch
 import { BinarySchemaSerializer } from "@infra/serialization/binarySchema/BinarySchemaSerializer";
 import { BinarySchemaSizeCalculator } from "@infra/serialization/binarySchema/BinarySchemaSizeCalculator";
 import { InMemorySchemaRegistry } from "@infra/serialization/registry/InMemorySchemaRegistry";
-import { WorkerPoolFactory } from "@infra/worker/WorkerPoolFactory";
-
-export interface BinarySchemaCodecConfig {
-  sizeThreshold?: number;
-  workersCount?: number;
-  precompiledSchemas?: Record<string, ISchema<unknown>>;
-  compressionSizeThreshold?: number;
-  encryptionOptions?: IEncryptionOptions;
-}
+import { WorkerPoolFactory } from "@infra/factories/WorkerPoolFactory";
 
 export class BinarySchemaCodecFactory {
-  create(config: BinarySchemaCodecConfig): ICodec {
+  create(config: ICodecConfig<ISchema<unknown>>): ICodec {
     const {
       compressionSizeThreshold,
       precompiledSchemas,
       workersCount,
       encryptionOptions,
-      sizeThreshold = 10_000,
+      threadingSizeThreshold = 10_000,
     } = config;
+
     // registry
     const schemaRegistry = new InMemorySchemaRegistry(precompiledSchemas);
     const schemaRegistrar = new BinarySchemaRegistrar(schemaRegistry);
@@ -54,30 +48,23 @@ export class BinarySchemaCodecFactory {
     const decryptor =
       encryptionOptions && new CipherDecryptor(encryptionOptions);
 
-    // workers
-    const sizeCalculator = new BinarySchemaSizeCalculator();
-    const workerpool = new WorkerPoolFactory().create(config, workersCount);
-
-    return new Codec(
-      new Encode(
-        schemaRegistry,
-        sizeCalculator,
-        workerpool,
-        sizeThreshold,
-        serializer,
-        compressor,
-        encryptor
-      ),
-      new Decode(
-        schemaRegistry,
-        workerpool,
-        sizeThreshold,
-        deserializer,
-        decompressor,
-        decryptor
-      ),
-      new RegisterSchema(schemaRegistrar, workerpool),
-      new RemoveSchema(schemaRemover, workerpool)
+    const codec = new Codec(
+      new Encode(schemaRegistry, serializer, compressor, encryptor),
+      new Decode(schemaRegistry, deserializer, decompressor, decryptor),
+      new RegisterSchema(schemaRegistrar),
+      new RemoveSchema(schemaRemover)
     );
+
+    if (!workersCount) return codec;
+
+    // workers
+    const workerpool = new WorkerPoolFactory().create(config, workersCount);
+    const threadingPolicy = new SizeThresholdThreadingPolicy(
+      new BinarySchemaSizeCalculator(),
+      schemaRegistry,
+      threadingSizeThreshold
+    );
+
+    return new ThreadedCodec(codec, workerpool, threadingPolicy);
   }
 }

@@ -38,6 +38,8 @@ export class LevelDbMapFactory {
     name: string,
     { serializer }: IMapOptions<V> = {}
   ): IMap<K, V> {
+    const keyRegistry = new CuckooFilterKeyTracker<K>();
+
     const { cache, cacheEnriesReader, cacheKeysReader, cacheValuesReader } =
       this.cacheFactory.create<K, V>();
 
@@ -62,8 +64,6 @@ export class LevelDbMapFactory {
       name,
       serializer
     );
-
-    const keyRegistry = new CuckooFilterKeyTracker<K>();
 
     return new Map<K, V>(
       new GetMapSize(keyRegistry),

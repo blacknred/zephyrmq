@@ -1,5 +1,5 @@
+import type { ISchema } from "@domain/interfaces/ISchema";
 import crc32 from "crc-32";
-import type { ISchema } from "@domain/ports/ISchema";
 
 export type FieldType =
   | "int8"
@@ -77,59 +77,6 @@ export class BinarySchema<T> implements ISchema<T> {
     return Buffer.concat([crcBuffer, dataBuffer]);
   }
 
-  deserialize(buffer: Buffer): T {
-    if (buffer.length < 4) {
-      throw new Error("Buffer too small for CRC");
-    }
-
-    const expectedCrc = buffer.readUInt32BE(0);
-    const dataBuffer = buffer.subarray(4);
-    const actualCrc = crc32.buf(dataBuffer);
-
-    if (expectedCrc !== actualCrc) {
-      throw new Error("CRC32 checksum verification failed");
-    }
-
-    const result = {} as T;
-    let offset = 0;
-    const entries = Object.entries(this.schemaDef) as Array<
-      [keyof T, IFieldDefinition]
-    >;
-
-    let flagByte = 0;
-    let flagIndex = 0;
-
-    const hasOptional = entries.some(([_, def]) => def.optional);
-
-    if (hasOptional) {
-      flagByte = dataBuffer.readUInt8(offset++);
-    }
-
-    for (let i = 0; i < entries.length; i++) {
-      const [key, def] = entries[i];
-
-      if (def.optional && !(flagByte & (1 << flagIndex))) {
-        (result as any)[key] = undefined;
-        flagIndex++;
-        continue;
-      }
-
-      if (def.optional) {
-        flagIndex++;
-      }
-
-      const { value, bytesRead } = this.deserializeField(
-        def,
-        dataBuffer,
-        offset
-      );
-      (result as any)[key] = value;
-      offset += bytesRead;
-    }
-
-    return result;
-  }
-
   private computeCrc(buffer: Buffer): Buffer {
     const value = crc32.buf(buffer);
     const crcBuf = Buffer.alloc(4);
@@ -189,6 +136,59 @@ export class BinarySchema<T> implements ISchema<T> {
       default:
         throw new Error(`Unsupported type: ${def.type}`);
     }
+  }
+
+  deserialize(buffer: Buffer): T {
+    if (buffer.length < 4) {
+      throw new Error("Buffer too small for CRC");
+    }
+
+    const expectedCrc = buffer.readUInt32BE(0);
+    const dataBuffer = buffer.subarray(4);
+    const actualCrc = crc32.buf(dataBuffer);
+
+    if (expectedCrc !== actualCrc) {
+      throw new Error("CRC32 checksum verification failed");
+    }
+
+    const result = {} as T;
+    let offset = 0;
+    const entries = Object.entries(this.schemaDef) as Array<
+      [keyof T, IFieldDefinition]
+    >;
+
+    let flagByte = 0;
+    let flagIndex = 0;
+
+    const hasOptional = entries.some(([_, def]) => def.optional);
+
+    if (hasOptional) {
+      flagByte = dataBuffer.readUInt8(offset++);
+    }
+
+    for (let i = 0; i < entries.length; i++) {
+      const [key, def] = entries[i];
+
+      if (def.optional && !(flagByte & (1 << flagIndex))) {
+        (result as any)[key] = undefined;
+        flagIndex++;
+        continue;
+      }
+
+      if (def.optional) {
+        flagIndex++;
+      }
+
+      const { value, bytesRead } = this.deserializeField(
+        def,
+        dataBuffer,
+        offset
+      );
+      (result as any)[key] = value;
+      offset += bytesRead;
+    }
+
+    return result;
   }
 
   private deserializeField(

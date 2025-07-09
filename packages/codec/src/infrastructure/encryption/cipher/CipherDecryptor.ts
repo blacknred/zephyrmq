@@ -1,6 +1,6 @@
 import { createDecipheriv, type CipherGCMTypes } from "node:crypto";
-import type { IDecryptor } from "@domain/ports/IDecryptor";
-import type { IEncryptionOptions } from "@domain/ports/IEncryptionOptions";
+import type { IDecryptor } from "@domain/interfaces/IDecryptor";
+import type { IEncryptionOptions } from "@domain/interfaces/IEncryptionOptions";
 
 export class CipherDecryptor implements IDecryptor {
   static readonly AUTH_TAG_BYTE_LEN = 16;

@@ -1,25 +1,18 @@
+import type {
+  IWorkerPool,
+  WorkerRequest,
+  WorkerResponse,
+} from "@domain/interfaces/IWorkerPool";
 import type { TransferListItem } from "node:worker_threads";
 import { Worker } from "node:worker_threads";
 import os from "os";
-
-export type WorkerRequest = {
-  id: number;
-  method: string;
-  args: any[];
-};
-
-export type WorkerResponse<T = any> = {
-  id: number;
-  result?: T;
-  error?: string;
-};
 
 interface IPendingTask {
   resolve: (value: any) => void;
   reject: (reason?: any) => void;
 }
 
-export class WorkerPool {
+export class WorkerPool implements IWorkerPool {
   private pending = new Map<number, IPendingTask>();
   private workers: Worker[] = [];
   private pendingRequests: number[] = [];

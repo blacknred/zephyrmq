@@ -1,5 +1,5 @@
 import snappy from "snappy";
-import type { ICompressor } from "@domain/ports/ICompressor";
+import type { ICompressor } from "@domain/interfaces/ICompressor";
 
 export class SnappyCompressor implements ICompressor {
   static readonly COMPRESSION_SIZE_THRESHOLD = 4_000;

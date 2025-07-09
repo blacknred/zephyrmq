@@ -1,5 +1,5 @@
-import type { ISchema } from "@domain/ports/ISchema";
-import type { ISchemaRegistry } from "@domain/ports/ISchemaRegistry";
+import type { ISchema } from "@domain/interfaces/ISchema";
+import type { ISchemaRegistry } from "@domain/interfaces/ISchemaRegistry";
 
 export class InMemorySchemaRegistry implements ISchemaRegistry {
   private schemas: Map<any, ISchema<any>>;

@@ -1,14 +1,9 @@
-import type { ISchemaRemover } from "@domain/ports/ISchemaRemover";
-import type { WorkerPool } from "@infra/worker/WorkerPool";
+import type { ISchemaRemover } from "@domain/interfaces/ISchemaRemover";
 
 export class RemoveSchema {
-  constructor(
-    private schemaRemover: ISchemaRemover,
-    private workerPool: WorkerPool
-  ) {}
+  constructor(private schemaRemover: ISchemaRemover) {}
 
-  async execute(name: string) {
-    this.schemaRemover.remove(name);
-    return this.workerPool.sendToAll<boolean>("removeSchema", [name]);
+  execute(name: string) {
+    return this.schemaRemover.remove(name);
   }
 }

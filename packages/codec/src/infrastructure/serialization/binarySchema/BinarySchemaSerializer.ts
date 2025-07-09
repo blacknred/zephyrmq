@@ -1,6 +1,6 @@
 import msgpack from "@msgpack/msgpack";
-import type { ISchema } from "@domain/ports/ISchema";
-import type { ISerializer } from "@domain/ports/ISerializer";
+import type { ISchema } from "@domain/interfaces/ISchema";
+import type { ISerializer } from "@domain/interfaces/ISerializer";
 
 export class BinarySchemaSerializer implements ISerializer {
   serialize<T>(data: T, schema?: ISchema<T> | undefined): Buffer {

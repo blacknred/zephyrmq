@@ -1,5 +1,5 @@
-import type { ISchema } from "@domain/ports/ISchema";
-import type { ISchemaBasedSizeCalculator } from "@domain/ports/ISchemaBasedSizeCalculator";
+import type { ISchema } from "@domain/interfaces/ISchema";
+import type { ISchemaBasedSizeCalculator } from "@domain/interfaces/ISchemaBasedSizeCalculator";
 import type { IFieldDefinition } from "./BinarySchema";
 
 export class BinarySchemaSizeCalculator implements ISchemaBasedSizeCalculator {

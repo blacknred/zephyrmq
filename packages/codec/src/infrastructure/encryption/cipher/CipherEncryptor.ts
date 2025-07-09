@@ -1,6 +1,6 @@
 import { createCipheriv, randomBytes, type CipherGCMTypes } from "node:crypto";
-import type { IEncryptionOptions } from "@domain/ports/IEncryptionOptions";
-import type { IEncryptor } from "@domain/ports/IEncryptor";
+import type { IEncryptionOptions } from "@domain/interfaces/IEncryptionOptions";
+import type { IEncryptor } from "@domain/interfaces/IEncryptor";
 
 export class CipherEncryptor implements IEncryptor {
   static readonly AUTH_TAG_BYTE_LEN = 16;

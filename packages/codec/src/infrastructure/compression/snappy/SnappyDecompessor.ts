@@ -1,5 +1,5 @@
 import snappy from "snappy";
-import type { IDecompressor } from "@domain/ports/IDecompressor";
+import type { IDecompressor } from "@domain/interfaces/IDecompressor";
 
 export class SnappyDecompressor implements IDecompressor {
   decompress(buffer: Buffer): Buffer {

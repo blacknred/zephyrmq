@@ -6,3 +6,9 @@ export interface IDBFlushManager {
   commit(): void;
   close(): void;
 }
+
+export interface IDBFlushManagerConfig {
+  persistThresholdMs?: number;
+  maxPendingFlushes?: number;
+  memoryUsageThresholdMB?: number;
+}

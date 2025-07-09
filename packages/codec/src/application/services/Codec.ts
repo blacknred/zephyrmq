@@ -1,8 +1,8 @@
 import type { ICodec } from "@app/interfaces/ICodec";
-import type { Decode } from "./usecases/Decode";
-import type { Encode } from "./usecases/Encode";
-import type { RegisterSchema } from "./usecases/RegisterSchema";
-import type { RemoveSchema } from "./usecases/RemoveSchema";
+import type { Decode } from "../usecases/Decode";
+import type { Encode } from "../usecases/Encode";
+import type { RegisterSchema } from "../usecases/RegisterSchema";
+import type { RemoveSchema } from "../usecases/RemoveSchema";
 
 export class Codec implements ICodec {
   constructor(
@@ -25,10 +25,10 @@ export class Codec implements ICodec {
   }
 
   async registerSchema<T>(name: string, schema: T) {
-    return this.registrar.execute(name, schema);
+    this.registrar.execute(name, schema);
   }
 
   async removeSchema(name: string) {
-    return this.remover.execute(name);
+    this.remover.execute(name);
   }
 }
