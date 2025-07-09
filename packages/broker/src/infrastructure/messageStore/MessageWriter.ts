@@ -1,6 +1,6 @@
 import type { MessageMetadata } from "@domain/entities/MessageMetadata";
-import type { ILogger } from "@domain/ports/ILogger";
-import type { IMessageWriter } from "@domain/ports/IMessageWriter";
+import type { ILogger } from "@domain/interfaces/ILogger";
+import type { IMessageWriter } from "@domain/interfaces/IMessageWriter";
 import type { ISegmentLog } from "@zephyrmq/segmentlog/index";
 import type { IWriteAheadLog } from "@zephyrmq/wal/index";
 import type { IMap } from "@zephyrmq/mapstore/index";
@@ -60,7 +60,7 @@ export class MessageWriter implements IMessageWriter {
       this.metadatas.set(meta.id, metaBuffer);
       this.pointers.set(meta.id, pointerBuffer);
       this.ttls.set(`${ttl}:${meta.id}`, Buffer.alloc(0));
- 
+
       // await this.db.batch([
       //   { type: "put", key: `meta!${meta.id}`, value: metaBuffer },
       //   { type: "put", key: `ptr!${meta.id}`, value: pointerBuffer },
@@ -73,7 +73,7 @@ export class MessageWriter implements IMessageWriter {
 
       // Update last_wal_offset immediately
       const lastWalOffset = String(walOffset + 4 + totalLength);
-      this.systemData.set("last_wal_offset", Buffer.from(lastWalOffset))
+      this.systemData.set("last_wal_offset", Buffer.from(lastWalOffset));
       // await this.db.put("last_wal_offset", Buffer.from(lastWalOffset));
 
       return meta.id;

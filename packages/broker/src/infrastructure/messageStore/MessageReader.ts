@@ -1,6 +1,6 @@
 import type { MessageMetadata } from "@domain/entities/MessageMetadata";
-import type { ILogger } from "@domain/ports/ILogger";
-import type { IMessageReader } from "@domain/ports/IMessageReader";
+import type { ILogger } from "@domain/interfaces/ILogger";
+import type { IMessageReader } from "@domain/interfaces/IMessageReader";
 import type { IMap } from "@zephyrmq/mapstore/index";
 import type { ISegmentLog, SegmentPointer } from "@zephyrmq/segmentlog/index";
 

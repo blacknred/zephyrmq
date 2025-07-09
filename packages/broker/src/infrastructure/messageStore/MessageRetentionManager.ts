@@ -1,5 +1,5 @@
-import type { ILogger } from "@domain/ports/ILogger";
-import type { IMessageRetentionManager } from "@domain/ports/IMessageRetentionManager";
+import type { ILogger } from "@domain/interfaces/ILogger";
+import type { IMessageRetentionManager } from "@domain/interfaces/IMessageRetentionManager";
 import type { IMap } from "@zephyrmq/mapstore/index";
 import type { ISegmentLog, SegmentPointer } from "@zephyrmq/segmentlog/index";
 import type { IWriteAheadLog } from "@zephyrmq/wal/index";
@@ -17,7 +17,7 @@ export class MessageRetentionManager implements IMessageRetentionManager {
     private ttls: IMap<string, Buffer>,
     private deleted: IMap<number, Buffer>,
     private systemData: IMap<string, Buffer>,
-    
+
     private dlqManager: IDLQManager<any>,
     private codec: ICodec,
     private logger?: ILogger,

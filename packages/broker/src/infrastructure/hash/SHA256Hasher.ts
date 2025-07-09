@@ -1,4 +1,4 @@
-import type { IHasher } from "@domain/ports/IHasher";
+import type { IHasher } from "@domain/interfaces/IHasher";
 import crypto from "node:crypto";
 
 export class SHA256Hasher implements IHasher {

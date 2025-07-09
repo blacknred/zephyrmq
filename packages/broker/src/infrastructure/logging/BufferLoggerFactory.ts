@@ -1,6 +1,6 @@
-import type { ILogger } from "@domain/ports/ILogger";
-import type { ILogDriver } from "@domain/ports/ILoggerDriver";
-import type { ILoggerFactory } from "@domain/ports/ILoggerFactory";
+import type { ILogger } from "@domain/interfaces/ILogger";
+import type { ILogDriver } from "@domain/interfaces/ILoggerDriver";
+import type { ILoggerFactory } from "@domain/interfaces/ILoggerFactory";
 import { BufferedLogger } from "./BufferedLogger";
 
 export class BufferLoggerFactory implements ILoggerFactory {

@@ -1,4 +1,4 @@
-import { MessageMetadata } from "../../..";
+import { MessageMetadata } from "../..";
 import type { ISchema } from "../types";
 
 export const messageMetadataSchema: ISchema<MessageMetadata> = {

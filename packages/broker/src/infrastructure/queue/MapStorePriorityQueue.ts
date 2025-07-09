@@ -1,4 +1,4 @@
-import type { IPriorityQueue } from "@domain/ports/IPriorityQueue";
+import type { IPriorityQueue } from "@domain/interfaces/IPriorityQueue";
 import type { IMap, IMapStore, ISerializable } from "@zephyrmq/mapstore/index";
 
 export class MapStorePriorityQueue<T> implements IPriorityQueue<T> {

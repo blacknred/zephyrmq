@@ -1,5 +1,5 @@
-import type { IHasher } from "@domain/ports/IHasher";
-import type { IHashRing } from "@domain/ports/IHashRing";
+import type { IHasher } from "@domain/interfaces/IHasher";
+import type { IHashRing } from "@domain/interfaces/IHashRing";
 import type { IMap, IMapStore, ISerializable } from "@zephyrmq/mapstore/index";
 
 class HashToNodeSerializer implements ISerializable<number, number> {

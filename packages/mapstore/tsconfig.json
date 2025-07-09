@@ -9,6 +9,6 @@
       "@app/*": ["application/*"]
     }
   },
-  "include": ["src/**/*", "../broker/src/application/serializers"],
+  "include": ["src/**/*"],
   "exclude": ["node_modules"]
 }

@@ -1,5 +1,5 @@
-import type { ILogger } from "@domain/ports/ILogger";
-import type { IWALReplayer } from "@domain/ports/IWALReplayer";
+import type { ILogger } from "@domain/interfaces/ILogger";
+import type { IWALReplayer } from "@domain/interfaces/IWALReplayer";
 import type { IMap } from "@zephyrmq/mapstore/index";
 import type { ISegmentLog } from "@zephyrmq/segmentlog/index";
 import type { IWriteAheadLog } from "@zephyrmq/wal/index";

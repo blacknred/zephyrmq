@@ -1,4 +1,4 @@
-import { SegmentPointer } from "../../..";
+import { SegmentPointer } from "../..";
 import type { ISchema } from "../types";
 
 export const segmentPointerSchema: ISchema<SegmentPointer> = {
