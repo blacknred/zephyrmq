@@ -1,6 +1,6 @@
 export interface IHashRing {
-  addNode(id: number): void;
-  removeNode(id: number): void;
+  addNode(id: number): Promise<void>;
+  removeNode(id: number): Promise<void>;
   getNodeCount(): number;
-  getNode(key: string): Generator<number, void, unknown>;
+  getNodes(key: string): AsyncGenerator<number, void, unknown>;
 }

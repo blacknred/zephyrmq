@@ -1,5 +1,5 @@
-import type { ILogger } from "@domain/interfaces/ILogger";
-import type { ILogDriver } from "@domain/interfaces/ILoggerDriver";
+import type { ILogger } from "@app/interfaces/ILogger";
+import type { ILogDriver } from "@app/interfaces/ILogDriver";
 
 export class BufferedLogger implements ILogger {
   private flushId?: NodeJS.Immediate;

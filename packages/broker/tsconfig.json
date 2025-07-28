@@ -6,10 +6,10 @@
       "@infra/*": ["src/infrastructure/*"],
       "@domain/*": ["src/domain/*"],
       "@app/*": ["src/application/*"],
-      "@zephyrmq/codec/*": ["../codec/src/*"],
-      "@zephyrmq/segmentlog/*": ["../segmentlog/src/*"],
-      "@zephyrmq/wal/*": ["../wal/src/*"],
-      "@zephyrmq/mapstore/*": ["../mapstore/src/*"]
+      "@zephyrmq/codec": ["../codec/src/index"],
+      "@zephyrmq/segmentlog": ["../segmentlog/src/index"],
+      "@zephyrmq/wal": ["../wal/src/index"],
+      "@zephyrmq/mapstore": ["../mapstore/src/index"]
     }
   },
   "include": ["src/**/*"],

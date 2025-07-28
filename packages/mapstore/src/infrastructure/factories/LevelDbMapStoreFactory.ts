@@ -2,24 +2,29 @@ import type { IMapStore } from "@app/interfaces/IMapStore";
 import { MapStore } from "@app/services/MapStore";
 import { CloseDB } from "@app/usecases/CloseDB";
 import { CreateMap } from "@app/usecases/CreateMap";
-import type { IDBFlushManagerConfig } from "@domain/interfaces/IDBFlushManager";
 import { MemoryCapacityService } from "@infra/ram/MemoryCapacityService";
 import { MemoryPressureChecker } from "@infra/ram/MemoryPressureChecker";
 import { FlushManager } from "@infra/storage/FlushManager";
 import { LevelDbCloser } from "@infra/storage/leveldb/LevelDbCloser";
 import { Level, type DatabaseOptions } from "level";
-import { CacheCapacityCalculator } from "../cache/CacheCapacityCalculator";
 import { FifoCacheFactory } from "./FifoCacheFactory";
 import { LevelDbMapFactory } from "./LevelDbMapFactory";
+import { CacheCapacityCalculator } from "@zephyrmq/mapstore/src/infrastructure/cache/RamCacheCapacityCalculator";
 
-export interface LevelDbMapStoreFactoryConfig
+interface IDBFlushManagerConfig {
+  persistThresholdMs?: number;
+  maxPendingFlushes?: number;
+  memoryUsageThresholdMB?: number;
+}
+
+export interface IMapStoreConfig
   extends DatabaseOptions<string, unknown>,
     IDBFlushManagerConfig {}
 
 export class LevelDbMapStoreFactory {
   create(
     location: string,
-    options: LevelDbMapStoreFactoryConfig = {}
+    options: IMapStoreConfig | undefined = {}
   ): IMapStore {
     const {
       persistThresholdMs,

@@ -1,0 +1,1 @@
+export type IClientType = "producer" | "consumer" | "dlq_consumer";

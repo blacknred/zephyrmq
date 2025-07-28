@@ -1,9 +1,9 @@
-import type { IAppender } from "../../domain/interfaces/IAppender";
+import type { ITopicLister } from "@domain/interfaces/topic/ITopicLister";
 
 export class ListTopics {
-  constructor(private appender: IAppender) {}
+  constructor(private lister: ITopicLister) {}
 
-  async execute(data: Buffer) {
-    return this.appender.append(data);
+  async execute() {
+    return this.lister.list();
   }
 }

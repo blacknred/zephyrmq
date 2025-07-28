@@ -1,9 +1,9 @@
-import type { IAppender } from "../../domain/interfaces/IAppender";
+import type { IClientGetter } from "@domain/interfaces/client/IClientGetter";
 
 export class GetClient {
-  constructor(private appender: IAppender) {}
+  constructor(private getter: IClientGetter) {}
 
-  async execute(data: Buffer) {
-    return this.appender.append(data);
+  async execute(id: number) {
+    return this.getter.get(id);
   }
 }

@@ -25,29 +25,6 @@ import { uniqueIntGenerator } from "./utils";
 //
 //
 // MESSAGE
-export class MessageMetadata {
-  id: number = 0; // 4 bytes
-  ts: number = Date.now(); // 8 bytes (double)
-  producerId: number = 0; // 4 bytes
-  priority?: number; // 1 byte (0-255)
-  ttl?: number; // 4 bytes
-  ttd?: number; // 4 bytes
-  topic: string = "";
-  correlationId?: string;
-  routingKey?: string;
-  dedupId?: string;
-  // Bit flags for optional fields (1 byte)
-  get flags(): number {
-    return (
-      (this.priority !== undefined ? 0x01 : 0) |
-      (this.ttl !== undefined ? 0x02 : 0) |
-      (this.ttd !== undefined ? 0x04 : 0) |
-      (this.correlationId !== undefined ? 0x10 : 0) |
-      (this.routingKey !== undefined ? 0x20 : 0) |
-      (this.dedupId !== undefined ? 0x40 : 0)
-    );
-  }
-}
 interface IMessageValidator<Data> {
   validate(data: { data: Data; size: number; dedupId?: string }): void;
 }
@@ -97,483 +74,83 @@ class CapacityValidator implements IMessageValidator<any> {
     }
   }
 }
-interface MetadataInput
-  extends Pick<
-    MessageMetadata,
-    "priority" | "correlationId" | "ttd" | "ttl" | "dedupId"
-  > {}
-interface IMessageCreationResult {
-  meta: MessageMetadata;
-  message?: Buffer;
-  error?: any;
-}
-interface IMessageFactory<Data> {
-  create(
-    batch: Data[],
-    metadataInput: MetadataInput & {
-      topic: string;
-      producerId: number;
-    }
-  ): Promise<IMessageCreationResult[]>;
-}
-class MessageFactory<Data> implements IMessageFactory<Data> {
-  constructor(
-    private codec: ICodec,
-    private validators: IMessageValidator<Data>[],
-    private schemaId?: string
-  ) {}
+// interface MetadataInput
+//   extends Pick<
+//     MessageMetadata,
+//     "priority" | "correlationId" | "ttd" | "ttl" | "dedupId"
+//   > {}
+// interface IMessageCreationResult {
+//   meta: MessageMetadata;
+//   message?: Buffer;
+//   error?: any;
+// }
+// interface IMessageFactory<Data> {
+//   create(
+//     batch: Data[],
+//     metadataInput: MetadataInput & {
+//       topic: string;
+//       producerId: number;
+//     }
+//   ): Promise<IMessageCreationResult[]>;
+// }
+// class MessageFactory<Data> implements IMessageFactory<Data> {
+//   constructor(
+//     private codec: ICodec,
+//     private validators: IMessageValidator<Data>[],
+//     private schemaId?: string
+//   ) {}
 
-  async create(
-    batch: Data[],
-    metadataInput: MetadataInput & { topic: string; producerId: number }
-  ) {
-    return Promise.all(
-      batch.map(async (data) => {
-        const meta = new MessageMetadata();
-        Object.assign(meta, metadataInput);
-        meta.id = uniqueIntGenerator();
+//   async create(
+//     batch: Data[],
+//     metadataInput: MetadataInput & { topic: string; producerId: number }
+//   ) {
+//     return Promise.all(
+//       batch.map(async (data) => {
+//         const meta = new MessageMetadata();
+//         Object.assign(meta, metadataInput);
+//         meta.id = uniqueIntGenerator();
 
-        try {
-          const message = await this.codec.encode(data, this.schemaId);
-          this.validators.forEach((v) =>
-            v.validate({ data, size: message.length, dedupId: meta.dedupId })
-          );
-          return { meta, message };
-        } catch (error) {
-          return { meta, error };
-        }
-      })
-    );
-  }
-}
+//         try {
+//           const message = await this.codec.encode(data, this.schemaId);
+//           this.validators.forEach((v) =>
+//             v.validate({ data, size: message.length, dedupId: meta.dedupId })
+//           );
+//           return { meta, message };
+//         } catch (error) {
+//           return { meta, error };
+//         }
+//       })
+//     );
+//   }
+// }
 //
 //
-// message_store
-interface IWALReplayer {
-  replay(): Promise<void>;
-}
-class WALReplayer implements IWALReplayer {
-  constructor(
-    private wal: IWriteAheadLog,
-    private log: IMessageLog,
-    private db: Level<string, unknown>,
-    private codec: ICodec,
-    private messagePublisher: IMessagePublisher,
-    private logger?: ILogCollector
-  ) {}
-
-  async replay(): Promise<void> {
-    let offset = 0;
-
-    try {
-      while (true) {
-        const offsetBuffer = await this.db.get("last_wal_offset");
-        if (offsetBuffer) offset = +offsetBuffer.toString();
-
-        this.logger?.log(`Replaying WAL from offset ${offset}`, { offset });
-
-        // 1. Read total length
-        const totalLengthBytes = await this.wal.read(offset, 4);
-        if (!totalLengthBytes || totalLengthBytes.length < 4) break;
-        const totalLength = totalLengthBytes.readUInt32BE(0);
-
-        // 2. Read full record body (metaLength + metadata + message)
-        const recordBytes = await this.wal.read(offset + 4, totalLength);
-        if (!recordBytes || recordBytes.length < totalLength) break;
-
-        // 3. Extract metadata length
-        const metaLength = recordBytes.readUInt32BE(0);
-        const metaBuffer = recordBytes.slice(4, 4 + metaLength);
-        const messageBuffer = recordBytes.slice(4 + metaLength);
-
-        // 4. Decode and apply
-        const meta = await this.codec.decode(metaBuffer, messageMetadataSchema);
-        const pointer = await this.log.append(messageBuffer);
-        if (!pointer) break;
-
-        const pointerBuffer = await this.codec.encode(
-          pointer,
-          SegmentPointerSchema
-        );
-
-        await this.db.batch([
-          { type: "put", key: `meta!${meta.id}`, value: metaBuffer },
-          { type: "put", key: `ptr!${meta.id}`, value: pointerBuffer },
-        ]);
-
-        // 5. Update WAL progress
-        offset = offset + 4 + totalLength;
-        await this.db.put("last_wal_offset", Buffer.from(String(offset)));
-
-        // 6. publish
-        await this.messagePublisher.publish(meta);
-      }
-
-      if (offset > 0) {
-        await this.wal.truncate(offset);
-        this.logger?.log(`Replayed from WAL`, { offset });
-      }
-    } catch (error) {
-      this.logger?.log("Failed WAL replay", { error }, "error");
-    }
-  }
-}
-interface IMessageWriter {
-  write(message: Buffer, meta: MessageMetadata): Promise<number | undefined>;
-}
-class MessageWriter implements IMessageWriter {
-  constructor(
-    private wal: IWriteAheadLog,
-    private log: IMessageLog,
-    private db: Level<string, Buffer>,
-    private codec: ICodec,
-    private logger?: ILogCollector,
-    private maxMessageTTLMs = 3_600_000_000
-  ) {}
-
-  async write(
-    message: Buffer,
-    meta: MessageMetadata
-  ): Promise<number | undefined> {
-    try {
-      const metaBuffer = await this.codec.encode(meta, messageMetadataSchema);
-
-      // Add length prefixes
-      const metaLengthBuffer = Buffer.alloc(4);
-      metaLengthBuffer.writeUInt32BE(metaBuffer.length, 0);
-      const totalLength = 4 + metaBuffer.length + message.length;
-      const totalLengthBuffer = Buffer.alloc(4);
-      totalLengthBuffer.writeUInt32BE(totalLength, 0);
-
-      // Combine into one wal record
-      const walRecord = Buffer.concat([
-        totalLengthBuffer,
-        metaLengthBuffer,
-        metaBuffer,
-        message,
-      ]);
-
-      // 1. Write to WAL first for durability
-      const walOffset = await this.wal.append(walRecord);
-      if (!walOffset) throw new Error("Failed writing to WAL");
-
-      // 2. Write to log for long-term storage
-      const pointer = await this.log.append(message);
-      if (!pointer) throw new Error("Failed writing to MessageLog");
-
-      // 3. Store metadata, pointers and ttl in db.
-      const pointerBuffer = await this.codec.encode(
-        pointer,
-        SegmentPointerSchema
-      );
-
-      const ttl = meta.ts + (meta.ttl || this.maxMessageTTLMs);
-      await this.db.batch([
-        { type: "put", key: `meta!${meta.id}`, value: metaBuffer },
-        { type: "put", key: `ptr!${meta.id}`, value: pointerBuffer },
-        {
-          type: "put",
-          key: `ttl!${ttl}:${meta.id}`,
-          value: Buffer.alloc(0),
-        },
-      ]);
-
-      // Update last_wal_offset immediately
-      const lastWalOffset = String(walOffset + 4 + totalLength);
-      await this.db.put("last_wal_offset", Buffer.from(lastWalOffset));
-
-      return meta.id;
-    } catch (error) {
-      this.logger?.log("Failed to write message", { ...meta, error }, "error");
-    }
-  }
-}
-interface IMessageReader<Data> {
-  read(
-    id: number
-  ): Promise<
-    [
-      Awaited<Data> | undefined,
-      Pick<MessageMetadata, keyof MessageMetadata> | undefined,
-    ]
-  >;
-  readMessage(id: number): Promise<Data | undefined>;
-  readMetadata<K extends keyof MessageMetadata>(
-    id: number,
-    keys?: K[]
-  ): Promise<Pick<MessageMetadata, K> | undefined>;
-}
-class MessageReader<Data> implements IMessageReader<Data> {
-  constructor(
-    private log: IMessageLog,
-    private db: Level<string, Buffer>,
-    private codec: ICodec,
-    private schemaId?: string,
-    private logger?: ILogCollector
-  ) {}
-
-  async read(id: number) {
-    return Promise.all([this.readMessage(id), this.readMetadata(id)]);
-  }
-
-  async readMessage(id: number) {
-    try {
-      const pointerBuffer = await this.db.get(`ptr!${id}`);
-      if (!pointerBuffer) return;
-
-      const pointer = await this.codec.decode<SegmentPointer>(
-        pointerBuffer,
-        BasicSchemaNames.SegmentPointerSchema
-      );
-
-      const messageBuffer = await this.log.read(pointer);
-      if (!messageBuffer) return;
-
-      return this.codec.decode<Data>(messageBuffer, this.schemaId);
-    } catch (error) {
-      this.logger?.log("Failed message reading", { id, error }, "error");
-    }
-  }
-
-  async readMetadata(id: number) {
-    try {
-      const metaBuffer = await this.db.get(`meta!${id}`);
-      if (metaBuffer) return;
-
-      return this.codec.decode<MessageMetadata>(
-        metaBuffer,
-        BasicSchemaNames.messageMetadataSchema
-      );
-    } catch (error) {
-      this.logger?.log("Failed metadata reading", { id, error }, "error");
-    }
-  }
-}
-interface IMessageRetentionManager {
-  start(): void;
-  stop(): void;
-  markDeletable(id: number): Promise<void>;
-  unmarkDeletable(id: number): Promise<void>;
-}
-class MessageRetentionManager implements IMessageRetentionManager {
-  private retentionTimer?: NodeJS.Timeout;
-
-  constructor(
-    private db: Level<string, Buffer>,
-    private wal: IWriteAheadLog,
-    private log: IMessageLog,
-    private dlqManager: IDLQManager<any>,
-    private codec: ICodec,
-    private logger?: ILogCollector,
-    private retentionMs = 3_600_000
-  ) {}
-
-  start(): void {
-    if (this.retentionMs === Infinity) return;
-    this.retentionTimer = setInterval(
-      this.retain,
-      Math.min(this.retentionMs, 3_600_000)
-    );
-  }
-
-  stop() {
-    clearInterval(this.retentionTimer);
-  }
-
-  async markDeletable(id: number): Promise<void> {
-    return this.db.put(`del!${id}`, Buffer.from("1"));
-  }
-
-  async unmarkDeletable(id: number): Promise<void> {
-    return this.db.del(`del!${id}`);
-  }
-
-  private async clearDeletable() {
-    const pointersToDelete: SegmentPointer[] = [];
-    const batch = this.db.batch();
-
-    for await (const [key] of this.db.iterator({
-      gt: `del!`,
-      lt: `del~`,
-    })) {
-      const id = key.slice(4);
-
-      try {
-        const pointerBuffer = await this.db.get(`ptr!${id}`);
-        if (pointerBuffer) {
-          const pointer = await this.codec.decode(
-            pointerBuffer,
-            SegmentPointerSchema
-          );
-          pointersToDelete.push(pointer);
-        }
-
-        batch.del(`meta!${id}`);
-        batch.del(`ptr!${id}`);
-        batch.del(`del!${id}`);
-      } catch (error) {
-        this.logger?.log(
-          `MessageStore cannot delete ${id}`,
-          { error, id },
-          "error"
-        );
-      }
-    }
-
-    // 1. db batch
-    await batch.write();
-
-    // 2. delete from log
-    if (pointersToDelete.length) {
-      await this.log.compactSegmentsByRemovingOldMessages(pointersToDelete);
-    }
-
-    // 3. truncate the wal
-    const offsetBuffer = await this.db.get("last_wal_offset");
-    await this.wal.truncate(+offsetBuffer.toSorted());
-
-    return pointersToDelete.length;
-  }
-
-  private async processTtl() {
-    for await (const [key] of this.db.iterator({
-      lt: `ts!${Date.now() + this.retentionMs}`,
-    })) {
-      const id = key.split(":")[1];
-
-      try {
-        const metaBuffer = await this.db.get(`meta!${id}`);
-        const meta = await this.codec.decode(metaBuffer, messageMetadataSchema);
-
-        await this.db.del(key);
-        this.dlqManager.enqueue(meta, "expired");
-      } catch (error) {
-        this.logger?.log(
-          `MessageStore cannot send to dlq ${id}`,
-          { error, id },
-          "error"
-        );
-      }
-    }
-  }
-
-  private retain = async () => {
-    try {
-      const [deletedCount] = await Promise.all([
-        this.clearDeletable(),
-        this.processTtl(),
-      ]);
-
-      this.logger?.log("MessageStore retention succeed", { deletedCount });
-    } catch (error) {
-      this.logger?.log("MessageStore retention failed", { error }, "error");
-    }
-  };
-}
-interface IMessageStore<Data> {
-  write(message: Buffer, meta: MessageMetadata): Promise<number | undefined>;
-  read(
-    id: number
-  ): Promise<
-    [
-      Awaited<Data> | undefined,
-      Pick<MessageMetadata, keyof MessageMetadata> | undefined,
-    ]
-  >;
-  readMessage(id: number): Promise<Data | undefined>;
-  readMetadata<K extends keyof MessageMetadata>(
-    id: number,
-    keys?: K[]
-  ): Promise<Pick<MessageMetadata, K> | undefined>;
-  markDeletable(id: number): Promise<void>;
-  unmarkDeletable(id: number): Promise<void>;
-  close(): Promise<void>;
-  getMetrics(): Promise<{
-    wal: {
-      fileSize: number | undefined;
-      batchSize: number;
-      batchCount: number;
-      isFlushing: boolean;
-    };
-    log: {
-      totalSize: number;
-      messageCount: number;
-      currentSegmentId: number | undefined;
-      segmentCount: number;
-    };
-    db: {};
-    ram: NodeJS.MemoryUsage;
-  }>;
-}
-class MessageStoreService<Data> implements IMessageStore<Data> {
-  constructor(
-    private replayer: IWALReplayer,
-    private writer: IMessageWriter,
-    private reader: IMessageReader<Data>,
-    private retentionManager: IMessageRetentionManager,
-    private db: Level<string, Buffer>,
-    private wal: IWriteAheadLog,
-    private log: IMessageLog
-  ) {
-    this.init();
-  }
-
-  private async init() {
-    await this.replayer.replay();
-    this.retentionManager.start();
-  }
-
-  async write(
-    message: Buffer,
-    meta: MessageMetadata
-  ): Promise<number | undefined> {
-    return this.writer.write(message, meta);
-  }
-
-  async read(id: number) {
-    return this.reader.read(id);
-  }
-
-  async readMessage(id: number): Promise<Data | undefined> {
-    return this.reader.readMessage(id);
-  }
-
-  async readMetadata<K extends keyof MessageMetadata>(
-    id: number,
-    keys?: K[]
-  ): Promise<Pick<MessageMetadata, K> | undefined> {
-    return this.reader.readMetadata(id, keys);
-  }
-
-  async markDeletable(id: number): Promise<void> {
-    return this.retentionManager.markDeletable(id);
-  }
-
-  async unmarkDeletable(id: number): Promise<void> {
-    return this.retentionManager.markDeletable(id);
-  }
-
-  async close() {
-    this.retentionManager.stop();
-    await Promise.all([this.wal.close(), this.db.close()]);
-  }
-
-  async getMetrics() {
-    const [walStats, logStats] = await Promise.all([
-      this.wal.getMetrics(),
-      this.log.getMetrics(),
-    ]);
-
-    return {
-      wal: walStats,
-      log: logStats,
-      db: {
-        /** db.stats() is not implemented in Level */
-      },
-      ram: process.memoryUsage(),
-    };
-  }
-}
+// export interface RangeOptions<K> {
+//   gt?: K
+//   gte?: K
+//   lt?: K
+//   lte?: K
+//   reverse?: boolean | undefined
+//   limit?: number | undefined
+// }
+// 	interface RangeOptions {
+// 		/** Starting key for a range **/
+// 		start?: Key
+// 		/** Ending key for a range **/
+// 		end?: Key
+// 		/** Iterate through the entries in reverse order **/
+// 		reverse?: boolean
+// 		/** Include version numbers in each entry returned **/
+// 		versions?: boolean
+// 		/** The maximum number of entries to return **/
+// 		limit?: number
+// 		/** The number of entries to skip **/
+// 		offset?: number
+// 		/** Use a snapshot of the database from when the iterator started **/
+// 		snapshot?: boolean
+// 		/** Use the provided transaction for this range query */
+// 		transaction?: Transaction
+// 	}
 //
 //
 //
@@ -1059,60 +636,60 @@ class MessagePublisher implements IMessagePublisher {
     this.logger?.log(`Message is published in ${meta.topic}.`, meta);
   }
 }
-interface IPublishingService {
-  publish(
-    producerId: number,
-    message: Buffer,
-    meta: MessageMetadata
-  ): Promise<void>;
-  getMetrics(): {
-    router: {
-      consumerGroups: {
-        name: string;
-        count: number;
-      }[];
-    };
-    delayedMessages: {
-      count: number;
-    };
-  };
-}
-class PublishingService<Data> implements IPublishingService {
-  constructor(
-    private readonly messageStore: IMessageStore<Data>,
-    private readonly messageRouter: IMessageRouter,
-    private readonly messagePublisher: IMessagePublisher,
-    private readonly activityTracker: IClientActivityTracker,
-    private readonly delayedManager: IDelayedMessageManager,
-    private readonly metrics: IMetricsCollector
-  ) {}
+// interface IPublishingService {
+//   publish(
+//     producerId: number,
+//     message: Buffer,
+//     meta: MessageMetadata
+//   ): Promise<void>;
+//   getMetrics(): {
+//     router: {
+//       consumerGroups: {
+//         name: string;
+//         count: number;
+//       }[];
+//     };
+//     delayedMessages: {
+//       count: number;
+//     };
+//   };
+// }
+// class PublishingService<Data> implements IPublishingService {
+//   constructor(
+//     private readonly messageStore: IMessageStore<Data>,
+//     private readonly messageRouter: IMessageRouter,
+//     private readonly messagePublisher: IMessagePublisher,
+//     private readonly activityTracker: IClientActivityTracker,
+//     private readonly delayedManager: IDelayedMessageManager,
+//     private readonly metrics: IMetricsCollector
+//   ) {}
 
-  async publish(
-    producerId: number,
-    message: Buffer,
-    meta: MessageMetadata
-  ): Promise<void> {
-    await this.messageStore.write(message, meta);
+//   async publish(
+//     producerId: number,
+//     message: Buffer,
+//     meta: MessageMetadata
+//   ): Promise<void> {
+//     await this.messageStore.write(message, meta);
 
-    const processingTime = Date.now() - meta.ts;
-    this.metrics.recordEnqueue(message.length, processingTime);
-    this.activityTracker.recordActivity(producerId, {
-      messageCount: 1,
-      processingTime,
-      status: "idle",
-    });
+//     const processingTime = Date.now() - meta.ts;
+//     this.metrics.recordEnqueue(message.length, processingTime);
+//     this.activityTracker.recordActivity(producerId, {
+//       messageCount: 1,
+//       processingTime,
+//       status: "idle",
+//     });
 
-    await this.messagePublisher.publish(meta);
-  }
+//     await this.messagePublisher.publish(meta);
+//   }
 
-  getMetrics() {
-    return {
-      router: this.messageRouter.getMetrics(),
-      delayedMessages: this.delayedManager.getMetrics(),
-      storage: this.messageStore.getMetrics(),
-    };
-  }
-}
+//   getMetrics() {
+//     return {
+//       router: this.messageRouter.getMetrics(),
+//       delayedMessages: this.delayedManager.getMetrics(),
+//       storage: this.messageStore.getMetrics(),
+//     };
+//   }
+// }
 //
 //
 //
@@ -1918,92 +1495,92 @@ class DLQService<Data> implements IDLQService<Data> {
 //
 //
 // SRC/CLIENT_MANAGEMENT_SERVICE.TS
-type ClientType = "producer" | "consumer" | "dlq_consumer";
-type ClientStatus = "active" | "idle" | "lagging";
-interface IMutableClientState {
-  lastActiveAt: number;
-  // Metrics
-  status: ClientStatus;
-  messageCount: number;
-  processingTime: number;
-  avgProcessingTime: number;
-  pendingAcks: number;
-}
-interface IClientState extends IMutableClientState {
-  id: number;
-  clientType: ClientType;
-  registeredAt: number;
-}
-class ClientState implements IClientState {
-  public registeredAt = Date.now();
-  public lastActiveAt = Date.now();
-  public status: ClientStatus = "active";
-  public messageCount = 0;
-  public processingTime = 0;
-  public avgProcessingTime = 0;
-  public pendingAcks = 0;
-  constructor(
-    public id: number,
-    public clientType: ClientType
-  ) {}
-}
-interface IClientRegistry {
-  addClient(type: ClientType, id: number): ClientState | undefined;
-  removeClient(id: number): number;
-  getClient(id: number): IClientState | undefined;
-  getClients(filter?: (client: IClientState) => boolean): Set<IClientState>;
-  updateClient(id: number, state: IMutableClientState): void;
-  exists(id: number): boolean;
-  throwIfExists(id: number): void;
-}
-class ClientRegistry implements IClientRegistry {
-  private clients: IPersistedMap<number, IClientState>;
+// type ClientType = "producer" | "consumer" | "dlq_consumer";
+// type ClientStatus = "active" | "idle" | "lagging";
+// interface IMutableClientState {
+//   lastActiveAt: number;
+//   // Metrics
+//   status: ClientStatus;
+//   messageCount: number;
+//   processingTime: number;
+//   avgProcessingTime: number;
+//   pendingAcks: number;
+// }
+// interface IClientState extends IMutableClientState {
+//   id: number;
+//   clientType: ClientType;
+//   registeredAt: number;
+// }
+// class ClientState implements IClientState {
+//   public registeredAt = Date.now();
+//   public lastActiveAt = Date.now();
+//   public status: ClientStatus = "active";
+//   public messageCount = 0;
+//   public processingTime = 0;
+//   public avgProcessingTime = 0;
+//   public pendingAcks = 0;
+//   constructor(
+//     public id: number,
+//     public clientType: ClientType
+//   ) {}
+// }
+// interface IClientRegistry {
+//   addClient(type: ClientType, id: number): ClientState | undefined;
+//   removeClient(id: number): number;
+//   getClient(id: number): IClientState | undefined;
+//   getClients(filter?: (client: IClientState) => boolean): Set<IClientState>;
+//   updateClient(id: number, state: IMutableClientState): void;
+//   exists(id: number): boolean;
+//   throwIfExists(id: number): void;
+// }
+// class ClientRegistry implements IClientRegistry {
+//   private clients: IPersistedMap<number, IClientState>;
 
-  constructor(mapFactory: IPersistedMapFactory) {
-    this.clients = mapFactory.create<number, IClientState>("clients");
-  }
+//   constructor(mapFactory: IPersistedMapFactory) {
+//     this.clients = mapFactory.create<number, IClientState>("clients");
+//   }
 
-  addClient(type: ClientType, id: number) {
-    const client = this.getClient(id);
-    if (client) return;
+//   addClient(type: ClientType, id: number) {
+//     const client = this.getClient(id);
+//     if (client) return;
 
-    const state = new ClientState(id, type);
-    state.lastActiveAt = Date.now();
-    this.clients.set(id, state);
-    return state;
-  }
+//     const state = new ClientState(id, type);
+//     state.lastActiveAt = Date.now();
+//     this.clients.set(id, state);
+//     return state;
+//   }
 
-  removeClient(id: number) {
-    const client = this.clients.get(id);
-    if (client) this.clients.delete(id);
-    return this.clients.size;
-  }
+//   removeClient(id: number) {
+//     const client = this.clients.get(id);
+//     if (client) this.clients.delete(id);
+//     return this.clients.size;
+//   }
 
-  getClient(id: number): IClientState | undefined {
-    return this.clients.get(id);
-  }
+//   getClient(id: number): IClientState | undefined {
+//     return this.clients.get(id);
+//   }
 
-  getClients(filter?: (client: IClientState) => boolean): Set<IClientState> {
-    const states = this.clients.values();
-    if (!filter) return new Set(states);
-    return new Set(Array.from(states).filter(filter));
-  }
+//   getClients(filter?: (client: IClientState) => boolean): Set<IClientState> {
+//     const states = this.clients.values();
+//     if (!filter) return new Set(states);
+//     return new Set(Array.from(states).filter(filter));
+//   }
 
-  updateClient(id: number, state: IMutableClientState) {
-    const client = this.clients.get(id);
-    if (!client) return;
-    this.clients.set(id, Object.assign(client, state));
-  }
+//   updateClient(id: number, state: IMutableClientState) {
+//     const client = this.clients.get(id);
+//     if (!client) return;
+//     this.clients.set(id, Object.assign(client, state));
+//   }
 
-  exists(id: number): boolean {
-    return this.clients.has(id);
-  }
+//   exists(id: number): boolean {
+//     return this.clients.has(id);
+//   }
 
-  throwIfExists(id: number): void {
-    if (!this.exists(id)) return;
-    throw new Error(`Client with ID ${id} already exists`);
-  }
-}
+//   throwIfExists(id: number): void {
+//     if (!this.exists(id)) return;
+//     throw new Error(`Client with ID ${id} already exists`);
+//   }
+// }
 interface IClientValidator {
   validate(id: number, expectedType?: ClientType): void;
 }
@@ -2020,6 +1597,7 @@ class ClientValidator implements IClientValidator {
     }
   }
 }
+
 interface IClientActivityTracker {
   recordActivity(id: number, activityRecord: Partial<IClientState>): void;
   isOperable(id: number, now: number): boolean;
@@ -2073,6 +1651,7 @@ class ClientActivityTracker implements IClientActivityTracker {
     return !!client && client.status === "idle";
   }
 }
+
 interface IClientMetricsCollector {
   getMetrics(): {
     count: number;
@@ -2129,54 +1708,55 @@ class ClientMetricsCollector implements IClientMetricsCollector {
     };
   }
 }
-interface IPublishResult {
-  id: number;
-  status: "success" | "error";
-  ts: number;
-  error?: string;
-}
-interface IProducer<Data> {
-  id: number;
-  publish(batch: Data[], metadata?: MetadataInput): Promise<IPublishResult[]>;
-}
-class Producer<Data> implements IProducer<Data> {
-  constructor(
-    private readonly publishingService: IPublishingService,
-    private readonly messageFactory: IMessageFactory<Data>,
-    private readonly topicName: string,
-    public readonly id: number
-  ) {}
 
-  async publish(batch: Data[], metadata: MetadataInput = {}) {
-    const results: IPublishResult[] = [];
+// interface IPublishResult {
+//   id: number;
+//   status: "success" | "error";
+//   ts: number;
+//   error?: string;
+// }
+// interface IProducer<Data> {
+//   id: number;
+//   publish(batch: Data[], metadata?: MetadataInput): Promise<IPublishResult[]>;
+// }
+// class Producer<Data> implements IProducer<Data> {
+//   constructor(
+//     private readonly publishingService: IPublishingService,
+//     private readonly messageFactory: IMessageFactory<Data>,
+//     private readonly topicName: string,
+//     public readonly id: number
+//   ) {}
 
-    const messages = await this.messageFactory.create(batch, {
-      ...metadata,
-      topic: this.topicName,
-      producerId: this.id,
-    });
+//   async publish(batch: Data[], metadata: MetadataInput = {}) {
+//     const results: IPublishResult[] = [];
 
-    for (const { message, meta, error } of messages) {
-      const { id, ts } = meta;
+//     const messages = await this.messageFactory.create(batch, {
+//       ...metadata,
+//       topic: this.topicName,
+//       producerId: this.id,
+//     });
 
-      if (error) {
-        const err = error instanceof Error ? error.message : "Unknown error";
-        results.push({ id, ts, error: err, status: "error" });
-        continue;
-      }
+//     for (const { message, meta, error } of messages) {
+//       const { id, ts } = meta;
 
-      try {
-        await this.publishingService.publish(this.id, message!, meta);
-        results.push({ id, ts, status: "success" });
-      } catch (err) {
-        const error = err instanceof Error ? err.message : "Unknown error";
-        results.push({ id, ts, error, status: "error" });
-      }
-    }
+//       if (error) {
+//         const err = error instanceof Error ? error.message : "Unknown error";
+//         results.push({ id, ts, error: err, status: "error" });
+//         continue;
+//       }
 
-    return results;
-  }
-}
+//       try {
+//         await this.publishingService.publish(this.id, message!, meta);
+//         results.push({ id, ts, status: "success" });
+//       } catch (err) {
+//         const error = err instanceof Error ? err.message : "Unknown error";
+//         results.push({ id, ts, error, status: "error" });
+//       }
+//     }
+
+//     return results;
+//   }
+// }
 interface IProducerFactory<Data> {
   create(id: number): IProducer<Data>;
 }
@@ -2367,8 +1947,8 @@ class ClientManagementService<Data> implements IClientManagementService<Data> {
     const { groupId, routingKeys, noAck, limit } = config;
     this.messageRouter.addConsumer(id, groupId, routingKeys);
     this.clientRegistry.addClient("consumer", id);
-    this.queueManager.addQueue(id);
 
+    this.queueManager.addQueue(id);
     this.logger?.log(`consumer_created`, { id });
 
     return new Consumer(
@@ -2408,97 +1988,6 @@ class ClientManagementService<Data> implements IClientManagementService<Data> {
 //
 //
 // SRC/TOPIC.TS
-interface ITopicConfig {
-  schema?: string; // registered schema` name
-  persistThresholdMs?: number; // flush delay, 1000 default, if need ephemeral set Infinity
-  retentionMs?: number; // 86_400_000 1 day
-  maxSizeBytes?: number;
-  maxDeliveryAttempts?: number;
-  maxMessageSize?: number;
-  maxMessageTTLMs?: number;
-  ackTimeoutMs?: number; // e.g., 30_000
-  consumerInactivityThresholdMs?: number; // 600_000;
-  consumerProcessingTimeThresholdMs?: number;
-  consumerPendingThresholdMs?: number;
-  initialBackoffMs?: number; // e.g., 1000 ms
-  maxBackoffMs?: number; // e.g., 30_000 ms
-  deduplicationWindowMs?: number;
-  encryptionkey?: crypto.CipherKey;
-  // partitions?: number;
-  // archivalThresholdMs?: number; // 100_000
-}
-interface ITopic<Data> {
-  name: string;
-  config: ITopicConfig;
-  createProducer(): IProducer<Data>;
-  createConsumer(config: IConsumerConfig): IConsumer<Data>;
-  createDLQConsumer(limit?: number): DLQConsumer<Data>;
-  deleteClient(id: number): void;
-  getMetrics(): Promise<{
-    name: string;
-    ts: number;
-    totalMessagesPublished: number;
-    totalBytes: number;
-    depth: number;
-    enqueueRate: number;
-    dequeueRate: number;
-    avgLatencyMs: number;
-    queuedMessages: {
-      size: number;
-    };
-    subscriptions: {
-      count: number;
-    };
-    pendingAcks: {
-      count: number;
-    };
-    dlq: {
-      size: number;
-    };
-    storage: {
-      wal: {
-        fileSize: number | undefined;
-        batchSize: number;
-        batchCount: number;
-        isFlushing: boolean;
-      };
-      log: {
-        totalSize: number;
-        messageCount: number;
-        currentSegmentId: number | undefined;
-        segmentCount: number;
-      };
-      db: {};
-      ram: NodeJS.MemoryUsage;
-    };
-    router: {
-      consumerGroups: {
-        name: string;
-        count: number;
-      }[];
-    };
-    delayedMessages: {
-      count: number;
-    };
-    clients: {
-      count: number;
-      producersCount: number;
-      consumersCount: number;
-      dlqConsumersCount: number;
-      operableCount: number;
-      avgProcessingTime: number;
-    };
-  }>;
-}
-class TopicSerializer implements ISerializable {
-  constructor(private topicFactory: ITopicFactory) {}
-  serialize({ name, config }: ITopic<any>) {
-    return { name, config };
-  }
-  deserialize(data: { name: string; config: ITopicConfig }) {
-    return this.topicFactory.create(data.name, data.config);
-  }
-}
 class Topic<Data> implements ITopic<Data> {
   constructor(
     private readonly _name: string,
@@ -2552,9 +2041,6 @@ class Topic<Data> implements ITopic<Data> {
   }
 
   async dispose() {}
-}
-interface ITopicFactory {
-  create<Data>(name: string, config?: Partial<ITopicConfig>): Topic<Data>;
 }
 class TopicFactory implements ITopicFactory {
   constructor(
@@ -2723,14 +2209,7 @@ class TopicFactory implements ITopicFactory {
     }
   }
 }
-type ITopicMetricType =
-  | "totalMessagesPublished"
-  | "totalBytes"
-  | "ts"
-  | "depth"
-  | "enqueueRate"
-  | "dequeueRate"
-  | "avgLatencyMs"; // Time in queue
+
 interface IMetricsCollector {
   recordEnqueue(byteSize: number, latencyMs: number): void;
   recordDequeue(latencyMs: number): void;
@@ -2785,60 +2264,20 @@ class TopicMetricsCollector implements IMetricsCollector {
 //
 //
 //
-// ROOT
-// logger
-
 // schema_registry
-interface ISchemaDefRecord<T> {
-  schemaDef: JSONSchemaType<T>;
-  author?: string;
-  ts: number;
-}
-interface ISchemaDefStore {
-  get<T>(schemaId: string): JSONSchemaType<T> | undefined;
-  set<T>(schemaId: string, schemaDef: JSONSchemaType<T>, author?: string): void;
-  delete(schemaId: string): void;
-  list(): string[];
-}
-class SchemaDefStore implements ISchemaDefStore {
-  private schemaDefs: PersistedMap<string, ISchemaDefRecord<any>>;
 
-  constructor(mapFactory: IPersistedMapFactory) {
-    this.schemaDefs = mapFactory.create("schemaDefs");
-  }
 
-  get<T>(schemaId: string): JSONSchemaType<T> | undefined {
-    return this.schemaDefs.get(schemaId) as JSONSchemaType<T>;
-  }
 
-  set<T>(
-    schemaId: string,
-    schemaDef: JSONSchemaType<T>,
-    author?: string
-  ): void {
-    const record: ISchemaDefRecord<T> = { schemaDef, author, ts: Date.now() };
-    this.schemaDefs.set(schemaId, record);
-  }
 
-  delete(schemaId: string): void {
-    this.schemaDefs.delete(schemaId);
-  }
 
-  list(): string[] {
-    return Array.from(this.schemaDefs.keys());
-  }
-}
-interface ISchemaValidator {
-  (data: any): boolean;
-}
-interface IValidatorCache {
-  getValidator(
-    schemaId: string,
-    schemaDef: JSONSchemaType<any>
-  ): ISchemaValidator;
-  removeValidator(schemaId: string): void;
-  clear(): void;
-}
+// interface IValidatorCache {
+//   getValidator(
+//     schemaId: string,
+//     schemaDef: JSONSchemaType<any>
+//   ): ISchemaValidator;
+//   removeValidator(schemaId: string): void;
+//   clear(): void;
+// }
 class ValidatorCache implements IValidatorCache {
   private validatorCache = new Map<string, ISchemaValidator>();
   private ajv: Ajv;
@@ -2873,204 +2312,60 @@ class ValidatorCache implements IValidatorCache {
     this.validatorCache.clear();
   }
 }
-interface ISchemaDefVersionManager {
-  register<T>(
-    name: string,
-    schemaDef: JSONSchemaType<T>,
-    author?: string
-  ): string;
-  findLatestSchemaDefKey(name: string): string | undefined;
-}
-class SchemaDefVersionManager implements ISchemaDefVersionManager {
-  constructor(
-    private store: ISchemaDefStore,
-    private compatibilityMode: "none" | "forward" | "backward" | "full"
-  ) {}
 
-  register<T>(
-    name: string,
-    schemaDef: JSONSchemaType<T>,
-    author?: string
-  ): string {
-    const latestKey = this.findLatestSchemaDefKey(name);
+// interface ISchemaDefVersionManager {
+//   register<T>(
+//     name: string,
+//     schemaDef: JSONSchemaType<T>,
+//     author?: string
+//   ): string;
+//   findLatestSchemaDefKey(name: string): string | undefined;
+// }
+// class SchemaDefVersionManager implements ISchemaDefVersionManager {
+//   constructor(
+//     private store: ISchemaDefStore,
+//     private compatibilityMode: "none" | "forward" | "backward" | "full"
+//   ) {}
 
-    if (latestKey && this.compatibilityMode !== "none") {
-      const latestSchemaDef = this.store.get(latestKey)!;
+//   register<T>(
+//     name: string,
+//     schemaDef: JSONSchemaType<T>,
+//     author?: string
+//   ): string {
+//     const latestKey = this.findLatestSchemaDefKey(name);
 
-      if (!validateSchema(latestSchemaDef, schemaDef, this.compatibilityMode)) {
-        throw new Error(
-          `Schema definition ${name} is not compatible in ${this.compatibilityMode} mode`
-        );
-      }
-    }
+//     if (latestKey && this.compatibilityMode !== "none") {
+//       const latestSchemaDef = this.store.get(latestKey)!;
 
-    const version = latestKey ? parseInt(latestKey.split(":")[1]) + 1 : 1;
-    const schemaId = `${name}:${version}`;
-    this.store.set(schemaId, schemaDef, author);
-    return schemaId;
-  }
+//       if (!validateSchema(latestSchemaDef, schemaDef, this.compatibilityMode)) {
+//         throw new Error(
+//           `Schema definition ${name} is not compatible in ${this.compatibilityMode} mode`
+//         );
+//       }
+//     }
 
-  findLatestSchemaDefKey(name: string): string | undefined {
-    const candidates = this.store
-      .list()
-      .reduce<{ key: string; version: number }[]>((acc, key) => {
-        if (!key.startsWith(name + ":")) return acc;
-        return acc.concat({ key, version: parseInt(key.split(":")[1]) });
-      }, [])
-      .sort((a, b) => b.version - a.version);
+//     const version = latestKey ? parseInt(latestKey.split(":")[1]) + 1 : 1;
+//     const schemaId = `${name}:${version}`;
+//     this.store.set(schemaId, schemaDef, author);
+//     return schemaId;
+//   }
 
-    return candidates[0]?.key;
-  }
-}
-interface ISchemaRegistry {
-  register(name: string, schema: JSONSchemaType<any>): Promise<string | void>;
-  remove(schemaId: string): Promise<void>;
-  getValidator(schemaId: string): ISchemaValidator | undefined;
-  getSchema<Data>(schemaId: string): JSONSchemaType<Data> | undefined;
-  listSchemas(): string[];
-}
-class SchemaRegistry implements ISchemaRegistry {
-  private store: ISchemaDefStore;
-  private validatorCache: IValidatorCache;
-  private versionManager: ISchemaDefVersionManager;
-  private logger: ILogCollector;
+//   findLatestSchemaDefKey(name: string): string | undefined {
+//     const candidates = this.store
+//       .list()
+//       .reduce<{ key: string; version: number }[]>((acc, key) => {
+//         if (!key.startsWith(name + ":")) return acc;
+//         return acc.concat({ key, version: parseInt(key.split(":")[1]) });
+//       }, [])
+//       .sort((a, b) => b.version - a.version);
 
-  constructor(
-    private codec: ICodec,
-    logService: ILogService,
-    mapFactory: IPersistedMapFactory,
-    options?: AjvOptions,
-    compatibilityMode: "none" | "forward" | "backward" | "full" = "backward"
-  ) {
-    this.logger = logService.globalCollector;
-    this.store = new SchemaDefStore(mapFactory);
-    this.validatorCache = new ValidatorCache(options);
-    this.versionManager = new SchemaDefVersionManager(
-      this.store,
-      compatibilityMode
-    );
-  }
+//     return candidates[0]?.key;
+//   }
+// }
 
-  async register<T>(
-    name: string,
-    schemaDef: JSONSchemaType<T>,
-    author?: string
-  ): Promise<string | void> {
-    try {
-      const schemaId = this.versionManager.register<T>(name, schemaDef, author);
-      const schema = SchemaCompiler.fromJsonSchema(schemaDef);
-      await this.codec.registerSchema(schemaId, schema);
-      return schemaId;
-    } catch (error) {
-      this.store.delete(name);
-      this.logger.log("Failed schema creation", { error }, "warn");
-    }
-  }
 
-  async remove(schemaId: string): Promise<void> {
-    const [name, versionStr] = schemaId.split(":");
-    const version = versionStr ? parseInt(versionStr) : undefined;
 
-    if (version) {
-      const fullName = `${name}:${version}`;
-      this.store.delete(fullName);
-      this.validatorCache.removeValidator(fullName);
-      await this.codec.removeSchema(fullName);
-    } else {
-      // Remove all versions
-      for (const key of this.store.list()) {
-        if (key.startsWith(`${name}:`)) {
-          this.store.delete(key);
-          this.validatorCache.removeValidator(key);
-          await this.codec.removeSchema(key);
-        }
-      }
-    }
-  }
 
-  listSchemas(): string[] {
-    return Array.from(
-      new Set(this.store.list().map((key) => key.split(":")[0]))
-    ).map((name) => `${name}:latest`);
-  }
-
-  getValidator(schemaId: string): ISchemaValidator | undefined {
-    const [name, versionStr] = schemaId.split(":");
-    const version = parseInt(versionStr || "1");
-
-    const storedSchema = this.store.get<unknown>(`${name}:${version}`);
-    if (!storedSchema) return undefined;
-
-    return this.validatorCache.getValidator(schemaId, storedSchema);
-  }
-
-  getSchema<Data>(schemaId: string): JSONSchemaType<Data> | undefined {
-    const [name, versionStr] = schemaId.split(":");
-    const version = versionStr ? parseInt(versionStr) : undefined;
-
-    if (version) {
-      return this.store.get(`${name}:${version}`);
-    } else {
-      const latestKey = this.versionManager.findLatestSchemaDefKey(name);
-      return latestKey ? this.store.get(latestKey) : undefined;
-    }
-  }
-}
-// topic_registry
-interface ITopicRegistry {
-  create<Data>(name: string, config: ITopicConfig): ITopic<Data>;
-  get(name: string): ITopic<any> | undefined;
-  delete(name: string): void;
-  list(): MapIterator<string>;
-}
-class TopicRegistry implements ITopicRegistry {
-  private topics: PersistedMap<string, ITopic<any>>;
-
-  constructor(
-    mapFactory: IPersistedMapFactory,
-    private topicFactory: ITopicFactory,
-    private logService?: ILogService
-  ) {
-    this.topics = mapFactory.create(
-      "topics",
-      new TopicSerializer(topicFactory)
-    );
-  }
-
-  create<Data>(name: string, config: ITopicConfig): ITopic<Data> {
-    if (this.topics.has(name)) {
-      throw new Error("Topic already exists");
-    }
-
-    const topic = this.topicFactory.create<Data>(name, config);
-    this.topics.set(name, topic);
-
-    this.logService?.log("Topic created", {
-      ...config,
-      name,
-    });
-
-    return topic;
-  }
-
-  list() {
-    return this.topics.keys();
-  }
-
-  get(name: string): ITopic<any> | undefined {
-    if (!this.topics.has(name)) {
-      throw new Error("Topic not found");
-    }
-    return this.topics.get(name);
-  }
-
-  delete(name: string): void {
-    this.get(name);
-    this.topics.delete(name);
-
-    this.logService?.log("Topic deleted", { name });
-  }
-}
 
 // In Layered Arch Data Layer is rigid - knows concrete db impl
 // Clean Arch uses the idea of Dependency Inversion to solve this.

@@ -1,9 +1,9 @@
-import type { IAppender } from "../../domain/interfaces/IAppender";
+import type { IClientLister } from "@domain/interfaces/client/IClientLister";
 
 export class ListClients {
-  constructor(private appender: IAppender) {}
+  constructor(private lister: IClientLister) {}
 
-  async execute(data: Buffer) {
-    return this.appender.append(data);
+  async execute() {
+    return this.lister.list();
   }
 }

@@ -1,9 +1,14 @@
-import type { IAppender } from "../../domain/interfaces/IAppender";
+import type { ILogService } from "@app/interfaces/ILogService";
+import type { IClientDeleter } from "@domain/interfaces/client/IClientDeleter";
 
 export class DeleteClient {
-  constructor(private appender: IAppender) {}
+  constructor(
+    private deleter: IClientDeleter,
+    private logService?: ILogService
+  ) {}
 
-  async execute(data: Buffer) {
-    return this.appender.append(data);
+  async execute(id: number) {
+    this.deleter.delete(id);
+    this.logService?.log("Client is deleted", { id });
   }
 }

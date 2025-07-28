@@ -10,7 +10,6 @@ export class GetValue<K, V> {
   ) {}
 
   async execute(key: K) {
-    // cache is faster than keytracker so check it first
     let value = this.cache.get(key);
     if (value != undefined) return value;
 

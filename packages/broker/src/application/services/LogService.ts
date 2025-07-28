@@ -1,6 +1,6 @@
+import type { ILogger } from "@app/interfaces/ILogger";
 import type { ILogService } from "@app/interfaces/ILogService";
-import type { ILogger } from "@domain/interfaces/ILogger";
-import type { ILoggerFactory } from "@domain/interfaces/ILoggerFactory";
+import type { ILoggerFactory } from "@app/interfaces/ILoggerFactory";
 
 export class LogService implements ILogService {
   private loggers = new Map<string, ILogger>();

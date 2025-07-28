@@ -1,4 +1,4 @@
-import type { ILogger } from "@domain/interfaces/ILogger";
+import type { ILogger } from "./ILogger";
 
 export interface ILogService {
   log: ILogger["log"];

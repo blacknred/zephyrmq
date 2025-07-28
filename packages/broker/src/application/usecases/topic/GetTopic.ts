@@ -1,10 +1,10 @@
-import type { IAppender } from "../../domain/interfaces/IAppender";
+import type { ITopicGetter } from "@domain/interfaces/topic/ITopicGetter";
 
 // name, config
 export class GetTopic {
-  constructor(private appender: IAppender) {}
+  constructor(private getter: ITopicGetter) {}
 
-  async execute(data: Buffer) {
-    return this.appender.append(data);
+  async execute(name: string) {
+    return this.getter.get(name);
   }
 }

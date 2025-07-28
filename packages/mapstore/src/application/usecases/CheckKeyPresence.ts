@@ -7,7 +7,7 @@ export class CheckKeyPresence<K, V> {
     private readonly keyTracker: IKeyTracker<K>
   ) {}
 
-  async execute(key: K) {
+  execute(key: K) {
     // cache is faster than keytracker so check it first
     if (this.cache.has(key)) return true;
     return this.keyTracker.has(key);
