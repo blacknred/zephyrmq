@@ -176,6 +176,7 @@ class AttemptsProcessor<Data> implements IMessageProcessor {
   ) {}
   process(meta: MessageMetadata): boolean {
     const attempts = this.deliveryTracker.decrementDeliveryAttempts(meta.id);
+    // const attemptsLeft = deliveryTracker.recordAttempt(messageId);
     const shouldDeadLetter = attempts === 0;
     if (shouldDeadLetter) {
       this.dlq.enqueue(meta, "max_attempts");
@@ -492,6 +493,7 @@ class MessageRouter<Data> implements IMessageRouter {
     };
   }
 
+
   addConsumer(
     id: number,
     groupId = ConsumerGroup.defaultName,
@@ -512,6 +514,7 @@ class MessageRouter<Data> implements IMessageRouter {
     this.consumerGroups.get(groupId)!.addMember(id, routingKeys);
   }
 
+
   removeConsumer(id: number) {
     for (const [name, group] of this.consumerGroups.entries()) {
       group.removeMember(id);
@@ -521,6 +524,8 @@ class MessageRouter<Data> implements IMessageRouter {
       }
     }
   }
+
+
 
   async route(meta: MessageMetadata, skipDLQ = false): Promise<number> {
     const results = await Promise.all(
@@ -812,16 +817,16 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
 //
 //
 // SRC/ACK_SERVICE.TS
-interface IDeliveryTracker {
-  setAwaitedDeliveries(messageid: number, deliveries: number): void;
-  decrementAwaitedDeliveries(messageId: number): Promise<void>;
-  decrementDeliveryAttempts(messageId: number): number;
-  getDeliveryRetryBackoff(messageId: number): number;
-}
-interface IDeliveryEntry {
-  awaited: number;
-  attempts: number;
-}
+// interface IDeliveryTracker {
+//   setAwaitedDeliveries(messageid: number, deliveries: number): void;
+//   decrementAwaitedDeliveries(messageId: number): Promise<void>;
+//   decrementDeliveryAttempts(messageId: number): number;
+//   getDeliveryRetryBackoff(messageId: number): number;
+// }
+// interface IDeliveryEntry {
+//   awaited: number;
+//   attempts: number;
+// }
 class DeliveryTracker<Data> implements IDeliveryTracker {
   private deliveries: IPersistedMap<number, IDeliveryEntry>;
 
@@ -1757,9 +1762,9 @@ class ClientMetricsCollector implements IClientMetricsCollector {
 //     return results;
 //   }
 // }
-interface IProducerFactory<Data> {
-  create(id: number): IProducer<Data>;
-}
+// interface IProducerFactory<Data> {
+//   create(id: number): IProducer<Data>;
+// }
 class ProducerFactory<Data> implements IProducerFactory<Data> {
   private messageFactory: IMessageFactory<Data>;
   constructor(
@@ -1804,72 +1809,72 @@ class ProducerFactory<Data> implements IProducerFactory<Data> {
     );
   }
 }
-interface IConsumerConfig {
-  routingKeys?: string[];
-  groupId?: string;
-  limit?: number;
-  noAck?: boolean;
-}
-interface IConsumer<Data> {
-  id: number;
-  consume(): Promise<Data[]>;
-  ack(messageId?: number): Promise<number[]>;
-  nack(messageId?: number, requeue?: boolean): Promise<number>;
-  subscribe(listener: ISubscriptionListener<Data>): void;
-  unsubscribe(): void;
-}
-class Consumer<Data> implements IConsumer<Data> {
-  private readonly limit: number;
-  constructor(
-    private readonly consumptionService: IConsumptionService<Data>,
-    private readonly ackService: IAckService,
-    private readonly subscriptionService: ISubscriptionService<Data>,
-    public readonly id: number,
-    private readonly noAck = false,
-    limit?: number
-  ) {
-    this.limit = Math.max(1, limit!);
-  }
+// interface IConsumerConfig {
+//   routingKeys?: string[];
+//   groupId?: string;
+//   limit?: number;
+//   noAck?: boolean;
+// }
+// interface IConsumer<Data> {
+//   id: number;
+//   consume(): Promise<Data[]>;
+//   ack(messageId?: number): Promise<number[]>;
+//   nack(messageId?: number, requeue?: boolean): Promise<number>;
+//   subscribe(listener: ISubscriptionListener<Data>): void;
+//   unsubscribe(): void;
+// }
+// class Consumer<Data> implements IConsumer<Data> {
+//   private readonly limit: number;
+//   constructor(
+//     private readonly consumptionService: IConsumptionService<Data>,
+//     private readonly ackService: IAckService,
+//     private readonly subscriptionService: ISubscriptionService<Data>,
+//     public readonly id: number,
+//     private readonly noAck = false,
+//     limit?: number
+//   ) {
+//     this.limit = Math.max(1, limit!);
+//   }
 
-  async consume() {
-    const messages: Data[] = [];
+//   async consume() {
+//     const messages: Data[] = [];
 
-    for (let i = 0; i < this.limit; i++) {
-      const message = await this.consumptionService.consume(
-        this.id,
-        this.noAck
-      );
-      if (!message) break;
-      messages.push(message);
-    }
+//     for (let i = 0; i < this.limit; i++) {
+//       const message = await this.consumptionService.consume(
+//         this.id,
+//         this.noAck
+//       );
+//       if (!message) break;
+//       messages.push(message);
+//     }
 
-    return messages;
-  }
+//     return messages;
+//   }
 
-  async ack(messageId?: number) {
-    return this.ackService.ack(this.id, messageId);
-  }
+//   async ack(messageId?: number) {
+//     return this.ackService.ack(this.id, messageId);
+//   }
 
-  async nack(messageId?: number, requeue = true): Promise<number> {
-    return this.ackService.nack(this.id, messageId, requeue);
-  }
+//   async nack(messageId?: number, requeue = true): Promise<number> {
+//     return this.ackService.nack(this.id, messageId, requeue);
+//   }
 
-  subscribe(listener: ISubscriptionListener<Data>): void {
-    this.subscriptionService.subscribe(this.id, listener, this.noAck);
-  }
+//   subscribe(listener: ISubscriptionListener<Data>): void {
+//     this.subscriptionService.subscribe(this.id, listener, this.noAck);
+//   }
 
-  unsubscribe(): void {
-    this.subscriptionService.unsubscribe(this.id);
-  }
-}
-interface IDLQConsumer<Data> {
-  id: number;
-  consume(): Promise<IDLQEntry<Data>[]>;
-  replayDlq(
-    handler: (message: Data, meta: MessageMetadata) => Promise<void>,
-    filter?: (meta: MessageMetadata) => boolean
-  ): Promise<number>;
-}
+//   unsubscribe(): void {
+//     this.subscriptionService.unsubscribe(this.id);
+//   }
+// }
+// interface IDLQConsumer<Data> {
+//   id: number;
+//   consume(): Promise<IDLQEntry<Data>[]>;
+//   replayDlq(
+//     handler: (message: Data, meta: MessageMetadata) => Promise<void>,
+//     filter?: (meta: MessageMetadata) => boolean
+//   ): Promise<number>;
+// }
 class DLQConsumer<Data> implements IDLQConsumer<Data> {
   private readonly limit: number;
   private reader: AsyncGenerator<IDLQEntry<Data>, void, unknown>;

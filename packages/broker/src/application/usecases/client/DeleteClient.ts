@@ -3,12 +3,15 @@ import type { IClientDeleter } from "@domain/interfaces/client/IClientDeleter";
 
 export class DeleteClient {
   constructor(
-    private deleter: IClientDeleter,
+    private clientDeleter: IClientDeleter,
     private logService?: ILogService
   ) {}
 
   async execute(id: number) {
-    this.deleter.delete(id);
+    this.clientDeleter.delete(id);
+    this.messageRouter.removeConsumer(id);
+    this.queueManager.removeQueue(id);
+
     this.logService?.log("Client is deleted", { id });
   }
 }

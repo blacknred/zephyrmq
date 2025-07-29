@@ -1,11 +1,14 @@
 import type { IMetadataInput } from "@app/interfaces/IMetadataInput";
 import type { IProducer, IPublishResult } from "@app/interfaces/IProducer";
+import type { PublishMessage } from "@app/usecases/message/PublishMessage";
+import type { RouteMessage } from "@app/usecases/message/RouteMessage";
 
 export class Producer<Data> implements IProducer<Data> {
   constructor(
-    private readonly publishingService: IPublishingService,
-    private readonly messageFactory: IMessageFactory<Data>,
-    private readonly topicName: string,
+    private publishMessage: PublishMessage,
+    private routeMessage: RouteMessage,
+    // private readonly messageFactory: IMessageFactory<Data>,
+    // private readonly topicName: string,
     public readonly id: number
   ) {}
 
@@ -28,7 +31,9 @@ export class Producer<Data> implements IProducer<Data> {
       }
 
       try {
-        await this.publishingService.publish(this.id, message!, meta);
+        await this.publishMessage.execute(this.id, message!, meta);
+        await this.routeMessage.execute(meta);
+
         results.push({ id, ts, status: "success" });
       } catch (err) {
         const error = err instanceof Error ? err.message : "Unknown error";
