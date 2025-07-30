@@ -1,46 +1,45 @@
-import type { IConsumer, ISubscriptionListener } from "@app/interfaces/IConsumer";
+import type {
+  IConsumer,
+  ISubscriptionListener,
+} from "@app/interfaces/IConsumer";
+import type { AckMessages } from "@app/usecases/message/AckMessages";
+import type { ConsumeMessages } from "@app/usecases/message/ConsumeMessages";
+import type { NackMessages } from "@app/usecases/message/NackMessages";
+import type { SubscribeToMessages } from "@app/usecases/message/SubscribeToMessages";
+import type { UnsubscribeToMessages } from "@app/usecases/message/UnsubscribeToMessages";
 
 export class Consumer<Data> implements IConsumer<Data> {
-  private readonly limit: number;
+  static MAX_LIMIT = 1000;
   constructor(
-    private readonly consumptionService: IConsumptionService<Data>,
-    private readonly ackService: IAckService,
-    private readonly subscriptionService: ISubscriptionService<Data>,
+    private consumeMessages: ConsumeMessages,
+    private ackMessages: AckMessages,
+    private nackMessages: NackMessages,
+    private subscribeToMessages: SubscribeToMessages,
+    private unsubscribeToMessages: UnsubscribeToMessages,
     public readonly id: number,
     private readonly noAck = false,
-    limit?: number
+    private readonly limit = 1
   ) {
-    this.limit = Math.max(1, limit!);
+    this.limit = Math.min(Consumer.MAX_LIMIT, limit);
   }
 
   async consume() {
-    const messages: Data[] = [];
-
-    for (let i = 0; i < this.limit; i++) {
-      const message = await this.consumptionService.consume(
-        this.id,
-        this.noAck
-      );
-      if (!message) break;
-      messages.push(message);
-    }
-
-    return messages;
+    return this.consumeMessages.execute<Data>(this.id, this.limit, this.noAck);
   }
 
   async ack(messageId?: number) {
-    return this.ackService.ack(this.id, messageId);
+    return this.ackMessages.execute(this.id, messageId);
   }
 
   async nack(messageId?: number, requeue = true): Promise<number> {
-    return this.ackService.nack(this.id, messageId, requeue);
+    return this.nackMessages.execute(this.id, messageId, requeue);
   }
 
-  subscribe(listener: ISubscriptionListener<Data>): void {
-    this.subscriptionService.subscribe(this.id, listener, this.noAck);
+  async subscribe(listener: ISubscriptionListener<Data>) {
+    await this.subscribeToMessages.execute<Data>(this.id, listener, this.noAck);
   }
 
-  unsubscribe(): void {
-    this.subscriptionService.unsubscribe(this.id);
+  async unsubscribe() {
+    await this.unsubscribeToMessages.execute(this.id);
   }
 }

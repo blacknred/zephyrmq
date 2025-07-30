@@ -706,15 +706,15 @@ interface IPriorityQueue<Data = any> {
   isEmpty(): boolean;
   size(): number;
 }
-interface IQueueManager {
-  addQueue(id: number): void;
-  removeQueue(id: number): void;
-  enqueue(id: number, meta: MessageMetadata): number | undefined;
-  dequeue(id: number): number | undefined;
-  getMetrics(): {
-    size: number;
-  };
-}
+// interface IQueueManager {
+//   addQueue(id: number): void;
+//   removeQueue(id: number): void;
+//   enqueue(id: number, meta: MessageMetadata): number | undefined;
+//   dequeue(id: number): number | undefined;
+//   getMetrics(): {
+//     size: number;
+//   };
+// }
 class QueueManager implements IQueueManager {
   private queues: IPersistedMap<number, IPersistedQueue<number>>;
   private totalQueuedMessages = 0;
@@ -761,58 +761,58 @@ class QueueManager implements IQueueManager {
     };
   }
 }
-interface IConsumptionService<Data> {
-  consume(consumerId: number, noAck?: boolean): Promise<Data | undefined>;
-  getMetrics(): {
-    queuedMessages: {
-      size: number;
-    };
-  };
-}
-class ConsumptionService<Data> implements IConsumptionService<Data> {
-  constructor(
-    private readonly queueManager: IQueueManager,
-    private readonly messageStore: IMessageStore<Data>,
-    private readonly pendingAcks: IAckRegistry,
-    private readonly deliveryTracker: IDeliveryTracker,
-    private readonly processedMessageTracker: IProcessedMessageTracker,
-    private readonly activityTracker: IClientActivityTracker,
-    private readonly logger?: ILogCollector
-  ) {}
+// interface IConsumptionService<Data> {
+//   consume(consumerId: number, noAck?: boolean): Promise<Data | undefined>;
+//   getMetrics(): {
+//     queuedMessages: {
+//       size: number;
+//     };
+//   };
+// }
+// class ConsumptionService<Data> implements IConsumptionService<Data> {
+//   constructor(
+//     private readonly queueManager: IQueueManager,
+//     private readonly messageStore: IMessageStore<Data>,
+//     private readonly pendingAcks: IAckRegistry,
+//     private readonly deliveryTracker: IDeliveryTracker,
+//     private readonly processedMessageTracker: IProcessedMessageTracker,
+//     private readonly activityTracker: IClientActivityTracker,
+//     private readonly logger?: ILogCollector
+//   ) {}
 
-  async consume(consumerId: number, noAck = false): Promise<Data | undefined> {
-    if (this.pendingAcks.isReachedMaxUnacked(consumerId)) return;
+//   async consume(consumerId: number, noAck = false): Promise<Data | undefined> {
+//     if (this.pendingAcks.isReachedMaxUnacked(consumerId)) return;
 
-    const messageId = this.queueManager.dequeue(consumerId);
-    if (!messageId) return;
+//     const messageId = this.queueManager.dequeue(consumerId);
+//     if (!messageId) return;
 
-    const [message, meta] = await this.messageStore.read(messageId);
-    if (!meta || !message) return;
+//     const [message, meta] = await this.messageStore.read(messageId);
+//     if (!meta || !message) return;
 
-    if (!noAck) {
-      this.pendingAcks.addAck(consumerId, messageId);
-    } else {
-      this.activityTracker.recordActivity(consumerId, {
-        messageCount: 1,
-        pendingAcks: 0,
-        processingTime: 0,
-        status: "idle",
-      });
+//     if (!noAck) {
+//       this.pendingAcks.addAck(consumerId, messageId);
+//     } else {
+//       this.activityTracker.recordActivity(consumerId, {
+//         messageCount: 1,
+//         pendingAcks: 0,
+//         processingTime: 0,
+//         status: "idle",
+//       });
 
-      this.processedMessageTracker.add(consumerId, messageId);
-      await this.deliveryTracker.decrementAwaitedDeliveries(messageId);
-    }
+//       this.processedMessageTracker.add(consumerId, messageId);
+//       await this.deliveryTracker.decrementAwaitedDeliveries(messageId);
+//     }
 
-    this.logger?.log(`Message is consumed from ${meta.topic}.`, meta);
-    return message;
-  }
+//     this.logger?.log(`Message is consumed from ${meta.topic}.`, meta);
+//     return message;
+//   }
 
-  getMetrics() {
-    return {
-      queuedMessages: this.queueManager.getMetrics(),
-    };
-  }
-}
+//   getMetrics() {
+//     return {
+//       queuedMessages: this.queueManager.getMetrics(),
+//     };
+//   }
+// }
 //
 //
 //
@@ -827,73 +827,73 @@ class ConsumptionService<Data> implements IConsumptionService<Data> {
 //   awaited: number;
 //   attempts: number;
 // }
-class DeliveryTracker<Data> implements IDeliveryTracker {
-  private deliveries: IPersistedMap<number, IDeliveryEntry>;
+// class DeliveryTracker<Data> implements IDeliveryTracker {
+//   private deliveries: IPersistedMap<number, IDeliveryEntry>;
 
-  constructor(
-    mapFactory: IPersistedMapFactory,
-    private messageStore: IMessageStore<Data>,
-    private metrics: IMetricsCollector,
-    private readonly maxAttempts = 1,
-    private readonly initialBackoffMs = 1000,
-    private readonly maxBackoffMs = 30_000
-  ) {
-    this.deliveries = mapFactory.create<number, IDeliveryEntry>("deliveries");
-  }
+//   constructor(
+//     mapFactory: IPersistedMapFactory,
+//     private messageStore: IMessageStore<Data>,
+//     private metrics: IMetricsCollector,
+//     private readonly maxAttempts = 1,
+//     private readonly initialBackoffMs = 1000,
+//     private readonly maxBackoffMs = 30_000
+//   ) {
+//     this.deliveries = mapFactory.create<number, IDeliveryEntry>("deliveries");
+//   }
 
-  private getOrCreateEntry(messageid: number) {
-    const entry = this.deliveries.get(messageid);
-    return entry ?? { awaited: 0, attempts: Math.max(1, this.maxAttempts) };
-  }
+//   private getOrCreateEntry(messageid: number) {
+//     const entry = this.deliveries.get(messageid);
+//     return entry ?? { awaited: 0, attempts: Math.max(1, this.maxAttempts) };
+//   }
 
-  setAwaitedDeliveries(messageid: number, deliveries: number) {
-    const entry = this.getOrCreateEntry(messageid);
-    entry.awaited = deliveries;
-    entry.attempts = this.maxAttempts;
-    this.deliveries.set(messageid, entry);
-  }
+//   setAwaitedDeliveries(messageid: number, deliveries: number) {
+//     const entry = this.getOrCreateEntry(messageid);
+//     entry.awaited = deliveries;
+//     entry.attempts = this.maxAttempts;
+//     this.deliveries.set(messageid, entry);
+//   }
 
-  async decrementAwaitedDeliveries(messageId: number) {
-    let entry = this.deliveries.get(messageId);
-    if (!entry) return;
-    if (--entry.awaited > 0) {
-      this.deliveries.set(messageId, entry);
-      return;
-    }
+//   async decrementAwaitedDeliveries(messageId: number) {
+//     let entry = this.deliveries.get(messageId);
+//     if (!entry) return;
+//     if (--entry.awaited > 0) {
+//       this.deliveries.set(messageId, entry);
+//       return;
+//     }
 
-    this.deliveries.delete(messageId);
-    // if there is no deliveries needed mark message as consumed
-    await this.messageStore.markDeletable(messageId);
+//     this.deliveries.delete(messageId);
+//     // if there is no deliveries needed mark message as consumed
+//     await this.messageStore.markDeletable(messageId);
 
-    const meta = await this.messageStore.readMetadata(messageId, ["ts"]);
-    if (meta) this.metrics.recordDequeue(Date.now() - meta.ts);
-  }
+//     const meta = await this.messageStore.readMetadata(messageId, ["ts"]);
+//     if (meta) this.metrics.recordDequeue(Date.now() - meta.ts);
+//   }
 
-  decrementDeliveryAttempts(messageId: number): number {
-    const entry = this.getOrCreateEntry(messageId);
-    if (--entry.attempts == 0) {
-      this.deliveries.delete(messageId);
-    } else {
-      this.deliveries.set(messageId, entry);
-    }
+//   decrementDeliveryAttempts(messageId: number): number {
+//     const entry = this.getOrCreateEntry(messageId);
+//     if (--entry.attempts == 0) {
+//       this.deliveries.delete(messageId);
+//     } else {
+//       this.deliveries.set(messageId, entry);
+//     }
 
-    return entry.attempts;
-  }
+//     return entry.attempts;
+//   }
 
-  getDeliveryRetryBackoff(messageId: number) {
-    const attempts = this.deliveries.get(messageId)?.attempts;
-    if (!attempts) return 0;
-    return Math.min(
-      this.maxBackoffMs ?? 30_000,
-      this.initialBackoffMs * Math.pow(2, attempts - 1)
-    );
-  }
-}
-interface IProcessedMessageRegistry {
-  has(consumerId: number, messageId: number): boolean;
-  add(consumerId: number, messageId: number): void;
-  remove(consumerId: number, messageId: number): void;
-}
+//   getDeliveryRetryBackoff(messageId: number) {
+//     const attempts = this.deliveries.get(messageId)?.attempts;
+//     if (!attempts) return 0;
+//     return Math.min(
+//       this.maxBackoffMs ?? 30_000,
+//       this.initialBackoffMs * Math.pow(2, attempts - 1)
+//     );
+//   }
+// }
+// interface IProcessedMessageRegistry {
+//   has(consumerId: number, messageId: number): boolean;
+//   add(consumerId: number, messageId: number): void;
+//   remove(consumerId: number, messageId: number): void;
+// }
 class ProcessedMessageRegistry implements IProcessedMessageRegistry {
   private processed: IPersistedMap<number, Map<number, number>>; // consumerId:{messageId:ts}
 
@@ -932,16 +932,16 @@ class ProcessedMessageRegistry implements IProcessedMessageRegistry {
     this.processed.get(consumerId)?.delete(messageId);
   }
 }
-interface IAckRegistry {
-  addAck(consumerId: number, messageId: number): void;
-  getAcks(consumerId: number): Map<number, number> | undefined;
-  getAllAcks(): IPersistedMap<number, Map<number, number>>;
-  removeAck(consumerId: number, messageId?: number): void;
-  isReachedMaxUnacked(consumerId: number): boolean;
-  getMetrics(): {
-    count: number;
-  };
-}
+// interface IAckRegistry {
+//   addAck(consumerId: number, messageId: number): void;
+//   getAcks(consumerId: number): Map<number, number> | undefined;
+//   getAllAcks(): IPersistedMap<number, Map<number, number>>;
+//   removeAck(consumerId: number, messageId?: number): void;
+//   isReachedMaxUnacked(consumerId: number): boolean;
+//   getMetrics(): {
+//     count: number;
+//   };
+// }
 class AckRegistry implements IAckRegistry {
   private acks: IPersistedMap<number, Record<number, number>>; // consumerId:{messageId:ts}
 
@@ -1062,19 +1062,19 @@ class AckMonitor implements IAckMonitor {
     }
   };
 }
-interface IAckService {
-  ack(consumerId: number, messageId?: number): Promise<number[]>;
-  nack: (
-    consumerId: number,
-    messageId?: number,
-    requeue?: boolean
-  ) => Promise<number>;
-  getMetrics(): {
-    pendingAcks: {
-      count: number;
-    };
-  };
-}
+// interface IAckService {
+//   ack(consumerId: number, messageId?: number): Promise<number[]>;
+//   nack: (
+//     consumerId: number,
+//     messageId?: number,
+//     requeue?: boolean
+//   ) => Promise<number>;
+//   getMetrics(): {
+//     pendingAcks: {
+//       count: number;
+//     };
+//   };
+// }
 class AckService<Data> implements IAckService {
   constructor(
     private readonly pendingAcks: IAckRegistry,
@@ -1161,20 +1161,20 @@ class AckService<Data> implements IAckService {
 //
 //
 // SRC/SUBSCRIPTION_SERVICE.TS
-type ISubscriptionListener<Data> = (message: Data) => Promise<void>;
-interface ISubscriptionRegistry<Data> {
-  addListener(
-    consumerId: number,
-    listener: ISubscriptionListener<Data>,
-    noAck?: boolean
-  ): void;
-  removeListener(consumerId: number): void;
-  hasListener(consumerId: number): boolean;
-  getListener(consumerId: number): ISubscriptionListener<Data> | undefined;
-  getAllListeners(): IterableIterator<[number, ISubscriptionListener<Data>]>;
-  hasFanout(consumerId: number): boolean;
-  size: number;
-}
+// type ISubscriptionListener<Data> = (message: Data) => Promise<void>;
+// interface ISubscriptionRegistry<Data> {
+//   addListener(
+//     consumerId: number,
+//     listener: ISubscriptionListener<Data>,
+//     noAck?: boolean
+//   ): void;
+//   removeListener(consumerId: number): void;
+//   hasListener(consumerId: number): boolean;
+//   getListener(consumerId: number): ISubscriptionListener<Data> | undefined;
+//   getAllListeners(): IterableIterator<[number, ISubscriptionListener<Data>]>;
+//   hasFanout(consumerId: number): boolean;
+//   size: number;
+// }
 class SubscriptionRegistry<Data> implements ISubscriptionRegistry<Data> {
   private listeners = new Map<number, ISubscriptionListener<Data>>();
   private fanouts = new Set<number>();
@@ -1315,50 +1315,50 @@ class SubscriptionMetricsCollector<Data>
     };
   }
 }
-interface ISubscriptionService<Data> {
-  subscribe(
-    consumerId: number,
-    listener: ISubscriptionListener<Data>,
-    noAck?: boolean
-  ): void;
-  unsubscribe(consumerId: number): void;
-  getMetrics(): {
-    count: number;
-  };
-}
-class SubscriptionService<Data> implements ISubscriptionService<Data> {
-  constructor(
-    private readonly topicName: string,
-    private readonly registry: ISubscriptionRegistry<Data>,
-    private readonly metrics: ISubscriptionMetricsCollector,
-    private readonly logger?: ILogCollector
-  ) {}
+// interface ISubscriptionService<Data> {
+//   subscribe(
+//     consumerId: number,
+//     listener: ISubscriptionListener<Data>,
+//     noAck?: boolean
+//   ): void;
+//   unsubscribe(consumerId: number): void;
+//   getMetrics(): {
+//     count: number;
+//   };
+// }
+// class SubscriptionService<Data> implements ISubscriptionService<Data> {
+//   constructor(
+//     private readonly topicName: string,
+//     private readonly registry: ISubscriptionRegistry<Data>,
+//     private readonly metrics: ISubscriptionMetricsCollector,
+//     private readonly logger?: ILogCollector
+//   ) {}
 
-  subscribe(
-    consumerId: number,
-    listener: ISubscriptionListener<Data>,
-    noAck?: boolean
-  ): void {
-    this.registry.addListener(consumerId, listener, noAck);
+//   subscribe(
+//     consumerId: number,
+//     listener: ISubscriptionListener<Data>,
+//     noAck?: boolean
+//   ): void {
+//     this.registry.addListener(consumerId, listener, noAck);
 
-    this.logger?.log(`${consumerId} is subscribed to ${this.topicName}.`, {
-      consumerId,
-      noAck,
-    });
-  }
+//     this.logger?.log(`${consumerId} is subscribed to ${this.topicName}.`, {
+//       consumerId,
+//       noAck,
+//     });
+//   }
 
-  unsubscribe(consumerId: number): void {
-    this.registry.removeListener(consumerId);
+//   unsubscribe(consumerId: number): void {
+//     this.registry.removeListener(consumerId);
 
-    this.logger?.log(`${consumerId} is unsubscribed from ${this.topicName}.`, {
-      consumerId,
-    });
-  }
+//     this.logger?.log(`${consumerId} is unsubscribed from ${this.topicName}.`, {
+//       consumerId,
+//     });
+//   }
 
-  getMetrics() {
-    return this.metrics.getMetrics();
-  }
-}
+//   getMetrics() {
+//     return this.metrics.getMetrics();
+//   }
+// }
 //
 //
 //
@@ -1603,11 +1603,11 @@ class ClientValidator implements IClientValidator {
   }
 }
 
-interface IClientActivityTracker {
-  recordActivity(id: number, activityRecord: Partial<IClientState>): void;
-  isOperable(id: number, now: number): boolean;
-  isIdle(id: number): boolean;
-}
+// interface IClientActivityTracker {
+//   recordActivity(id: number, activityRecord: Partial<IClientState>): void;
+//   isOperable(id: number, now: number): boolean;
+//   isIdle(id: number): boolean;
+// }
 class ClientActivityTracker implements IClientActivityTracker {
   constructor(
     private registry: IClientRegistry,
@@ -1875,38 +1875,38 @@ class ProducerFactory<Data> implements IProducerFactory<Data> {
 //     filter?: (meta: MessageMetadata) => boolean
 //   ): Promise<number>;
 // }
-class DLQConsumer<Data> implements IDLQConsumer<Data> {
-  private readonly limit: number;
-  private reader: AsyncGenerator<IDLQEntry<Data>, void, unknown>;
-  constructor(
-    private readonly dlqService: IDLQService<Data>,
-    public readonly id: number,
-    limit?: number
-  ) {
-    this.limit = Math.max(1, limit!);
-    // singleton reader allows to read only once, waiting for the newest messages to arrive
-    this.reader = this.dlqService.createDlqReader();
-  }
+// class DLQConsumer<Data> implements IDLQConsumer<Data> {
+//   private readonly limit: number;
+//   private reader: AsyncGenerator<IDLQEntry<Data>, void, unknown>;
+//   constructor(
+//     private readonly dlqService: IDLQService<Data>,
+//     public readonly id: number,
+//     limit?: number
+//   ) {
+//     this.limit = Math.max(1, limit!);
+//     // singleton reader allows to read only once, waiting for the newest messages to arrive
+//     this.reader = this.dlqService.createDlqReader();
+//   }
 
-  async consume() {
-    const messages: IDLQEntry<Data>[] = [];
+//   async consume() {
+//     const messages: IDLQEntry<Data>[] = [];
 
-    for await (const message of this.reader) {
-      if (!message) break;
-      messages.push(message);
-      if (messages.length == this.limit) break;
-    }
+//     for await (const message of this.reader) {
+//       if (!message) break;
+//       messages.push(message);
+//       if (messages.length == this.limit) break;
+//     }
 
-    return messages;
-  }
+//     return messages;
+//   }
 
-  async replayDlq(
-    handler: (message: Data, meta: MessageMetadata) => Promise<void>,
-    filter?: (meta: MessageMetadata) => boolean
-  ) {
-    return this.dlqService.replayDlq(this.id, handler, filter);
-  }
-}
+//   async replayDlq(
+//     handler: (message: Data, meta: MessageMetadata) => Promise<void>,
+//     filter?: (meta: MessageMetadata) => boolean
+//   ) {
+//     return this.dlqService.replayDlq(this.id, handler, filter);
+//   }
+// }
 interface IClientManagementService<Data> {
   createProducer(): IProducer<Data>;
   createConsumer(config?: IConsumerConfig, id?: number): IConsumer<Data>;

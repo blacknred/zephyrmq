@@ -1,3 +1,3 @@
 export interface IDeliveryRetryDelayProvider {
-  getDelay(messageId: number): number;
+  getDelay(messageId: number): Promise<number>;
 }

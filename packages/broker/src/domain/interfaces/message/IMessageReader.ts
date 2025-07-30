@@ -1,7 +1,7 @@
-import type { MessageMetadata } from "../entities/MessageMetadata";
+import type { MessageMetadata } from "@domain/entities/MessageMetadata";
 
-export interface IMessageReader<Data> {
-  read(
+export interface IMessageReader {
+  read<Data>(
     id: number
   ): Promise<
     [
@@ -9,7 +9,7 @@ export interface IMessageReader<Data> {
       Pick<MessageMetadata, keyof MessageMetadata> | undefined,
     ]
   >;
-  readMessage(id: number): Promise<Data | undefined>;
+  readMessage<Data>(id: number): Promise<Data | undefined>;
   readMetadata<K extends keyof MessageMetadata>(
     id: number,
     keys?: K[]

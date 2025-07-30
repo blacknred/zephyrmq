@@ -1,0 +1,1 @@
+export type ISubscriptionListener<Data> = (message: Data) => Promise<void>;

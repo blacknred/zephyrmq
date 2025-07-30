@@ -1,9 +1,23 @@
-import type { IAppender } from "../../domain/interfaces/IAppender";
+import type { ISubscriptionListener } from "@app/interfaces/IConsumer";
+import type { ILogService } from "@app/interfaces/ILogService";
+import type { ISubscriptionCreator } from "@domain/interfaces/message/subscription/ISubscriptionCreator";
 
 export class SubscribeToMessages {
-  constructor(private appender: IAppender) {}
+  constructor(
+    private subscriptionCreator: ISubscriptionCreator,
+    private logService?: ILogService
+  ) {}
 
-  async execute(data: Buffer) {
-    return this.appender.append(data);
+  async execute<Data>(
+    consumerId: number,
+    listener: ISubscriptionListener<Data>,
+    noAck?: boolean
+  ) {
+    await this.subscriptionCreator.create<Data>(consumerId, listener, noAck);
+
+    this.logService?.log(`${consumerId} is subscribed.`, {
+      consumerId,
+      noAck,
+    });
   }
 }

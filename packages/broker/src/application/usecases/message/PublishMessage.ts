@@ -3,12 +3,13 @@ import type { IAppender } from "../../domain/interfaces/IAppender";
 import type { ILogService } from "@app/interfaces/ILogService";
 import type { IMessageWriter } from "@domain/interfaces/message/IMessageWriter";
 import type { MessageMetadata } from "@domain/entities/MessageMetadata";
+import type { IClientActivityRecorder } from "@domain/interfaces/client/IClientActivityRecorder";
 
 export class PublishMessage {
   constructor(
     private writer: IMessageWriter,
     private metrics: IMetricsCollector,
-    private activityTracker: IClientActivityTracker,
+    private activityRecorder: IClientActivityRecorder,
     private logService?: ILogService
   ) {}
 
@@ -23,13 +24,13 @@ export class PublishMessage {
 
     const processingTime = Date.now() - meta.ts;
     this.metrics.recordEnqueue(message.length, processingTime);
-    this.activityTracker.recordActivity(producerId, {
+    await this.activityRecorder.record(producerId, {
       messageCount: 1,
       processingTime,
       status: "idle",
     });
 
-    this.logService?.log(`Message is published in ${meta.topic}.`, meta);
+    this.logService?.log(`Message is published.`, meta);
   }
 }
 
